@@ -5,29 +5,30 @@
 //! directly as the masters of a variable font:
 //!
 //! ```text
-//! left point at pen-down L₀ → left side L₁ … Lₘ → end cap (line, 2 cubics, line) → Rₘ
-//!                          → right side Rₘ₋₁ … R₀ → start cap (line, 2 cubics, line) → back to L₀
+//! left point at pen-down L₀ → left side L₁ … Lₘ → end cap (2 cubics) → Rₘ
+//!                          → right side Rₘ₋₁ … R₀ → start cap (2 cubics) → back to L₀
 //! ```
-//!
-//! (The cap lines usually have zero length; see `cap`.)
 //!
 //! "Left" is the writer's left in a y-up coordinate system, so the contour is **clockwise** with
 //! y up (the TrueType outer-contour direction) and counter-clockwise in y-down page coordinates.
 //! Left and right on-curve points come in pairs (Lᵢ ↔ Rᵢ) around the same centerline point, so
 //! downstream tools can recover the skeleton.
 //!
-//! How the sides are built, so that the outline follows the union of the skeleton's circles:
+//! The contour fills the union of the skeleton's circles under the **non-zero** rule; it is not
+//! that union's boundary. Where the stroke folds (the inner side of a turn, a kink, a circle that
+//! swallows its neighbors) it overlaps itself, the way a variable font keeps overlapping contours:
+//! computing the union's boundary instead would move points abruptly as they get covered, and the
+//! weights in between, which a font makes by interpolating its masters point by point, would come
+//! out wrong. How it is built:
 //! 1. the centerline is sampled densely (in length and in turning), with explicit tangents and a
-//!    fan of extra directions at kinks and tight turns (so the outer side wraps around them);
-//! 2. each sample contributes one point per side on the envelope of the circle family;
-//! 3. side points swallowed by nearby circles are pushed out onto the union boundary, and local
-//!    self-intersections (swallowtails at sharp inner turns) are cut out;
-//! 4. every half-cell between consecutive samples is made to run the way the contour turns
-//!    (`make_positive`), which rules out holes under the nonzero fill rule whatever the skeleton;
-//! 5. one least-squares cubic is fitted per knot interval, with shared tangents at smooth knots and
-//!    one-sided tangents at corners.
-
-mod boundary;
+//!    fan of extra directions where the sides' directions jump (kinks, changes in the rate the
+//!    radius changes), so the outer side wraps around the joint's circle;
+//! 2. each sample contributes one point per side, on the envelope of the circle family (through
+//!    the center on the inner side of a kink, see `contour`);
+//! 3. knots are chosen where one cubic per interval no longer follows the stroke's edge within
+//!    the precision at both ends of the weight range (`select_knots`), and one least-squares
+//!    cubic is fitted per interval, depending continuously on the points (`fit_span`); the
+//!    weights to keep as masters follow from how far the interpolation strays (`masters`).
 
 use kurbo::{self, BezPath, CubicBez, ParamCurve, ParamCurveArclen, ParamCurveDeriv, ParamCurveNearest, Point, Vec2};
 use scriptoria_skeleton::{Sample, Skeleton};
@@ -76,6 +77,8 @@ pub struct DenseSample {
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub pieces: Vec<PiecePlan>,
+    /// The weights (radius scales) the plan serves, thinnest and boldest (see [`PlanParams`]).
+    pub weights: (f64, f64),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -99,10 +102,15 @@ impl Plan {
     }
 }
 
-/// Kinks sharper than this get a fan of extra directions.
-const KINK: f64 = 3.0 * std::f64::consts::PI / 180.0;
-/// Angular step of a fan.
+/// Largest angular step of a fan, and of the turn between samples along the centerline.
 const FAN_STEP: f64 = 10.0 * std::f64::consts::PI / 180.0;
+
+/// The angle an arc of radius `r` may turn and still lie within `precision` of its chord
+/// (r·(1 − cos θ/2) ≤ precision), at most a fan step: a turn of the sides up to this needs no fan,
+/// and a fan turns this much per step.
+fn arc_step(r: f64, precision: f64) -> f64 {
+    if r <= precision { FAN_STEP } else { (2.0 * (1.0 - precision / r).acos()).min(FAN_STEP) }
+}
 
 /// What a plan must achieve.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,7 +136,7 @@ impl Default for PlanParams {
 /// knots are shared by all weights, which is what keeps the outlines compatible.
 pub fn plan(sk: &Skeleton, params: &PlanParams) -> Plan {
     let pieces = sk.pieces.iter().map(|piece| plan_piece(&piece.samples, &piece.spine, params)).collect();
-    Plan { pieces }
+    Plan { pieces, weights: params.weights }
 }
 
 fn plan_piece(samples: &[Sample], spine: &[CubicBez], params: &PlanParams) -> PiecePlan {
@@ -139,16 +147,17 @@ fn plan_piece(samples: &[Sample], spine: &[CubicBez], params: &PlanParams) -> Pi
         }
         return PiecePlan { dense, knots: (0..samples.len().min(1)).collect() };
     }
+    let rmax = samples.iter().map(|s| s.r).fold(0.0, f64::max);
+    let bold = params.weights.1;
     let mut s_acc = 0.0;
     let mut prev_t: Option<Vec2> = None;
     let mut prev_dr = 0.0;
-    // Forced knots: both ends of every fan, so the sides' corners stay corners.
-    let mut forced: Vec<usize> = Vec::new();
     for (i, seg) in spine.iter().enumerate() {
         let (r0, r1) = (samples[i].r, samples[i + 1].r);
-        let len = seg.arclen(1e-4);
-        let dr = if len > 1e-9 { (r1 - r0) / len } else { 0.0 };
-        let n = (len / (0.25 * r0.min(r1).max(0.02))).ceil().clamp(2.0, 400.0) as usize;
+        let len = seg.arclen(1e-4 * rmax);
+        let dr = if len > 1e-9 * rmax { (r1 - r0) / len } else { 0.0 };
+        // Spacing ≤ ¼ of the radius (not finer than for a twentieth of the largest radius).
+        let n = (len / (0.25 * r0.min(r1).max(0.05 * rmax))).ceil().clamp(2.0, 400.0) as usize;
         let d = seg.deriv();
         let chord = seg.p3 - seg.p0;
         let before = prev_t;
@@ -162,20 +171,28 @@ fn plan_piece(samples: &[Sample], spine: &[CubicBez], params: &PlanParams) -> Pi
                 before.unwrap_or(Vec2::new(1.0, 0.0))
             }
         };
-        // A fan at the joint with the previous segment, when the centerline kinks there.
+        // A fan at the joint with the previous segment, where the side directions jump (where the
+        // centerline kinks, or where the radius starts changing at another rate: the envelope
+        // leaves each circle at 90° + asin(dr) from the tangent) further than a chord across the
+        // joint's circle can stand for at the boldest weight. Its samples turn the tangent and
+        // blend the rate, so on each side the direction turns steadily from the incoming to the
+        // outgoing one: an arc of the joint's circle on the outer side.
         let t_in = tangent(0.0);
         if let Some(t_prev) = prev_t {
             let a = t_prev.cross(t_in).atan2(t_prev.dot(t_in));
-            if a.abs() > KINK {
-                let steps = (a.abs() / FAN_STEP).ceil() as usize;
+            let shift = |dr: f64| (dr * bold).clamp(-1.0, 1.0).asin();
+            let jump = shift(dr) - shift(prev_dr);
+            let turn = (a + jump).abs().max((a - jump).abs());
+            let step = arc_step(r0 * bold, params.precision);
+            if turn > step {
+                let steps = (turn / step).ceil() as usize;
                 // The joint with the incoming direction, then the fan, then (below) the outgoing one.
-                forced.push(dense.len());
                 dense.push(DenseSample { p: seg.p0, r: r0, t: t_prev, dr: prev_dr, s: s_acc });
                 for k in 1..steps {
-                    let ang = t_prev.y.atan2(t_prev.x) + a * k as f64 / steps as f64;
-                    dense.push(DenseSample { p: seg.p0, r: r0, t: Vec2::new(ang.cos(), ang.sin()), dr: 0.0, s: s_acc });
+                    let f = k as f64 / steps as f64;
+                    let ang = t_prev.y.atan2(t_prev.x) + a * f;
+                    dense.push(DenseSample { p: seg.p0, r: r0, t: Vec2::new(ang.cos(), ang.sin()), dr: prev_dr + (dr - prev_dr) * f, s: s_acc });
                 }
-                forced.push(dense.len());
             }
         }
         // Parameters: uniform (spacing ≤ ¼ r), bisected wherever the tangent turns more than a
@@ -197,10 +214,10 @@ fn plan_piece(samples: &[Sample], spine: &[CubicBez], params: &PlanParams) -> Pi
             let (p, r, tan, s) = (seg.eval(t), r0 + (r1 - r0) * t, tangent(t), s_acc + len * t);
             if let Some(tp) = prev {
                 let a = tp.cross(tan).atan2(tp.dot(tan));
-                let steps = (a.abs() / FAN_STEP).ceil().max(1.0) as usize;
+                let steps = (a.abs() / arc_step(r * bold, params.precision)).ceil().max(1.0) as usize;
                 for k in 1..steps {
                     let ang = tp.y.atan2(tp.x) + a * k as f64 / steps as f64;
-                    dense.push(DenseSample { p, r, t: Vec2::new(ang.cos(), ang.sin()), dr: 0.0, s });
+                    dense.push(DenseSample { p, r, t: Vec2::new(ang.cos(), ang.sin()), dr, s });
                 }
             }
             dense.push(DenseSample { p, r, t: tan, dr, s });
@@ -214,307 +231,373 @@ fn plan_piece(samples: &[Sample], spine: &[CubicBez], params: &PlanParams) -> Pi
         }
     }
 
-    let knots = select_knots(&dense, &forced, params);
+    let knots = select_knots(&dense, params);
     PiecePlan { dense, knots }
 }
 
-/// The fewest knots (dense indices, increasing, first and last included, `forced` kept) such that
-/// between consecutive knots one cubic per side follows each side within `params.precision`, at
-/// both weights of `params.weights`. Greedy: from each knot, the farthest next one that still fits
-/// (found by bisection; a stretch that fits keeps fitting when shortened).
-fn select_knots(dense: &[DenseSample], forced: &[usize], params: &PlanParams) -> Vec<usize> {
+/// The fewest knots (dense indices, increasing, first and last included) such that between
+/// consecutive knots one cubic per side fits each side ([`Ink::miss`] within `params.precision`)
+/// at both weights of `params.weights`. Greedy: from each knot, the farthest next one that still
+/// fits (found by bisection; a stretch that fits keeps fitting when shortened).
+fn select_knots(dense: &[DenseSample], params: &PlanParams) -> Vec<usize> {
     let m = dense.len();
     if m <= 2 {
         return (0..m).collect();
     }
-    // Both sides at both weights, as polylines indexed like `dense`, with travel directions.
-    let mut sides: Vec<(Vec<Point>, Vec<Option<Vec2>>)> = Vec::with_capacity(4);
-    for w in [params.weights.0, params.weights.1] {
-        let (pts, dirs) = contour(dense, &WeightParams::scaled(w));
-        sides.push((pts[..m].to_vec(), dirs[..m].to_vec()));
+    // Both sides at both weights, as polylines indexed like `dense`, with headings, the ink there
+    // and which points lie on its edge.
+    let mut inks: Vec<Ink> = Vec::with_capacity(2);
+    let mut sides: Vec<(Vec<Point>, Vec<Heading>, Vec<f64>, usize)> = Vec::with_capacity(4);
+    for (i, w) in [params.weights.0, params.weights.1].into_iter().enumerate() {
+        let weight = WeightParams::scaled(w);
+        let (pts, heads) = contour(dense, &weight, params.weights);
+        let ink = Ink::new(dense, &weight);
         let right = |k: usize| m + CAP_POINTS + (m - 1 - k);
-        sides.push(((0..m).map(|k| pts[right(k)]).collect(), (0..m).map(|k| dirs[right(k)].map(|d| -d)).collect()));
+        let left: Vec<Point> = pts[..m].to_vec();
+        let right_pts: Vec<Point> = (0..m).map(|k| pts[right(k)]).collect();
+        for (side, h) in [(left, heads[..m].to_vec()), (right_pts, (0..m).map(|k| (-heads[right(k)].0, heads[right(k)].1)).collect())] {
+            let slack = (0..m).map(|k| ink.slack(side[k], weight.radius(dense[k].r), params.precision)).collect();
+            sides.push((side, h, slack, i));
+        }
+        inks.push(ink);
     }
     let fits = |k0: usize, k1: usize| {
-        sides.iter().all(|(pts, dirs)| {
+        sides.iter().all(|(pts, heads, slack, i)| {
             let span = &pts[k0..=k1];
-            let t0 = dirs[k0].unwrap_or_else(|| first_direction(span.iter().copied()));
-            let t1 = dirs[k1].unwrap_or_else(|| -first_direction(span.iter().rev().copied()));
-            max_distance(&fit_cubic(span, t0, t1), span) <= params.precision
+            inks[*i].miss(&fit_span(span, &heads[k0..=k1]), span, &slack[k0..=k1]) <= params.precision
         })
     };
-    let mut bounds: Vec<usize> = forced.iter().copied().chain([0, m - 1]).filter(|&k| k < m).collect();
-    bounds.sort_unstable();
-    bounds.dedup();
     let mut knots = vec![0];
-    for w in bounds.windows(2) {
-        let (mut k0, b) = (w[0], w[1]);
-        while k0 < b {
-            let k1 = if fits(k0, b) {
-                b
-            } else {
-                let (mut lo, mut hi) = (k0 + 1, b);
-                while hi - lo > 1 {
-                    let mid = (lo + hi) / 2;
-                    if fits(k0, mid) { lo = mid } else { hi = mid }
-                }
-                lo
-            };
-            knots.push(k1);
-            k0 = k1;
-        }
+    let mut k0 = 0;
+    while k0 < m - 1 {
+        let b = m - 1;
+        let k1 = if fits(k0, b) {
+            b
+        } else {
+            let (mut lo, mut hi) = (k0 + 1, b);
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if fits(k0, mid) { lo = mid } else { hi = mid }
+            }
+            lo
+        };
+        knots.push(k1);
+        k0 = k1;
     }
     knots
 }
 
-/// The unit direction from the first point towards the first point distinct from it.
-fn first_direction(mut pts: impl Iterator<Item = Point>) -> Vec2 {
-    let Some(a) = pts.next() else { return Vec2::new(1.0, 0.0) };
-    pts.map(|p| p - a).find(|v| v.hypot() > 1e-12).map_or(Vec2::new(1.0, 0.0), unit_or_zero)
+/// The union of a piece's circles at one weight: the ink a contour must fill and not leave.
+struct Ink {
+    disks: Vec<(Point, f64)>,
+    /// Distances below this count as zero (scaled to the largest radius).
+    tiny: f64,
 }
+
+impl Ink {
+    fn new(dense: &[DenseSample], w: &WeightParams) -> Self {
+        let disks: Vec<(Point, f64)> = dense.iter().map(|d| (d.p, w.radius(d.r))).collect();
+        let tiny = 1e-6 * disks.iter().map(|d| d.1).fold(0.0, f64::max);
+        Ink { disks, tiny }
+    }
+
+    /// Signed distance to the union's edge (negative inside).
+    fn outside(&self, p: Point) -> f64 {
+        self.disks.iter().map(|&(c, r)| (p - c).hypot() - r).fold(f64::INFINITY, f64::min)
+    }
+
+    /// How far a cubic through a contour point may pass from it (scaled by the miss allowed): a
+    /// point on the ink's edge must be followed within the precision; one inside (pulled in
+    /// towards its center, or covered by another circle) only roughly: within 3 % of its circle's
+    /// radius, so the curve stays where other parts of the contour cover the ink too, and within
+    /// half its depth in the ink, so the curve cannot cross the part of the contour along the edge
+    /// nearby (which would cut a sliver out of the ink between them).
+    fn slack(&self, p: Point, radius: f64, precision: f64) -> f64 {
+        let depth = -self.outside(p);
+        ((0.03 * radius).min(0.5 * depth) / precision).max(1.0)
+    }
+
+    /// How far a cubic misses the ink: how far it leaves it, or passes from the contour points it
+    /// stands for, each distance divided by that point's slack ([`Ink::slack`]).
+    fn miss(&self, c: &CubicBez, pts: &[Point], slack: &[f64]) -> f64 {
+        let out = (0..=16).map(|j| self.outside(c.eval(j as f64 / 16.0))).fold(0.0, f64::max);
+        pts.iter().zip(slack).map(|(&p, &s)| c.nearest(p, 1e-9).distance_sq.sqrt() / s).fold(out, f64::max)
+    }
+}
+
 
 /// The outline at weight `w`: one closed contour per piece, in writing order.
 pub fn expand(plan: &Plan, w: &WeightParams) -> BezPath {
     let mut path = BezPath::new();
     for piece in &plan.pieces {
-        expand_piece(&mut path, piece, w);
+        expand_piece(&mut path, piece, w, plan.weights);
     }
     path
 }
 
-/// Points of each cap between the two sides: a cap turns half a circle, one point every 10°.
+/// Points of each cap between the two sides: a cap turns about half a circle, one point every 10°.
 const CAP_POINTS: usize = 17;
 
 /// One piece's outline at weight `w`: its contour ([`contour`]) fitted with one cubic per knot
-/// interval.
-///
-/// Every dense sample is a disk; the contour follows the boundary of their union (counting only
-/// local coverage, see [`boundary::Union::new`]). Its points are fixed slots, the same at every
-/// weight: the left side's envelope point of every sample, the end cap, the right side's
-/// backwards, the start cap. A slot whose point is visible lies on the boundary as it is; a run of
-/// hidden slots (inside other disks: inner turns, small circles inside a blob, ends folded into
-/// the stroke) is moved onto the stretch of boundary between the visible slots around it, walked
-/// exactly along the circle arcs ([`boundary`]). The contour then is the union's boundary itself,
-/// free of holes and folds, except where a run had to be left as it was ([`relocate`]).
-fn expand_piece(path: &mut BezPath, piece: &PiecePlan, w: &WeightParams) {
+/// interval (the plan's knots on both sides, and the middle of each cap).
+fn expand_piece(path: &mut BezPath, piece: &PiecePlan, w: &WeightParams, range: (f64, f64)) {
+    match piece.dense.len() {
+        0 => {}
+        1 => circle(path, piece.dense[0].p, w.radius(piece.dense[0].r)),
+        _ => {
+            let cubics = piece_cubics(piece, w, range);
+            path.move_to(cubics[0].p0);
+            for c in &cubics {
+                path.curve_to(c.p1, c.p2, c.p3);
+            }
+            path.close_path();
+        }
+    }
+}
+
+/// The closed contour of a piece of at least two dense samples (its first point repeated at the
+/// end), with its headings and its knots: the plan's on both sides, the middle of each cap, and
+/// the end.
+fn closed_contour(piece: &PiecePlan, w: &WeightParams, range: (f64, f64)) -> (Vec<Point>, Vec<Heading>, Vec<usize>) {
     let m = piece.dense.len();
-    if m == 0 {
-        return;
-    }
-    if m == 1 {
-        circle(path, piece.dense[0].p, w.radius(piece.dense[0].r));
-        return;
-    }
-    let (mut pts, mut dirs) = contour(&piece.dense, w);
-    // Knots: the plan's on both sides and the middle of each cap; then once more the first point.
+    let (mut pts, mut heads) = contour(&piece.dense, w, range);
     let n = pts.len();
-    let middle = CAP_POINTS / 2 + 1;
+    let (end_widest, start_widest) = widest_caps(&piece.dense, range);
     let mut knots: Vec<usize> = piece.knots.clone();
-    knots.push(m - 1 + middle);
+    knots.extend(cap_knots(end_widest).into_iter().map(|o| m - 1 + o));
     knots.extend(piece.knots.iter().rev().map(|&k| m + CAP_POINTS + (m - 1 - k)));
-    knots.push(2 * m + CAP_POINTS + middle - 1);
+    knots.extend(cap_knots(start_widest).into_iter().map(|o| 2 * m + CAP_POINTS - 1 + o));
     knots.push(n);
     pts.push(pts[0]);
-    dirs.push(dirs[0]);
-    path.move_to(pts[0]);
-    fit_polyline(path, &pts, &knots, &dirs);
-    path.close_path();
+    heads.push(heads[0]);
+    (pts, heads, knots)
 }
 
-/// The contour's points at weight `w` (at least two dense samples), in slot order, with the
-/// travel direction where it is known exactly (see [`expand_piece`]).
-fn contour(dense: &[DenseSample], w: &WeightParams) -> (Vec<Point>, Vec<Option<Vec2>>) {
-    use std::f64::consts::{PI, TAU};
+/// The cubics of a piece's outline (at least two dense samples), one per knot interval.
+fn piece_cubics(piece: &PiecePlan, w: &WeightParams, range: (f64, f64)) -> Vec<CubicBez> {
+    let (pts, heads, knots) = closed_contour(piece, w, range);
+    knots.windows(2).map(|k| fit_span(&pts[k[0]..=k[1]], &heads[k[0]..=k[1]])).collect()
+}
+
+/// How far the outline that a variable font makes at weight `w` by interpolating each point
+/// between its masters at weights `a` and `b` strays from the contour it should follow there:
+/// for every cubic, how far it leaves the union of the piece's circles at `w` (extra ink), and
+/// how far it passes from the contour's points in its interval that lie on that union's edge (a
+/// notch). What lies inside the stroke (points pulled in towards their centers, points covered
+/// by other circles, and any curve among them) cannot change the filled shape and is not counted.
+pub fn interpolation_error(plan: &Plan, a: f64, b: f64, w: f64) -> f64 {
+    let t = (w - a) / (b - a);
+    let lerp = |p: &CubicBez, q: &CubicBez| CubicBez::new(p.p0.lerp(q.p0, t), p.p1.lerp(q.p1, t), p.p2.lerp(q.p2, t), p.p3.lerp(q.p3, t));
+    let weight = WeightParams::scaled(w);
+    let mut worst: f64 = 0.0;
+    for piece in plan.pieces.iter().filter(|p| p.dense.len() >= 2) {
+        let ink = Ink::new(&piece.dense, &weight);
+        let (ca, cb) = (piece_cubics(piece, &WeightParams::scaled(a), plan.weights), piece_cubics(piece, &WeightParams::scaled(b), plan.weights));
+        let (pts, _, knots) = closed_contour(piece, &weight, plan.weights);
+        for (i, k) in knots.windows(2).enumerate() {
+            let c = lerp(&ca[i], &cb[i]);
+            let edge: Vec<Point> = pts[k[0]..=k[1]].iter().copied().filter(|&p| ink.outside(p) > -ink.tiny).collect();
+            worst = worst.max(ink.miss(&c, &edge, &vec![1.0; edge.len()]));
+        }
+    }
+    worst
+}
+
+/// Deepest bisection of the weight range when choosing masters (at most 2⁴ intervals).
+const MASTER_DEPTH: usize = 4;
+
+/// The weights at which to keep the outline as masters of a variable font, so that interpolating
+/// between consecutive ones stays within `tolerance` of the outline at every weight between them
+/// (checked at the quarter points): the two ends of `range`, and between them as many as halving
+/// the intervals that miss needs, up to [`MASTER_DEPTH`] halvings. A font may keep its own set
+/// per glyph (intermediate regions).
+pub fn masters(plan: &Plan, range: (f64, f64), tolerance: f64) -> Vec<f64> {
+    fn split(plan: &Plan, a: f64, b: f64, tolerance: f64, depth: usize, out: &mut Vec<f64>) {
+        let misses = [0.25, 0.5, 0.75].iter().any(|f| interpolation_error(plan, a, b, a + (b - a) * f) > tolerance);
+        if misses && depth < MASTER_DEPTH {
+            let mid = 0.5 * (a + b);
+            split(plan, a, mid, tolerance, depth + 1, out);
+            split(plan, mid, b, tolerance, depth + 1, out);
+        } else {
+            out.push(b);
+        }
+    }
+    let mut out = vec![range.0];
+    split(plan, range.0, range.1, tolerance, 0, &mut out);
+    out
+}
+
+/// The contour's points at weight `w` (at least two dense samples), in slot order — the left
+/// side's point of every sample, the end cap, the right side's points backwards, the start cap —
+// with their headings. The slots are the same at every weight and every point moves continuously
+/// with the weight, so outlines at a few weights interpolate well (the masters of a variable font).
+///
+/// The contour is not the boundary of the union of the samples' disks: it overlaps itself where
+/// the stroke folds, and fills the union under the non-zero rule. Seen as a sum of cells (the
+/// quadrilateral between two consecutive samples and their side points, the triangles of the
+/// caps), it covers the union as long as no cell runs the wrong way round, which would cancel the
+/// cover of another cell and leave a hole, unless other cells cover that place twice. Each side
+/// point lies on the envelope of the circles, p + r·(n·cos a − t·sin a) with a = asin(dr) (n the
+/// side's normal, t the tangent), which is where its circle touches the union's boundary. Where the
+/// side runs backwards there (a swallowtail on the inner side of a tight turn, a stutter back and
+/// forth along one circle), the stretch it runs back over is covered twice by the parts on either
+/// side, so the inverted cells leave no hole; pulling those points in instead would cut the ink
+/// wherever those parts are short. The exception is a fan turning the wrong way for a side (the
+/// inner side of a kink), which would run backwards around a whole arc: its points between its
+/// ends go through the center, as the inner join of a stroker does, blended in over the first fan
+/// step so they move continuously with the weight.
+fn contour(dense: &[DenseSample], w: &WeightParams, range: (f64, f64)) -> (Vec<Point>, Vec<Heading>) {
+    use std::f64::consts::FRAC_PI_2;
     let m = dense.len();
     let r: Vec<f64> = dense.iter().map(|d| w.radius(d.r)).collect();
+    // Angle a between a side's normal and its envelope point (the radius changes at rate dr·scale).
+    let shift: Vec<f64> = dense.iter().map(|d| (d.dr * w.scale).clamp(-1.0, 1.0).asin()).collect();
+    let same = |a: usize, b: usize| dense[a].p == dense[b].p;
 
-    // The disks along the centerline (repeats of a sample, as in a fan, are one disk).
-    let mut disk_of = Vec::with_capacity(m);
-    let mut disks: Vec<(Point, f64)> = Vec::new();
-    let mut along: Vec<f64> = Vec::new();
-    for (d, &ri) in dense.iter().zip(&r) {
-        if disks.last().is_none_or(|&(c, rr)| (c - d.p).hypot() > 1e-12 || (rr - ri).abs() > 1e-12) {
-            disks.push((d.p, ri));
-            along.push(d.s);
+    // One side (sign 1: the writer's left, y up; −1: the right), in writing order: points and
+    // headings.
+    let side = |sign: f64| -> (Vec<Point>, Vec<Heading>) {
+        let (dir, travel): (Vec<Vec2>, Vec<Vec2>) = (0..m)
+            .map(|k| {
+                let (t, a) = (dense[k].t, shift[k]);
+                let n = Vec2::new(-t.y, t.x) * sign;
+                (n * a.cos() - t * a.sin(), t * a.cos() + n * a.sin())
+            })
+            .unzip();
+        let mut reach = r.clone();
+        let mut k = 0;
+        while k + 1 < m {
+            if !same(k, k + 1) {
+                k += 1;
+                continue;
+            }
+            // A fan: samples k..=j around one center. The right way round is clockwise for the left
+            // side and counter-clockwise for the right one (y up).
+            let mut j = k + 1;
+            while j + 1 < m && same(j, j + 1) {
+                j += 1;
+            }
+            let turn: f64 = (k..j).map(|i| dir[i].cross(dir[i + 1]).atan2(dir[i].dot(dir[i + 1]))).sum();
+            let keep = (1.0 - turn * sign / FAN_STEP).clamp(0.0, 1.0);
+            for i in k + 1..j {
+                reach[i] *= keep;
+            }
+            k = j;
         }
-        disk_of.push(disks.len() - 1);
-    }
-    let union = boundary::Union::new(disks, Some(&along));
-
-    // Envelope of the circle family: p + r·(−r'·t ± √(1−r'²)·n), n = writer's left (y up). The
-    // left side runs along t·c + n·r', the right side along t·c − n·r'.
-    let side = |k: usize, sign: f64| -> (Point, Vec2) {
-        let d = &dense[k];
-        let n = Vec2::new(-d.t.y, d.t.x) * sign;
-        let dr = (d.dr * w.scale).clamp(-0.95, 0.95);
-        let c = (1.0 - dr * dr).sqrt();
-        (d.p + (n * c - d.t * dr) * r[k], unit_or_zero(d.t * c + n * dr))
+        let pts = (0..m).map(|k| dense[k].p + dir[k] * reach[k]).collect();
+        // The travel direction on the envelope is trusted fully, and not at all once the point is
+        // pulled in by a tenth of the radius.
+        let trust = |k: usize| if r[k] > 0.0 { ((reach[k] / r[k] - 0.9) / 0.1).clamp(0.0, 1.0) } else { 1.0 };
+        let heads = (0..m).map(|k| (travel[k], trust(k))).collect();
+        (pts, heads)
     };
-    // Slots: (disk, angle on its circle, direction of travel there).
-    let mut slots: Vec<(usize, f64, Vec2)> = Vec::with_capacity(2 * m + 2 * CAP_POINTS);
-    for k in 0..m {
-        let (p, dir) = side(k, 1.0);
-        slots.push((disk_of[k], union.angle(disk_of[k], p), dir));
-    }
-    // A cap turns clockwise (decreasing angles, y up) from one side's end to the other's.
-    let cap = |slots: &mut Vec<(usize, f64, Vec2)>, disk: usize, from: f64, to: f64| {
-        let sweep = match -(from - to).rem_euclid(TAU) {
-            s if s.abs() < 1e-9 => -PI,
-            s => s,
-        };
+    let (left, left_travel) = side(1.0);
+    let (right, right_travel) = side(-1.0);
+
+    let mut pts: Vec<Point> = Vec::with_capacity(2 * m + 2 * CAP_POINTS);
+    let mut heads: Vec<Heading> = Vec::with_capacity(2 * m + 2 * CAP_POINTS);
+    // A cap turns clockwise (y up) around its circle from one side's envelope point to the other's,
+    // through `ahead` (the tangent at the end, its opposite at the start), `half` either way (see
+    // `widest_caps`). Its points sit at fixed angles, spread over the widest the cap gets within
+    // the plan's weights, those beyond its current reach waiting at its ends: so each point only
+    // moves out with the radius, linearly in the weight, instead of turning with the cap's reach
+    // (which changes fastest just where a circle starts to swallow its neighbor).
+    let cap = |pts: &mut Vec<Point>, heads: &mut Vec<Heading>, k: usize, ahead: Vec2, half: f64, widest: f64| {
+        let ahead = ahead.y.atan2(ahead.x);
+        let widest = widest.max(half);
         for s in 1..=CAP_POINTS {
-            let a = from + sweep * s as f64 / (CAP_POINTS + 1) as f64;
-            slots.push((disk, a, Vec2::new(a.sin(), -a.cos())));
+            let a = ahead + (widest - 2.0 * widest * s as f64 / (CAP_POINTS + 1) as f64).clamp(-half, half);
+            pts.push(dense[k].p + unit(a) * r[k]);
+            heads.push((Vec2::new(a.sin(), -a.cos()), 1.0));
         }
     };
-    let (end_left, end_right) = (side(m - 1, 1.0).0, side(m - 1, -1.0).0);
-    let end = disk_of[m - 1];
-    cap(&mut slots, end, union.angle(end, end_left), union.angle(end, end_right));
-    for k in (0..m).rev() {
-        let (p, dir) = side(k, -1.0);
-        slots.push((disk_of[k], union.angle(disk_of[k], p), -dir));
-    }
-    let (start_left, start_right) = (side(0, 1.0).0, side(0, -1.0).0);
-    let start = disk_of[0];
-    cap(&mut slots, start, union.angle(start, start_right), union.angle(start, start_left));
-
-    let mut pts: Vec<Point> = slots.iter().map(|&(i, a, _)| union.point(i, a)).collect();
-    let hidden: Vec<bool> = slots.iter().map(|&(i, a, _)| union.hidden(i, a)).collect();
-    relocate(&mut pts, &hidden, &slots, &union);
-    // Analytic directions only hold where a point stayed where it was.
-    let dirs: Vec<Option<Vec2>> = slots.iter().zip(&hidden).map(|(s, &h)| (!h && s.2.hypot() > 0.5).then_some(s.2)).collect();
-    (pts, dirs)
+    let (end, start) = (m - 1, 0);
+    let (end_widest, start_widest) = widest_caps(dense, range);
+    pts.extend(&left);
+    heads.extend(&left_travel);
+    cap(&mut pts, &mut heads, end, dense[end].t, FRAC_PI_2 + shift[end], end_widest);
+    pts.extend(right.iter().rev());
+    heads.extend(right_travel.iter().rev().map(|&(d, c)| (-d, c)));
+    cap(&mut pts, &mut heads, start, -dense[start].t, FRAC_PI_2 - shift[start], start_widest);
+    (pts, heads)
 }
 
-/// Moves every run of hidden slots onto the boundary between the visible slots around it, spread
-/// evenly by length. A run is left as it is when the walk does not get from one end to the other
-/// (the ends lie on different boundary loops) or gets there only by a detour more than twice the
-/// run's own length (around some other part of the stroke): a run left inside the stroke only
-/// adds overlap, while a wrong path would add or cut away ink.
-fn relocate(pts: &mut [Point], hidden: &[bool], slots: &[(usize, f64, Vec2)], union: &boundary::Union) {
-    const ARC_STEP: f64 = 2.0 * std::f64::consts::PI / 180.0;
-    let n = pts.len();
-    let Some(first_visible) = (0..n).find(|&i| !hidden[i]) else { return };
-    let mut k = 0;
-    while k < n {
-        let a = (first_visible + k) % n;
-        if !hidden[(a + 1) % n] {
-            k += 1;
-            continue;
-        }
-        let len = (1..n).take_while(|&s| hidden[(a + s) % n]).count();
-        let b = (a + len + 1) % n;
-        // The raw run's own length, to tell a walk along the run from a detour around something.
-        let raw_len: f64 = (0..=len).map(|s| (pts[(a + s + 1) % n] - pts[(a + s) % n]).hypot()).sum();
-        let Some(path) = union.walk((slots[a].0, slots[a].1), (slots[b].0, slots[b].1), ARC_STEP) else {
-            k += len + 1;
-            continue;
-        };
-        let cumulative: Vec<f64> = std::iter::once(0.0)
-            .chain(path.windows(2).scan(0.0, |acc, w| {
-                *acc += (w[1] - w[0]).hypot();
-                Some(*acc)
-            }))
-            .collect();
-        let total = *cumulative.last().unwrap();
-        if total > 2.0 * raw_len + 1e-9 {
-            k += len + 1;
-            continue;
-        }
-        for t in 0..len {
-            let s = total * (t + 1) as f64 / (len + 1) as f64;
-            let j = cumulative.partition_point(|&c| c < s).clamp(1, path.len() - 1);
-            let span = (cumulative[j] - cumulative[j - 1]).max(1e-300);
-            pts[(a + 1 + t) % n] = path[j - 1].lerp(path[j], ((s - cumulative[j - 1]) / span).clamp(0.0, 1.0));
-        }
-        k += len + 1;
-    }
+/// The widest half-angles the end and the start cap reach within the weights `range` (a cap spans
+/// twice that around the tangent): a quarter turn where the radius stays, more where it grows
+/// towards the cap, less where it shrinks.
+fn widest_caps(dense: &[DenseSample], range: (f64, f64)) -> (f64, f64) {
+    use std::f64::consts::FRAC_PI_2;
+    let m = dense.len();
+    let shift = |k: usize, scale: f64| (dense[k].dr * scale).clamp(-1.0, 1.0).asin();
+    let end = (FRAC_PI_2 + shift(m - 1, range.0)).max(FRAC_PI_2 + shift(m - 1, range.1));
+    let start = (FRAC_PI_2 - shift(0, range.0)).max(FRAC_PI_2 - shift(0, range.1));
+    (end, start)
+}
+
+/// Knots inside a cap, as offsets (1 to `CAP_POINTS`) from the side point before it: one cubic
+/// per 112.5° of its widest span (a cubic follows such an arc within 0.1 % of its radius), at
+/// least two.
+fn cap_knots(widest_half: f64) -> Vec<usize> {
+    let cubics = ((2.0 * widest_half / (0.625 * std::f64::consts::PI)).ceil() as usize).clamp(2, 4);
+    (1..cubics).map(|j| (j * (CAP_POINTS + 1) + cubics / 2) / cubics).collect()
 }
 
 fn unit_or_zero(v: Vec2) -> Vec2 {
     if v.hypot() > 1e-12 { v / v.hypot() } else { Vec2::ZERO }
 }
 
-/// Without an analytic direction, a knot whose two sides turn less than this is treated as smooth.
-const SMOOTH: f64 = 2.0 * std::f64::consts::PI / 180.0;
+/// A point's travel direction along the contour where known from the geometry, and how far it can
+/// be trusted: 1 on the envelope and on the caps, falling to 0 as a side point is pulled in
+/// towards its center (it then sits at a cusp of the side, where that direction means nothing).
+type Heading = (Vec2, f64);
 
-/// Fits one cubic per knot interval through a polyline (in travel order; `knots` increasing),
-/// appending them to `path`. `dirs[i]` is the analytic travel direction at point i where known
-/// (points left untouched by the cleanup); elsewhere tangents come from the polyline: shared at
-/// smooth knots, one-sided at corners.
-fn fit_polyline(path: &mut BezPath, pts: &[Point], knots: &[usize], dirs: &[Option<Vec2>]) {
-    // Unit direction from point i towards the first point in direction `step` that is at least
-    // `reach` away (the nearest distinct point when `reach` is tiny).
-    let toward = |i: usize, step: isize, reach: f64| -> Option<Vec2> {
-        let mut j = i as isize + step;
-        let mut last = None;
-        while j >= 0 && (j as usize) < pts.len() {
-            let v = pts[j as usize] - pts[i];
-            if v.hypot() > 1e-9 {
-                last = Some(v / v.hypot());
-                if v.hypot() >= reach {
-                    return last;
-                }
-            }
-            j += step;
-        }
-        last
+/// How far into a span, as a fraction of its length, the polyline's own direction at either end is
+/// read (so points crowded around a cusp do not skew it).
+const LOOK: f64 = 0.15;
+
+/// One cubic through a span of the polyline (and its points' headings), with the span's ends,
+/// leaving and arriving along directions blended from the ends' headings and the polyline's own
+/// direction there. A heading holds at its point only, so it counts only as far as it is trusted,
+/// its neighbor in the span is trusted too (next to a point pulled in, the side turns a corner at
+/// the end), and it agrees with the polyline (fully when parallel, not at all from 60° apart: the
+/// side then turns too fast near its end for one cubic to keep that direction). Everything here
+/// depends continuously on the points (no thresholds, no choices between alternatives), so as a
+/// contour moves continuously with the weight its cubics do too, and the masters of a variable
+/// font interpolate.
+fn fit_span(span: &[Point], heads: &[Heading]) -> CubicBez {
+    let n = span.len();
+    let len: f64 = span.windows(2).map(|w| (w[1] - w[0]).hypot()).sum();
+    let leave = unit_or_zero(point_along(span.iter().copied(), LOOK * len) - span[0]);
+    let arrive = unit_or_zero(span[n - 1] - point_along(span.iter().rev().copied(), LOOK * len));
+    let blend = |(d, c): Heading, neighbor: f64, own: Vec2| {
+        let agree = ((d.dot(own) - 0.5) / 0.5).clamp(0.0, 1.0);
+        let c = c.min(neighbor) * if own == Vec2::ZERO { 1.0 } else { agree };
+        let v = unit_or_zero(d * c + own * (1.0 - c));
+        if v != Vec2::ZERO { v } else if own != Vec2::ZERO { own } else { d }
     };
-    // Polyline length between two indices.
-    let length = |a: usize, b: usize| pts[a..=b].windows(2).map(|w| (w[1] - w[0]).hypot()).sum::<f64>();
-    let tangents = |pos: usize, analytic: bool| -> (Vec2, Vec2) {
-        // (arriving, leaving) directions at knot number `pos`.
-        let k = knots[pos];
-        if analytic && let Some(d) = dirs[k] {
-            return (d, d);
-        }
-        // A point moved by the cleanup sits at a cusp (or on another circle's boundary): use
-        // one-sided directions, looking a little further along each interval so other displaced
-        // points near the cusp do not skew them.
-        let inc = toward(k, -1, 0.0).map(|v| -v);
-        let out = toward(k, 1, 0.0);
-        let before = (pos > 0).then(|| 0.15 * length(knots[pos - 1], k));
-        let after = (pos + 1 < knots.len()).then(|| 0.15 * length(k, knots[pos + 1]));
-        let a = before.and_then(|r| toward(k, -1, r)).map(|v| -v).or(inc);
-        let b = after.and_then(|r| toward(k, 1, r)).or(out);
-        match (a, b) {
-            // Nearly straight through: share one tangent to keep the joint smooth.
-            (Some(a), Some(b)) if a.cross(b).atan2(a.dot(b)).abs() < SMOOTH => {
-                let s = unit_or_zero(a + b);
-                (s, s)
-            }
-            (Some(a), Some(b)) => (a, b),
-            (Some(a), None) => (a, a),
-            (None, Some(b)) => (b, b),
-            (None, None) => (Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0)),
-        }
-    };
-    for pos in 0..knots.len().saturating_sub(1) {
-        let (k0, k1) = (knots[pos], knots[pos + 1]);
-        let span = &pts[k0..=k1];
-        let mut cubic = fit_cubic(span, tangents(pos, true).1, tangents(pos + 1, true).0);
-        // An analytic direction holds at its point only; after a quick change of radius the side
-        // soon bends away from it, and a long cubic held to it bows out. If the cubic misses its
-        // points (by more than 0.001 pt), try directions taken from the polyline and keep the
-        // closer fit.
-        let error = max_distance(&cubic, span);
-        if (dirs[k0].is_some() || dirs[k1].is_some()) && error > 1e-3 {
-            let alternative = fit_cubic(span, tangents(pos, false).1, tangents(pos + 1, false).0);
-            if max_distance(&alternative, span) < error {
-                cubic = alternative;
-            }
-        }
-        path.curve_to(cubic.p1, cubic.p2, cubic.p3);
-    }
+    let t0 = blend(heads[0], heads[1.min(n - 1)].1, leave);
+    let t1 = blend(heads[n - 1], heads[n.saturating_sub(2)].1, arrive);
+    fit_cubic(span, t0, t1)
 }
 
-/// Largest distance from the points to the cubic.
-fn max_distance(c: &CubicBez, pts: &[Point]) -> f64 {
-    pts.iter().map(|&p| c.nearest(p, 1e-9).distance_sq).fold(0.0, f64::max).sqrt()
+/// The point `dist` along a polyline from its first point (its last point if it is shorter).
+fn point_along(mut pts: impl Iterator<Item = Point>, dist: f64) -> Point {
+    let Some(mut prev) = pts.next() else { return Point::ZERO };
+    let mut left = dist;
+    for p in pts {
+        let l = (p - prev).hypot();
+        if l > 0.0 && l >= left {
+            return prev.lerp(p, left / l);
+        }
+        left -= l;
+        prev = p;
+    }
+    prev
 }
 
 /// Least-squares cubic through `pts` with fixed endpoints and unit end tangents `t0` (leaving
-/// the start) and `t1` (arriving at the end), with Newton reparametrization rounds.
+/// the start) and `t1` (arriving at the end), with Gauss-Newton reparametrization rounds (no second-derivative term, whose sign can flip and
+/// throw a parameter to the other end: the fit stays continuous in the points).
 fn fit_cubic(pts: &[Point], t0: Vec2, t1: Vec2) -> CubicBez {
     let (a, b) = (pts[0], pts[pts.len() - 1]);
     let chord = (b - a).hypot();
@@ -547,23 +630,30 @@ fn fit_cubic(pts: &[Point], t0: Vec2, t1: Vec2) -> CubicBez {
             x1 += a1.dot(rest);
             x2 += a2.dot(rest);
         }
+        // A faint pull of both handles towards a third of the chord: where the points leave the
+        // handles undetermined (a straight span with tangents along it, where they only change
+        // the speed along the line), they take that value instead of swinging with every rounding;
+        // elsewhere it changes nothing measurable.
+        let ridge = 1e-3 * (c11 + c22);
+        let (c11, c22) = (c11 + ridge, c22 + ridge);
+        let (x1, x2) = (x1 + ridge * chord / 3.0, x2 + ridge * chord / 3.0);
         let det = c11 * c22 - c12 * c12;
         let (alpha, beta) = if det.abs() > 1e-18 {
             ((x1 * c22 - x2 * c12) / det, (c11 * x2 - c12 * x1) / det)
         } else {
             (chord / 3.0, chord / 3.0)
         };
-        // Handles pointing backwards or absurdly long would create loops and spikes.
-        let ok = |h: f64| h > 1e-6 * chord && h < 2.0 * chord;
-        let (alpha, beta) = if ok(alpha) && ok(beta) { (alpha, beta) } else { (chord / 3.0, chord / 3.0) };
+        // Handles pointing backwards or absurdly long would create loops and spikes: kept within
+        // bounds (continuously, so the cubic still follows its points as they move).
+        let bound = |h: f64| h.clamp(1e-6 * chord, 2.0 * chord);
+        let (alpha, beta) = (bound(alpha), bound(beta));
         best = CubicBez::new(a, a + t0 * alpha, b - t1 * beta, b);
-        // Newton step per parameter: minimize |B(u) − p|.
+        // Gauss-Newton step per parameter: minimize |B(u) − p|.
         let d1 = best.deriv();
-        let d2 = d1.deriv();
         for (p, t) in pts.iter().zip(u.iter_mut()) {
             let diff = best.eval(*t) - *p;
-            let (f1, f2) = (d1.eval(*t).to_vec2(), d2.eval(*t).to_vec2());
-            let den = f1.dot(f1) + diff.dot(f2);
+            let f1 = d1.eval(*t).to_vec2();
+            let den = f1.dot(f1);
             if den.abs() > 1e-18 {
                 *t = (*t - diff.dot(f1) / den).clamp(0.0, 1.0);
             }
@@ -746,4 +836,3 @@ mod tests {
         assert!((path.area().abs() - std::f64::consts::PI * 0.04).abs() < 1e-3);
     }
 }
-

@@ -1,0 +1,105 @@
+//! Projects saved to a folder and opened again.
+
+use std::path::PathBuf;
+
+use kurbo::{Affine, BezPath, CubicBez, Point, Rect};
+use scriptoria_project::{
+    Error, FORMAT, Glyph, GlyphStroke, Outline, OutlineKind, Project, SkeletonPiece, StrokeOrigin, initial_placement,
+};
+
+/// A fresh, empty folder under the system's temporary directory.
+fn folder(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("scriptoria-project-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn stroke(x: f64, origin: Option<StrokeOrigin>, kind: OutlineKind) -> GlyphStroke {
+    let mut path = BezPath::new();
+    path.move_to((x, 1.0 / 3.0));
+    path.curve_to((x + 0.1, 0.2), (x + 0.3, 0.25), (x + 0.4, 1.0));
+    path.close_path();
+    let (a, b, c) = (Point::new(x, 0.5), Point::new(x + 0.2, 0.6), Point::new(x + 0.4, 0.55));
+    let piece = SkeletonPiece {
+        circles: vec![(a, 0.1), (b, 0.12345678901234567), (c, 0.09)],
+        spine: vec![CubicBez::new(a, Point::new(x + 0.05, 0.55), Point::new(x + 0.15, 0.6), b), CubicBez::new(b, Point::new(x + 0.25, 0.6), Point::new(x + 0.35, 0.56), c)],
+    };
+    let dot = SkeletonPiece { circles: vec![(Point::new(x, 2.0), 0.2)], spine: vec![] };
+    GlyphStroke {
+        origin,
+        outline: Outline { kind, path },
+        skeleton: vec![piece, dot],
+        placement: initial_placement(Rect::new(x, 0.0, x + 4.5, 4.5), &Default::default()) * Affine::rotate(0.01),
+    }
+}
+
+fn sample() -> Project {
+    let mut p = Project::new("Test Hand");
+    let source = p.source_for(&PathBuf::from("notes/page.pdf"));
+    p.add_chars("世A a");
+    p.glyphs[0].strokes = vec![
+        stroke(1.0, Some(StrokeOrigin { source: source.clone(), page: 2, index: 1617 }), OutlineKind::Filled),
+        stroke(2.0, None, OutlineKind::Line { width: 0.25 }),
+    ];
+    p.glyphs[1].strokes = vec![stroke(3.0, Some(StrokeOrigin { source, page: 0, index: 7 }), OutlineKind::Filled)];
+    p.glyphs[1].advance = 612.5;
+    p
+}
+
+#[test]
+fn projects_come_back_as_they_were_saved() {
+    let dir = folder("round-trip");
+    let project = sample();
+    project.save(&dir).unwrap();
+    let back = Project::load(&dir).unwrap();
+    assert_eq!(back, project);
+    // "A" and "a" differ only in case: two files, the empty "a" none.
+    let files: Vec<String> = std::fs::read_dir(dir.join("glyphs")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn files_of_glyphs_without_strokes_are_removed() {
+    let dir = folder("stale");
+    let mut project = sample();
+    project.save(&dir).unwrap();
+    project.glyphs[1].strokes.clear();
+    project.save(&dir).unwrap();
+    assert_eq!(std::fs::read_dir(dir.join("glyphs")).unwrap().count(), 1);
+    assert_eq!(Project::load(&dir).unwrap(), project);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn other_format_versions_are_refused() {
+    let dir = folder("version");
+    sample().save(&dir).unwrap();
+    let toml = dir.join("project.toml");
+    let text = std::fs::read_to_string(&toml).unwrap().replace(&format!("format = {FORMAT}"), "format = 99");
+    std::fs::write(&toml, text).unwrap();
+    assert!(matches!(Project::load(&dir), Err(Error::Format(99))));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_broken_glyph_file_names_itself() {
+    let dir = folder("broken");
+    sample().save(&dir).unwrap();
+    let file = std::fs::read_dir(dir.join("glyphs")).unwrap().next().unwrap().unwrap().path();
+    std::fs::write(&file, "<svg><g class=\"stroke\" transform=\"rotate(3)\"></g></svg>").unwrap();
+    match Project::load(&dir) {
+        Err(Error::Svg(path, message)) => {
+            assert_eq!(path, file);
+            assert!(message.contains("transform"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn empty_glyphs_have_no_strokes() {
+    let g = Glyph::for_char('x', &Default::default());
+    assert!(g.bounds().is_none());
+}

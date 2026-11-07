@@ -1,0 +1,10 @@
+[package]
+name = "scriptoria-project"
+version = "0.1.0"
+edition = "2024"
+description = "A handwriting font project: font settings, glyphs and their strokes in writing order, stored as a folder of TOML and SVG"
+
+[dependencies]
+kurbo = "0.13"
+serde = { version = "1", features = ["derive"] }
+toml = "1"

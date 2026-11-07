@@ -1,0 +1,12 @@
+[package]
+name = "scriptoria-outline"
+version = "0.1.0"
+edition = "2024"
+description = "Regenerates stroke outlines from skeletons at any weight (fixed structure, ready for variable fonts)"
+
+[dependencies]
+kurbo = "0.13"
+scriptoria-skeleton = { path = "../skeleton" }
+
+[dev-dependencies]
+scriptoria-testkit = { path = "../testkit" }

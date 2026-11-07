@@ -1,0 +1,13 @@
+[package]
+name = "scriptoria-ink"
+version = "0.1.0"
+edition = "2024"
+description = "Extracts handwritten strokes from PDFs (Goodnotes and similar), in writing order"
+
+[dependencies]
+anyhow = "1.0.104"
+hayro-interpret = "0.9"
+hayro-syntax = "0.9"
+
+[dev-dependencies]
+pdf-writer = "0.15"

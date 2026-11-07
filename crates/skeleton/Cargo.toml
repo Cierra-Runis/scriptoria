@@ -1,0 +1,11 @@
+[package]
+name = "scriptoria-skeleton"
+version = "0.1.0"
+edition = "2024"
+description = "Recovers stroke skeletons (circles along a centerline) from outlines drawn as chains of capsules"
+
+[dependencies]
+kurbo = "0.13"
+
+[dev-dependencies]
+scriptoria-testkit = { path = "../testkit" }

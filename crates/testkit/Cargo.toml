@@ -1,0 +1,9 @@
+[package]
+name = "scriptoria-testkit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Test helpers for 2D shape crates: raster comparison metrics, visual HTML/SVG reports, SVG test data"
+
+[dependencies]
+kurbo = "0.13"

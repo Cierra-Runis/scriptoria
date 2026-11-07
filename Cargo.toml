@@ -1,6 +1,36 @@
+[workspace]
+members = ["crates/*"]
+
 [package]
 name = "scriptoria"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+gpui = { version = "*" }
+lyon = "1.0"
+scriptoria-ink = { path = "crates/ink" }
+scriptoria-outline = { path = "crates/outline" }
+scriptoria-skeleton = { path = "crates/skeleton" }
+
+# The tools in `examples/` and the pipeline test in `tests/` (they read `test/test.pdf`).
+[dev-dependencies]
+scriptoria-testkit = { path = "crates/testkit" }
+
+# Optimize the compute-heavy packages even in debug builds, so the viewer and tests stay fast
+# (only these packages; they compile quickly).
+[profile.dev.package.scriptoria-skeleton]
+opt-level = 3
+
+[profile.dev.package.scriptoria-outline]
+opt-level = 3
+
+[profile.dev.package.lyon_tessellation]
+opt-level = 3
+
+[profile.dev.package.kurbo]
+opt-level = 3
+
+[profile.dev.package.scriptoria-testkit]
+opt-level = 3

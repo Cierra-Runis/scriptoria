@@ -27,6 +27,7 @@ use scriptoria_project::{Glyph, GlyphStroke, Outline, OutlineKind, SkeletonPiece
 
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::mesh::Mesh;
+use crate::font::AXIS;
 
 /// Tessellation tolerance (pt, the strokes' own units): an em of 4.5 pt is some 600 px here.
 const TOLERANCE: f32 = 0.001;
@@ -203,7 +204,7 @@ pub struct GlyphView {
 
 impl GlyphView {
     pub fn new(document: Entity<Document>, glyph: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let weight = cx.new(|_| SliderState::new().min(100.0).max(900.0).step(1.0).default_value(400.0));
+        let weight = cx.new(|_| SliderState::new().min(AXIS.min as f32).max(AXIS.default as f32).step(1.0).default_value(AXIS.default as f32));
         let advance = cx.new(|cx| InputState::new(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&document, window, move |this, _, event: &DocumentEvent, window, cx| match event {
@@ -282,7 +283,7 @@ impl GlyphView {
 
     /// The radius scale of the weight shown.
     fn scale(&self, cx: &App) -> f64 {
-        crate::font::scale_at(self.wght(cx), self.document.read(cx).project.font.weight_scales)
+        crate::font::scale_at(self.wght(cx), self.document.read(cx).project.font.thinnest)
     }
 
     fn regenerated(&self) -> bool {
@@ -327,8 +328,8 @@ impl GlyphView {
         if jobs.is_empty() {
             return;
         }
-        let [thinnest, _, boldest] = self.document.read(cx).project.font.weight_scales;
-        let params = PlanParams { precision: PRECISION, weights: (thinnest, boldest) };
+        let thinnest = self.document.read(cx).project.font.thinnest;
+        let params = PlanParams { precision: PRECISION, weights: (thinnest, 1.0) };
         let background = cx.background_executor().clone();
         self.planning = Some(cx.spawn(async move |this, cx| {
             let plans = background

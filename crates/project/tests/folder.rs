@@ -83,6 +83,20 @@ fn other_format_versions_are_refused() {
 }
 
 #[test]
+fn projects_from_before_the_thinnest_weight_open() {
+    // Early projects gave three radius scales instead (thinnest, default, boldest).
+    let dir = folder("thinnest");
+    let mut p = sample();
+    p.font.thinnest = 0.5;
+    p.save(&dir).unwrap();
+    let toml = dir.join("project.toml");
+    let text = std::fs::read_to_string(&toml).unwrap().replace("thinnest = 0.5", "weight_scales = [0.3, 1.0, 3.0]");
+    std::fs::write(&toml, text).unwrap();
+    assert_eq!(Project::load(&dir).unwrap().font.thinnest, 0.3);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn a_broken_glyph_file_names_itself() {
     let dir = folder("broken");
     sample().save(&dir).unwrap();

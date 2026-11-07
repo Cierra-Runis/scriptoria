@@ -42,15 +42,21 @@ pub struct FontInfo {
     pub units_per_em: u16,
     pub ascender: i16,
     pub descender: i16,
-    /// Stroke radius scales at the weight axis' minimum, default and maximum (wght 100, 400, 900).
-    pub weight_scales: [f64; 3],
+    /// The stroke radius scale of the thinnest weight: the strokes as written are the boldest (and
+    /// the default) weight, and the weight axis runs from them down to this.
+    #[serde(default = "default_thinnest")]
+    pub thinnest: f64,
     /// How new strokes are placed: page units (pt) per em.
     pub pt_per_em: f64,
 }
 
+fn default_thinnest() -> f64 {
+    0.3
+}
+
 impl Default for FontInfo {
     fn default() -> Self {
-        FontInfo { family: "Untitled".into(), units_per_em: 1000, ascender: 880, descender: -120, weight_scales: [0.3, 1.0, 3.0], pt_per_em: 4.5 }
+        FontInfo { family: "Untitled".into(), units_per_em: 1000, ascender: 880, descender: -120, thinnest: default_thinnest(), pt_per_em: 4.5 }
     }
 }
 

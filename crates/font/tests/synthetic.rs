@@ -65,9 +65,29 @@ fn source() -> FontSource {
     }
 }
 
+/// The same glyphs on an axis that ends at its default: the outlines as given are the boldest, the
+/// others thinner.
+fn source_ending_at_the_default() -> FontSource {
+    let mut source = source();
+    source.axis = Axis { min: 100.0, default: 400.0, max: 400.0 };
+    source.instances = vec![("Thin".into(), 100.0), ("Light".into(), 300.0), ("Regular".into(), 400.0)];
+    for g in &mut source.glyphs {
+        g.masters.retain(|m| m.0 <= 400.0);
+    }
+    source
+}
+
 #[test]
 fn outlines_come_back_at_and_between_masters() {
-    let source = source();
+    outlines_come_back(source());
+}
+
+#[test]
+fn the_default_may_end_the_axis() {
+    outlines_come_back(source_ending_at_the_default());
+}
+
+fn outlines_come_back(source: FontSource) {
     let bytes = build(&source).expect("build");
     let font = font(&bytes);
     for g in &source.glyphs {

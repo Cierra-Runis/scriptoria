@@ -46,8 +46,9 @@ const ZOOM_RANGE: (f32, f32) = (0.25, 64.0);
 const ZOOM_PER_PX: f32 = 0.004;
 /// A drag shorter than this is a click, not a pan.
 const DRAG_THRESHOLD: f32 = 3.0;
-/// Weight (radius scale) range and step.
-const WEIGHT_RANGE: (f32, f32) = (0.3, 2.5);
+/// Weight (radius scale) range and step: as in the font, from the thinnest weight to the strokes
+/// as written.
+const WEIGHT_RANGE: (f32, f32) = (crate::font::THINNEST as f32, 1.0);
 const WEIGHT_STEP: f32 = 0.05;
 /// What regenerated outlines must achieve: the default precision over the weight slider's range.
 const PLAN: PlanParams = PlanParams { precision: 0.004, weights: (WEIGHT_RANGE.0 as f64, WEIGHT_RANGE.1 as f64) };
@@ -881,7 +882,6 @@ impl Viewer {
     fn render_weight_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds_cell = self.weight_bounds.clone();
         let frac = (self.weight - WEIGHT_RANGE.0) / (WEIGHT_RANGE.1 - WEIGHT_RANGE.0);
-        let at_one = (1.0 - WEIGHT_RANGE.0) / (WEIGHT_RANGE.1 - WEIGHT_RANGE.0);
         let accent = hsla(0.58, 0.9, 0.5, 1.0);
         div()
             .id("weight-slider")
@@ -899,10 +899,6 @@ impl Viewer {
                         let y = bounds.origin.y + (bounds.size.height - track_h) / 2.0;
                         let track = Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, track_h));
                         window.paint_quad(quad(track, px(2.0), rgb(0xDDDDDD), px(0.0), gpui::transparent_black(), Default::default()));
-                        // Tick at ×1 (the original weight).
-                        let x1 = bounds.origin.x + bounds.size.width * at_one;
-                        let tick = Bounds::new(point(x1 - px(1.0), bounds.origin.y + px(5.0)), size(px(2.0), bounds.size.height - px(10.0)));
-                        window.paint_quad(quad(tick, px(1.0), rgb(0x9CA3AF), px(0.0), gpui::transparent_black(), Default::default()));
                         let c = point(bounds.origin.x + bounds.size.width * frac, bounds.origin.y + bounds.size.height / 2.0);
                         let thumb = Bounds::new(c - point(px(7.0), px(7.0)), size(px(14.0), px(14.0)));
                         window.paint_quad(quad(thumb, px(7.0), gpui::white(), px(2.0), accent, Default::default()));

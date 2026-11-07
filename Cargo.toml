@@ -13,6 +13,7 @@ lyon = "1.0"
 scriptoria-ink = { path = "crates/ink" }
 scriptoria-outline = { path = "crates/outline" }
 scriptoria-skeleton = { path = "crates/skeleton" }
+scriptoria-font = { path = "crates/font" }
 
 # The tools in `examples/` and the pipeline test in `tests/` (they read `test/test.pdf`).
 [dev-dependencies]

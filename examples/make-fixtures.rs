@@ -6,6 +6,8 @@
 //! - `crates/skeleton/tests/data/drawing.svg`: a few strokes from drawings (smoke test only);
 //! - `crates/outline/tests/data/{strokes,characters}.svg`: the skeletons of the same strokes, as
 //!   recovered now.
+//! - `crates/font/tests/data/glyphs.svg`: the characters as font glyphs, their outlines at the
+//!   masters each needs (font units, `wght` values; see `scriptoria::font`).
 //!
 //! `cargo run --release --example make-fixtures`
 
@@ -19,9 +21,6 @@ use scriptoria_testkit::data::{self, Group, Skeleton, SkeletonPiece, StrokeKind}
 
 /// A single stroke: page, index in writing order, tags (situations it exercises).
 struct Pick(usize, usize, &'static str);
-
-/// A character: name, page, rectangle (page points, y down) holding the centers of its strokes.
-struct Character(&'static str, usize, [f64; 4]);
 
 const STROKES: &[Pick] = &[
     // Ordinary strokes of characters.
@@ -52,35 +51,6 @@ const STROKES: &[Pick] = &[
     Pick(2, 8, "dot"),
 ];
 
-const CHARACTERS: &[Character] = &[
-    // Chinese.
-    Character("世", 2, [212.9, 187.8, 217.9, 192.2]),
-    Character("界", 2, [218.0, 187.8, 223.0, 192.3]),
-    Character("你", 2, [214.6, 152.6, 218.25, 155.6]),
-    Character("好", 2, [218.3, 152.6, 221.6, 155.6]),
-    Character("啊", 2, [221.8, 152.6, 225.4, 155.6]),
-    Character("吉", 2, [118.6, 62.3, 121.4, 65.2]),
-    Character("敷", 2, [121.4, 62.3, 125.4, 65.2]),
-    Character("佳", 2, [126.1, 62.3, 129.55, 65.3]),
-    Character("助", 2, [129.55, 62.3, 133.5, 65.3]),
-    // Kana.
-    Character("あ", 2, [294.0, 209.3, 296.9, 212.1]),
-    Character("き", 2, [296.9, 213.8, 299.4, 216.4]),
-    Character("す", 2, [299.9, 217.4, 302.4, 220.3]),
-    Character("ぬ", 2, [300.1, 225.7, 303.3, 228.5]),
-    Character("の", 2, [307.2, 225.7, 309.8, 228.5]),
-    Character("る", 2, [300.6, 228.8, 303.3, 231.9]),
-    Character("れ", 2, [303.6, 228.8, 306.9, 231.9]),
-    // Latin.
-    Character("A", 0, [64.6, 7.6, 67.7, 10.6]),
-    Character("B", 0, [69.6, 7.7, 72.6, 10.6]),
-    Character("G", 0, [92.1, 7.8, 95.4, 11.0]),
-    Character("K", 0, [79.4, 12.4, 82.2, 15.4]),
-    Character("Q", 0, [73.6, 16.8, 77.0, 21.0]),
-    Character("S", 0, [83.7, 17.8, 87.0, 21.3]),
-    Character("Z", 0, [84.8, 23.4, 88.4, 26.6]),
-];
-
 const DRAWING: &[Pick] = &[Pick(2, 2, "drawing"), Pick(2, 3, "drawing"), Pick(2, 4, "drawing"), Pick(2, 145, "drawing")];
 
 fn main() {
@@ -92,11 +62,11 @@ fn main() {
         STROKES.iter().map(|&Pick(page, index, tags)| vec![(page, &pages[page].strokes[index], tags)]).collect();
     let singles = Layout::grid(singles.into_iter().map(|s| (None, s)).collect());
     let characters = Layout::grid(
-        CHARACTERS
+        common::CHARACTERS
             .iter()
-            .map(|&Character(name, page, [x0, y0, x1, y1])| {
-                let rect = Rect::new(x0, y0, x1, y1);
-                let strokes: Vec<_> = pages[page].strokes.iter().filter(|s| rect.contains(s.bbox.center())).map(|s| (page, s, "")).collect();
+            .map(|c| {
+                let (name, page) = (c.0, c.1);
+                let strokes: Vec<_> = common::strokes_in(&pages[page], c.rect()).into_iter().map(|s| (page, s, "")).collect();
                 println!("{name}: {} strokes ({})", strokes.len(), strokes.iter().map(|(_, s, _)| s.order.to_string()).collect::<Vec<_>>().join(" "));
                 (Some(name), strokes)
             })
@@ -111,6 +81,16 @@ fn main() {
     data::write_strokes(&skeleton_dir.join("drawing.svg"), "drawing strokes", &drawing.strokes());
     data::write_skeletons(&outline_dir.join("strokes.svg"), "skeletons of single strokes", &singles.skeletons());
     data::write_skeletons(&outline_dir.join("characters.svg"), "skeletons of characters", &characters.skeletons());
+    let layout = scriptoria::font::Layout::default();
+    let glyphs: Vec<data::Glyph> = common::CHARACTERS
+        .iter()
+        .map(|c| {
+            let g = scriptoria::font::glyph(c.char(), &common::strokes_in(&pages[c.1], c.rect()), c.rect(), &layout);
+            println!("{}: {} masters", c.0, g.masters.len());
+            data::Glyph { name: g.name, chars: g.chars, advance: g.advance, masters: g.masters }
+        })
+        .collect();
+    data::write_glyphs(&root.join("crates/font/tests/data/glyphs.svg"), "glyphs at their masters (font units, wght)", &glyphs);
     for (page, s, tags) in singles.groups.iter().flat_map(|g| &g.items) {
         println!("{:<14} {tags:<20} {} subpaths, start ({:.2}, {:.2}), size {:.2}×{:.2}", id(*page, s.order), s.subpaths, s.start.x, s.start.y, s.bbox.width(), s.bbox.height());
     }

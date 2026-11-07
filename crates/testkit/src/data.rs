@@ -17,6 +17,11 @@
 //! `<path class="piece" data-r="r₀ r₁ …" d="…"/>` per connected piece: the path is the centerline,
 //! one cubic segment between consecutive circle centers (a lone `M x y` for a single circle), and
 //! `data-r` lists the radii. Circles drawn for viewing are ignored when reading.
+//!
+//! A glyph (an outline at several points of a variation axis, in font units with y up) is a
+//! `<g class="glyph" id="name" data-chars="…" data-advance="…" transform="…">` holding one
+//! `<path data-axis="value" d="…"/>` per master. The transform only lays the glyphs out upright for
+//! viewing and is ignored when reading.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -55,6 +60,16 @@ pub struct Skeleton {
     pub tags: Vec<String>,
     pub source: Option<String>,
     pub pieces: Vec<SkeletonPiece>,
+}
+
+/// A glyph's outline at several masters (points along one variation axis), in font units, y up.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Glyph {
+    pub name: String,
+    pub chars: Vec<char>,
+    pub advance: f64,
+    /// (axis value, outline), by increasing axis value.
+    pub masters: Vec<(f64, BezPath)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -175,6 +190,32 @@ pub fn write_skeletons(path: &Path, title: &str, groups: &[Group<Skeleton>]) {
             body += "</g>\n";
         }
         close_group(&mut body, group);
+    }
+    write_svg(path, title, bounds.unwrap_or(Rect::ZERO), &body);
+}
+
+/// Glyphs side by side on a baseline, each master drawn faintly over the others (thinnest first).
+pub fn write_glyphs(path: &Path, title: &str, glyphs: &[Glyph]) {
+    let mut bounds: Option<Rect> = None;
+    let mut body = String::new();
+    let mut x = 0.0;
+    for g in glyphs {
+        let chars: String = g.chars.iter().collect();
+        let _ = writeln!(
+            body,
+            "<g class=\"glyph\" id=\"{}\" data-chars=\"{}\" data-advance=\"{}\" transform=\"translate({x} 0) scale(1 -1)\">",
+            escape(&g.name),
+            escape(&chars),
+            g.advance
+        );
+        for (value, outline) in &g.masters {
+            let b = outline.bounding_box();
+            let b = Rect::new(b.x0 + x, -b.y1, b.x1 + x, -b.y0);
+            bounds = Some(bounds.map_or(b, |a| a.union(b)));
+            let _ = writeln!(body, "<path data-axis=\"{value}\" fill=\"{INK}\" fill-opacity=\"0.25\" d=\"{}\"/>", outline.to_svg());
+        }
+        body += "</g>\n";
+        x += g.advance;
     }
     write_svg(path, title, bounds.unwrap_or(Rect::ZERO), &body);
 }
@@ -324,6 +365,35 @@ pub fn read_skeletons(path: &Path) -> Vec<Group<Skeleton>> {
     groups
 }
 
+pub fn read_glyphs(path: &Path) -> Vec<Glyph> {
+    let text = read(path);
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    let mut in_glyph = false;
+    for tag in tags(&text) {
+        match (tag.name.as_str(), tag.close) {
+            ("g", false) if tag.get("class").as_deref() == Some("glyph") => {
+                glyphs.push(Glyph {
+                    name: tag.get("id").unwrap_or_default(),
+                    chars: tag.get("data-chars").unwrap_or_default().chars().collect(),
+                    advance: tag.number("data-advance"),
+                    masters: Vec::new(),
+                });
+                in_glyph = true;
+            }
+            ("g", true) => in_glyph = false,
+            ("path", false) if in_glyph => {
+                let glyph = glyphs.last_mut().unwrap();
+                glyph.masters.push((tag.number("data-axis"), tag.path()));
+            }
+            _ => {}
+        }
+    }
+    for g in &mut glyphs {
+        g.masters.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    glyphs
+}
+
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
@@ -456,5 +526,25 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].items, groups[0].items);
+    }
+
+    #[test]
+    fn glyphs_round_trip() {
+        let master = |w: f64| {
+            let mut p = BezPath::new();
+            p.move_to((0.0, 0.0));
+            p.curve_to((100.0, 200.0 * w), (300.0, 200.0), (400.0 + 1.0 / 3.0, 0.0));
+            p.close_path();
+            p
+        };
+        let glyphs = vec![
+            Glyph { name: "uni4E16".into(), chars: vec!['世'], advance: 1000.0, masters: vec![(100.0, master(0.3)), (400.0, master(1.0))] },
+            Glyph { name: "A".into(), chars: vec!['A', 'a'], advance: 612.5, masters: vec![(400.0, master(2.0))] },
+        ];
+        let file = temp("glyphs.svg");
+        write_glyphs(&file, "round trip", &glyphs);
+        let back = read_glyphs(&file);
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(back, glyphs);
     }
 }

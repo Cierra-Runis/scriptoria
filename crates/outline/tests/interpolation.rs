@@ -25,10 +25,7 @@ const MAX_IOU_LOSS: f64 = 0.03;
 
 /// Strokes known to lose more ink between masters (reported, not failed; the test fails if one
 /// stops losing, so the list stays honest).
-const KNOWN_ISSUES: &[(&str, &str)] = &[
-    ("p0-1420", "a dot whose big circle swallows its short tail between ×0.3 and ×0.5: the caps' reach changes faster than masters a sixteenth of the range apart can follow"),
-    ("p2-1399", "the same kind of dot"),
-];
+const KNOWN_ISSUES: &[(&str, &str)] = &[];
 
 /// The point-by-point linear interpolation of two compatible paths.
 fn lerp_path(a: &BezPath, b: &BezPath, t: f64) -> BezPath {

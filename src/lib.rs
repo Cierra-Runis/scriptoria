@@ -1,6 +1,8 @@
 //! The glue between the crates, shared by the viewer, the tools in `examples/` and the pipeline
 //! test in `tests/`: PDF strokes (scriptoria-ink) → skeletons (scriptoria-skeleton) → outlines
-//! (scriptoria-outline).
+//! (scriptoria-outline) → font glyphs (scriptoria-font, see [`font`]).
+
+pub mod font;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

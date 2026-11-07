@@ -1,14 +1,17 @@
-//! Ink viewer: tells strokes apart, replays them in writing order, zooms and pans; in skeleton mode
-//! every stroke is regenerated from its skeleton at any weight.
+//! A handwritten document's pages: tells strokes apart, replays them in writing order, zooms and
+//! pans; in skeleton mode every stroke is regenerated from its skeleton at any weight. Strokes are
+//! selected (click, box, lasso) and assigned to a glyph; strokes already in a glyph are marked.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui::TestSupportExt as _;
 use gpui::prelude::*;
 use gpui::{
-    Bounds, ContentMask, Context, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Bounds, ContentMask, Context, EventEmitter, FocusHandle, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Path, PathBuilder, Pixels, Point, ScrollEvent, SharedString, Task, Window, canvas, div, hsla,
     point, px, quad, rgb, size,
 };
@@ -17,7 +20,7 @@ use scriptoria_ink::{InkDocument, InkPage, Stroke, StrokeShape};
 use scriptoria_outline::{Plan, PlanParams, WeightParams};
 use scriptoria_skeleton::Skeleton;
 
-use crate::mesh::Mesh;
+use crate::app::mesh::Mesh;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorMode {
@@ -111,15 +114,15 @@ struct SkeletonBase {
 
 impl SkeletonBase {
     fn compute(strokes: &[Stroke]) -> Self {
-        let skeletons = scriptoria::par_map(strokes, scriptoria::skeleton);
-        let plans = scriptoria::par_map(&skeletons, |sk| scriptoria_outline::plan(sk, &PLAN));
+        let skeletons = crate::par_map(strokes, crate::skeleton);
+        let plans = crate::par_map(&skeletons, |sk| scriptoria_outline::plan(sk, &PLAN));
         Self { skeletons, plans }
     }
 
     /// Every stroke's outline at `weight`, tessellated.
     fn meshes(&self, weight: f32) -> Vec<Option<Mesh>> {
         let w = WeightParams::scaled(weight as f64);
-        scriptoria::par_map(&self.plans, |plan| {
+        crate::par_map(&self.plans, |plan| {
             let path = scriptoria_outline::expand(plan, &w);
             Mesh::from_path(&path, StrokeShape::Outline { non_zero: true }, true)
         })
@@ -172,10 +175,25 @@ impl PathCache {
 #[derive(Clone, Copy)]
 struct Drag {
     button: MouseButton,
+    modifiers: Modifiers,
     start: Point<Pixels>,
     last: Point<Pixels>,
     moved: bool,
 }
+
+/// A selection being dragged out (window coordinates).
+#[derive(Clone)]
+enum Marquee {
+    Box { start: Point<Pixels>, end: Point<Pixels> },
+    Lasso(Vec<Point<Pixels>>),
+}
+
+pub enum ViewerEvent {
+    /// Put these strokes (in writing order, from this page) into the target glyph.
+    Assign { page: usize, strokes: Vec<Stroke> },
+}
+
+impl EventEmitter<ViewerEvent> for Viewer {}
 
 fn rgba_to_hsla([r, g, b, a]: [u8; 4]) -> Hsla {
     gpui::Rgba { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: a as f32 / 255.0 }.into()
@@ -205,6 +223,19 @@ fn paint_skeleton(window: &mut Window, layout: Layout, sk: &Skeleton, plan: &Pla
         let b = Bounds::new(c - point(px(r), px(r)), size(px(2.0 * r), px(2.0 * r)));
         window.paint_quad(quad(b, px(r), gpui::transparent_black(), px(1.0), ink.opacity(0.8), Default::default()));
     }
+}
+
+/// Whether a point lies inside a polygon (even-odd rule).
+fn inside(polygon: &[kurbo::Point], p: kurbo::Point) -> bool {
+    let n = polygon.len();
+    let mut inside = false;
+    for i in 0..n {
+        let (a, b) = (polygon[i], polygon[(i + 1) % n]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 /// Mixes `a` and `b` by `t` in RGB; the result is opaque.
@@ -247,6 +278,13 @@ pub struct Viewer {
     scrub_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     weight_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     cache: Rc<RefCell<PathCache>>,
+    /// Selected strokes of this page, by index.
+    selection: BTreeSet<usize>,
+    /// Strokes already in some glyph: (page, index).
+    assigned: Rc<HashSet<(usize, usize)>>,
+    /// The glyph selected strokes would go to.
+    target: Option<SharedString>,
+    marquee: Option<Marquee>,
 }
 
 impl Viewer {
@@ -278,11 +316,29 @@ impl Viewer {
             scrub_bounds: Rc::default(),
             weight_bounds: Rc::default(),
             cache: Rc::default(),
+            selection: BTreeSet::new(),
+            assigned: Rc::default(),
+            target: None,
+            marquee: None,
         }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    pub fn page_index(&self) -> usize {
+        self.page_index
+    }
+
+    /// Where a point of the page is in the window, once the page has been laid out.
+    pub fn page_to_window(&self, p: kurbo::Point) -> Option<Point<Pixels>> {
+        self.layout().map(|l| l.to_window(p))
+    }
+
+    /// The strokes marked as already in a glyph: (page, index).
+    pub fn assigned(&self) -> &HashSet<(usize, usize)> {
+        &self.assigned
     }
 
     fn total(&self) -> usize {
@@ -305,11 +361,59 @@ impl Viewer {
         }
     }
 
+    // ---- Selection and assignment ----
+
+    /// Marks the strokes already in a glyph: (page, index).
+    pub fn set_assigned(&mut self, assigned: HashSet<(usize, usize)>, cx: &mut Context<Self>) {
+        self.assigned = Rc::new(assigned);
+        cx.notify();
+    }
+
+    /// The glyph selected strokes would go to (its label), if any.
+    pub fn set_target(&mut self, target: Option<SharedString>, cx: &mut Context<Self>) {
+        self.target = target;
+        cx.notify();
+    }
+
+    /// Selects the shown strokes whose centers `contains` accepts (page coordinates), adding to the
+    /// selection or replacing it.
+    fn select_where(&mut self, contains: impl Fn(kurbo::Point) -> bool, add: bool, cx: &mut Context<Self>) {
+        if !add {
+            self.selection.clear();
+        }
+        for (i, s) in self.page.ink.strokes.iter().enumerate().take(self.visible) {
+            if contains(s.bbox.center()) {
+                self.selection.insert(i);
+            }
+        }
+        cx.notify();
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.selection.is_empty() {
+            self.selection.clear();
+            cx.notify();
+        }
+    }
+
+    /// Asks for the selected strokes to go into the target glyph.
+    fn request_assign(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let strokes = self.selection.iter().map(|&i| self.page.ink.strokes[i].clone()).collect();
+        self.selection.clear();
+        cx.emit(ViewerEvent::Assign { page: self.page_index, strokes });
+        cx.notify();
+    }
+
     fn go_to_page(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.doc.page_count() || index == self.page_index {
             return;
         }
         if let Some(ink) = self.doc.page(index) {
+            self.selection.clear();
+            self.marquee = None;
             self.playing = None;
             self.page_index = index;
             self.page = Rc::new(PageData::new(ink));
@@ -472,6 +576,8 @@ impl Viewer {
             "-" => self.zoom_at_center(0.8, cx),
             "0" => self.reset_zoom(cx),
             "k" => self.toggle_skeleton(cx),
+            "enter" => self.request_assign(cx),
+            "escape" => self.clear_selection(cx),
             "[" => self.set_weight(self.weight - 0.1, cx),
             "]" => self.set_weight(self.weight + 0.1, cx),
             "1" | "2" | "3" => {
@@ -485,8 +591,12 @@ impl Viewer {
 
     // ---- Mouse ----
 
-    fn on_canvas_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.drag = Some(Drag { button: ev.button, start: ev.position, last: ev.position, moved: false });
+    /// Left button: a click selects the stroke under it (with Ctrl or Shift, adds or removes it), a
+    /// drag selects the strokes whose centers it encloses (a box; a lasso with Alt). Middle button:
+    /// pans.
+    fn on_canvas_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        self.drag = Some(Drag { button: ev.button, modifiers: ev.modifiers, start: ev.position, last: ev.position, moved: false });
         cx.stop_propagation();
     }
 
@@ -510,7 +620,20 @@ impl Viewer {
                 drag.last = drag.start;
             }
             if drag.moved {
-                self.pan = self.pan + (ev.position - drag.last);
+                if drag.button == MouseButton::Left {
+                    let marquee = match self.marquee.take() {
+                        Some(Marquee::Box { start, .. }) => Marquee::Box { start, end: ev.position },
+                        Some(Marquee::Lasso(mut points)) => {
+                            points.push(ev.position);
+                            Marquee::Lasso(points)
+                        }
+                        None if drag.modifiers.alt => Marquee::Lasso(vec![drag.start, ev.position]),
+                        None => Marquee::Box { start: drag.start, end: ev.position },
+                    };
+                    self.marquee = Some(marquee);
+                } else {
+                    self.pan = self.pan + (ev.position - drag.last);
+                }
                 drag.last = ev.position;
                 cx.notify();
             }
@@ -522,17 +645,38 @@ impl Viewer {
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.slider = None;
-        if let Some(drag) = self.drag.take().filter(|d| d.button == ev.button) {
-            if drag.moved {
-                self.update_hover(ev.position, cx);
-            } else if drag.button == MouseButton::Left
-                && let Some(i) = self.hovered
-            {
-                // Clicking a stroke moves playback to it.
-                self.playing = None;
-                self.set_visible(i + 1, cx);
-            }
+        let Some(drag) = self.drag.take().filter(|d| d.button == ev.button) else { return };
+        if drag.button != MouseButton::Left {
+            self.update_hover(ev.position, cx);
+            return;
         }
+        let add = drag.modifiers.shift || drag.modifiers.secondary(cx);
+        match (drag.moved, self.marquee.take(), self.layout()) {
+            (true, Some(Marquee::Box { start, end }), Some(layout)) => {
+                let rect = kurbo::Rect::from_points(layout.to_page(start), layout.to_page(end));
+                self.select_where(|p| rect.contains(p), add, cx);
+            }
+            (true, Some(Marquee::Lasso(points)), Some(layout)) => {
+                let polygon: Vec<kurbo::Point> = points.iter().map(|&p| layout.to_page(p)).collect();
+                self.select_where(|p| inside(&polygon, p), add, cx);
+            }
+            (false, _, _) => match self.hovered {
+                Some(i) if add => {
+                    if !self.selection.remove(&i) {
+                        self.selection.insert(i);
+                    }
+                    cx.notify();
+                }
+                Some(i) => {
+                    self.selection = BTreeSet::from([i]);
+                    cx.notify();
+                }
+                None if !add => self.clear_selection(cx),
+                None => {}
+            },
+            _ => {}
+        }
+        self.update_hover(ev.position, cx);
     }
 
     fn update_hover(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
@@ -585,8 +729,14 @@ impl Viewer {
         let viewport_cell = self.viewport.clone();
         let (zoom, pan) = (self.zoom, self.pan);
         let visible = self.visible;
-        let colors: Vec<Hsla> = (0..page.ink.strokes.len()).map(|i| self.stroke_color(i)).collect();
-        let current = visible.checked_sub(1);
+        // Strokes already in a glyph are gray.
+        let colors: Vec<Hsla> = (0..page.ink.strokes.len())
+            .map(|i| if self.assigned.contains(&(self.page_index, i)) { rgb(0xB8B8B8).into() } else { self.stroke_color(i) })
+            .collect();
+        // The last stroke shown is marked while replaying (not when all are shown).
+        let current = (visible < page.ink.strokes.len()).then(|| visible.checked_sub(1)).flatten();
+        let selection: Vec<usize> = self.selection.iter().copied().collect();
+        let marquee = self.marquee.clone();
         let hovered = self.hovered;
         // In skeleton mode, use the regenerated meshes (the originals until they are ready).
         let regenerated = self.regenerated.clone().filter(|_| self.skeleton_mode);
@@ -648,6 +798,33 @@ impl Viewer {
                     }
                     if let Some(i) = hovered.filter(|h| Some(*h) != current) {
                         mark(i, hsla(0.58, 0.9, 0.5, 1.0));
+                    }
+                    // The selection: strokes in the selection color, each in a box.
+                    let selected = hsla(0.75, 0.8, 0.5, 1.0);
+                    for &i in &selection {
+                        if let Some(path) = &cache.paths[i] {
+                            window.paint_path(path.clone(), selected);
+                        }
+                        let r = layout.rect(ink.strokes[i].bbox).dilate(px(2.0));
+                        window.paint_quad(quad(r, px(2.0), selected.opacity(0.08), px(1.0), selected, Default::default()));
+                    }
+                    match &marquee {
+                        Some(Marquee::Box { start, end }) => {
+                            let b = Bounds::from_corners(start.min(end), start.max(end));
+                            window.paint_quad(quad(b, px(0.0), selected.opacity(0.08), px(1.0), selected, Default::default()));
+                        }
+                        Some(Marquee::Lasso(points)) if points.len() > 1 => {
+                            let mut builder = PathBuilder::stroke(px(1.0));
+                            builder.move_to(points[0]);
+                            for p in &points[1..] {
+                                builder.line_to(*p);
+                            }
+                            builder.line_to(points[0]);
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, selected);
+                            }
+                        }
+                        _ => {}
                     }
                 });
             },
@@ -769,7 +946,7 @@ impl Viewer {
 
     fn status_text(&self) -> String {
         let Some(i) = self.hovered else {
-            return "悬停查看笔画 · 点击跳到该笔 · 拖动/滚轮平移 · Ctrl+滚轮缩放（+/- 键，0 复位）· ←/→ 单步（Shift ×10）· 空格播放 · 1/2/3 配色 · K 骨架模式 · [ ] 字重".into();
+            return "点击选笔画（Ctrl/Shift 加选）· 拖出方框框选，按住 Alt 拖动是套索 · 回车分配给左边选中的字 · 灰色的笔画已用过 · 滚轮或中键拖动平移 · Ctrl+滚轮缩放 · ←/→ 单步 · 空格播放 · K 骨架模式".into();
         };
         let s = &self.page.ink.strokes[i];
         let kind = match s.shape {
@@ -857,6 +1034,21 @@ impl Render for Viewer {
                 d.child(self.button("prev-page", "上一页", false, cx, |this, cx| this.go_to_page(this.page_index.saturating_sub(1), cx)))
                     .child(self.button("next-page", "下一页", false, cx, |this, cx| this.go_to_page(this.page_index + 1, cx)))
             })
+            .when(!self.selection.is_empty(), |d| {
+                let label = match &self.target {
+                    Some(t) => format!("分配给「{t}」（回车）"),
+                    None => "先在左边选一个字".to_string(),
+                };
+                let can_assign = self.target.is_some();
+                d.child(div().w(px(1.0)).h(px(20.0)).bg(rgb(0xE5E7EB)))
+                    .child(div().text_sm().child(format!("已选 {} 笔", self.selection.len())))
+                    .child(self.button("assign", label, can_assign, cx, move |this, cx| {
+                        if can_assign {
+                            this.request_assign(cx);
+                        }
+                    }))
+                    .child(self.button("clear-selection", "清除（Esc）", false, cx, |this, cx| this.clear_selection(cx)))
+            })
             .child(div().flex_1())
             .child(skeleton_controls)
             .child(div().w(px(1.0)).h(px(20.0)).bg(rgb(0xE5E7EB)))
@@ -906,7 +1098,9 @@ impl Render for Viewer {
                     .child(self.render_page_canvas())
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_canvas_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_canvas_down))
-                    .on_scroll(cx.listener(Self::on_scroll)),
+                    .on_scroll(cx.listener(Self::on_scroll))
+                    // Visible to the UI tests (nothing without their test support).
+                    .test_support(),
             )
             .child(bottom_bar)
     }

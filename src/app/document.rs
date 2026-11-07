@@ -1,10 +1,12 @@
 //! The open project, shared by the views. Changes go through here: it marks the project modified
 //! and tells the views which glyphs changed (each glyph has a revision number for their caches).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{Context, EventEmitter};
-use scriptoria_project::Project;
+use scriptoria_ink::Stroke;
+use scriptoria_project::{Project, StrokeOrigin};
 
 pub struct Document {
     pub project: Project,
@@ -61,6 +63,34 @@ impl Document {
     pub fn update_glyph(&mut self, glyph: usize, f: impl FnOnce(&mut scriptoria_project::Glyph), cx: &mut Context<Self>) {
         let Some(g) = self.project.glyphs.get_mut(glyph) else { return };
         f(g);
+        self.changed(glyph, cx);
+    }
+
+    /// Adds written strokes (from page `page` of source `source`, in writing order) to the end of a
+    /// glyph (see [`crate::assign::assign`]).
+    pub fn assign(&mut self, glyph: usize, source: &str, page: usize, strokes: &[Stroke], cx: &mut Context<Self>) {
+        if glyph >= self.project.glyphs.len() {
+            return;
+        }
+        let list: Vec<(&Stroke, StrokeOrigin)> =
+            strokes.iter().map(|s| (s, StrokeOrigin { source: source.to_string(), page, index: s.order })).collect();
+        crate::assign::assign(&mut self.project, glyph, &list);
+        self.changed(glyph, cx);
+    }
+
+    /// The strokes of a source some glyph uses: (page, index).
+    pub fn used_strokes(&self, source: &str) -> HashSet<(usize, usize)> {
+        self.project
+            .glyphs
+            .iter()
+            .flat_map(|g| &g.strokes)
+            .filter_map(|s| s.origin.as_ref())
+            .filter(|o| o.source == source)
+            .map(|o| (o.page, o.index))
+            .collect()
+    }
+
+    fn changed(&mut self, glyph: usize, cx: &mut Context<Self>) {
         self.revisions[glyph] = self.next_revision;
         self.next_revision += 1;
         self.touch(cx);

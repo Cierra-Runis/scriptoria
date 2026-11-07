@@ -19,6 +19,8 @@ scriptoria-project = { path = "crates/project" }
 
 # The tools in `examples/` and the pipeline test in `tests/` (they read `test/test.pdf`).
 [dev-dependencies]
+# Headless windows and simulated input for the UI tests.
+gpui-kit = { version = "0.9", features = ["test-support"] }
 scriptoria-testkit = { path = "crates/testkit" }
 
 # Optimize the compute-heavy packages even in debug builds, so the viewer and tests stay fast

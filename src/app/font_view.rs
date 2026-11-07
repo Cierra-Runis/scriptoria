@@ -18,8 +18,8 @@ use scriptoria_ink::StrokeShape;
 use scriptoria_ink::kurbo::Affine;
 use scriptoria_project::{Glyph, OutlineKind};
 
-use crate::document::{Document, DocumentEvent};
-use crate::mesh::Mesh;
+use crate::app::document::{Document, DocumentEvent};
+use crate::app::mesh::Mesh;
 
 /// A cell's drawing area (px, square), the margin inside it, and the label under it.
 const CELL: f32 = 76.0;
@@ -29,6 +29,8 @@ const LABEL: f32 = 20.0;
 const TOLERANCE: f32 = 2.0;
 
 pub enum FontViewEvent {
+    /// The selected glyph changed.
+    Selected(Option<usize>),
     /// Open the glyph (double click).
     Open(usize),
 }
@@ -55,8 +57,16 @@ impl FontView {
                     this.add_typed(input.clone(), window, cx);
                 }
             }),
-            cx.subscribe(&document, |_, _, event: &DocumentEvent, cx| {
+            cx.subscribe(&document, |this, document, event: &DocumentEvent, cx| {
                 if matches!(event, DocumentEvent::GlyphList | DocumentEvent::Glyph(_) | DocumentEvent::Saved) {
+                    // A replaced project may have fewer glyphs; its meshes are all new.
+                    let n = document.read(cx).project.glyphs.len();
+                    if this.selected.is_some_and(|s| s >= n) {
+                        this.select(None, cx);
+                    }
+                    if matches!(event, DocumentEvent::Saved) && document.read(cx).folder.is_some() {
+                        this.meshes.borrow_mut().retain(|&i, _| i < n);
+                    }
                     cx.notify();
                 }
             }),
@@ -68,12 +78,31 @@ impl FontView {
         self.selected
     }
 
+    pub fn select(&mut self, glyph: Option<usize>, cx: &mut Context<Self>) {
+        if self.selected != glyph {
+            self.selected = glyph;
+            cx.emit(FontViewEvent::Selected(glyph));
+            cx.notify();
+        }
+    }
+
+    /// Selects the first glyph without strokes after the selected one (wrapping around), if any.
+    pub fn select_next_empty(&mut self, cx: &mut Context<Self>) {
+        let glyphs = &self.document.read(cx).project.glyphs;
+        let n = glyphs.len();
+        let from = self.selected.map_or(0, |s| s + 1);
+        let next = (0..n).map(|k| (from + k) % n).find(|&i| glyphs[i].strokes.is_empty());
+        if next.is_some() {
+            self.select(next, cx);
+        }
+    }
+
     fn add_typed(&mut self, input: Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) {
         let text = input.read(cx).value().to_string();
         let first_new = self.document.read(cx).project.glyphs.len();
         let added = self.document.update(cx, |d, cx| d.add_chars(&text, cx));
         if added > 0 && self.selected.is_none() {
-            self.selected = Some(first_new);
+            self.select(Some(first_new), cx);
         }
         input.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
@@ -143,11 +172,10 @@ impl FontView {
                     .child(label),
             )
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                this.selected = Some(index);
+                this.select(Some(index), cx);
                 if event.click_count() >= 2 {
                     cx.emit(FontViewEvent::Open(index));
                 }
-                cx.notify();
             }))
     }
 }
@@ -187,7 +215,7 @@ impl Render for FontView {
                     .p_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().flex_1().child(Input::new(&self.input)))
+                    .child(div().flex_1().child(Input::new(&self.input).id("chars")))
                     .child(Button::new("add-chars").primary().label("加入").on_click(cx.listener(move |this, _, window, cx| {
                         this.add_typed(input.clone(), window, cx);
                     }))),

@@ -15,9 +15,9 @@ use gpui::{
 use scriptoria_ink::InkDocument;
 use scriptoria_project::Project;
 
-use crate::document::{Document, DocumentEvent};
-use crate::font_view::{FontView, FontViewEvent};
-use crate::viewer::Viewer;
+use crate::app::document::{Document, DocumentEvent};
+use crate::app::font_view::{FontView, FontViewEvent};
+use crate::app::viewer::{Viewer, ViewerEvent};
 
 actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, Quit]);
 
@@ -56,7 +56,8 @@ fn menus() -> Vec<Menu> {
 
 /// A document open in a tab.
 enum Page {
-    Pdf { title: SharedString, view: Entity<Viewer> },
+    /// A handwritten document, with the id of its source in the project.
+    Pdf { title: SharedString, source: String, view: Entity<Viewer> },
 }
 
 impl Page {
@@ -78,8 +79,8 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// `start`: a project folder to open, or a PDF to import into a new project.
-    pub fn new(start: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `start`: a project folder to open and PDFs to import, in any order.
+    pub fn new(start: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let document = cx.new(|_| Document::new(Project::new("我的手写体"), None));
         let font_view = cx.new(|cx| FontView::new(document.clone(), window, cx));
         let subscriptions = vec![
@@ -89,7 +90,13 @@ impl Workspace {
                     this.update_title(window, cx);
                 }
             }),
-            cx.subscribe_in(&font_view, window, |_, _, event: &FontViewEvent, window, cx| match event {
+            cx.subscribe_in(&document, window, |this, _, event: &DocumentEvent, _, cx| {
+                if matches!(event, DocumentEvent::Glyph(_) | DocumentEvent::GlyphList | DocumentEvent::Saved) {
+                    this.refresh_pages(cx);
+                }
+            }),
+            cx.subscribe_in(&font_view, window, |this, _, event: &FontViewEvent, window, cx| match event {
+                FontViewEvent::Selected(_) => this.refresh_pages(cx),
                 FontViewEvent::Open(_) => window.push_notification(Notification::info("单字视图在下一步加入"), cx),
             }),
         ];
@@ -102,11 +109,16 @@ impl Workspace {
             menu_bar: AppMenuBar::new(cx),
             _subscriptions: subscriptions,
         };
-        match start {
-            Some(p) if p.join("project.toml").is_file() => this.open_folder(p, window, cx),
-            Some(p) if p.is_file() => this.import_pdf(&p, window, cx),
-            Some(p) => window.push_notification(Notification::error(format!("打不开 {}：不是工程文件夹，也不是 PDF", p.display())), cx),
-            None => {}
+        let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) = start.into_iter().partition(|p| p.join("project.toml").is_file());
+        if let Some(folder) = folders.into_iter().next() {
+            this.open_folder(folder, window, cx);
+        }
+        for p in files {
+            if p.is_file() {
+                this.import_pdf(&p, window, cx);
+            } else {
+                window.push_notification(Notification::error(format!("打不开 {}：不是工程文件夹，也不是 PDF", p.display())), cx);
+            }
         }
         this.update_title(window, cx);
         this
@@ -114,6 +126,21 @@ impl Workspace {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    pub fn document(&self) -> &Entity<Document> {
+        &self.document
+    }
+
+    pub fn font_view(&self) -> &Entity<FontView> {
+        &self.font_view
+    }
+
+    /// The viewer of the PDF in tab `index`.
+    pub fn pdf_view(&self, index: usize) -> Option<Entity<Viewer>> {
+        match self.pages.get(index)? {
+            Page::Pdf { view, .. } => Some(view.clone()),
+        }
     }
 
     fn update_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -142,20 +169,56 @@ impl Workspace {
     }
 
     fn import_pdf(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        // Sources are kept by absolute path, so the same file is the same source however it was named.
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = absolute.as_path();
         let opened = std::fs::read(path).map_err(anyhow::Error::from).and_then(|data| InkDocument::open(data).map_err(Into::into));
         match opened {
             Ok(ink) => {
                 let title: SharedString = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default().into();
                 let view = cx.new(|cx| Viewer::new(ink, title.clone(), cx));
-                self.document.update(cx, |d, cx| {
-                    d.project.source_for(path);
+                let source = self.document.update(cx, |d, cx| {
                     cx.notify();
+                    d.project.source_for(path)
                 });
-                self.pages.push(Page::Pdf { title, view });
+                let id = source.clone();
+                self._subscriptions.push(cx.subscribe_in(&view, window, move |this, _, event: &ViewerEvent, window, cx| match event {
+                    ViewerEvent::Assign { page, strokes } => this.assign(&id, *page, strokes, window, cx),
+                }));
+                self.pages.push(Page::Pdf { title, source, view });
                 self.active = self.pages.len() - 1;
+                self.refresh_pages(cx);
                 cx.notify();
             }
             Err(e) => window.push_notification(Notification::error(format!("导入 {} 失败：{e}", path.display())), cx),
+        }
+    }
+
+    /// Puts strokes into the glyph selected in the grid, then moves the selection on to the next
+    /// glyph still without strokes.
+    fn assign(&mut self, source: &str, page: usize, strokes: &[scriptoria_ink::Stroke], window: &mut Window, cx: &mut Context<Self>) {
+        let Some(glyph) = self.font_view.read(cx).selected() else {
+            window.push_notification(Notification::warning("先在左边的字形表里选一个字"), cx);
+            return;
+        };
+        self.document.update(cx, |d, cx| d.assign(glyph, source, page, strokes, cx));
+        self.font_view.update(cx, |f, cx| f.select_next_empty(cx));
+    }
+
+    /// Tells the pages which of their strokes are used and which glyph a selection would go to.
+    fn refresh_pages(&mut self, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        let target: Option<SharedString> =
+            self.font_view.read(cx).selected().and_then(|g| doc.project.glyphs.get(g)).map(|g| g.chars.iter().collect::<String>().into());
+        let updates: Vec<_> = self.pages.iter().map(|p| match p {
+            Page::Pdf { source, view, .. } => (view.clone(), doc.used_strokes(source)),
+        }).collect();
+        for (view, used) in updates {
+            let target = target.clone();
+            view.update(cx, |v, cx| {
+                v.set_assigned(used, cx);
+                v.set_target(target, cx);
+            });
         }
     }
 

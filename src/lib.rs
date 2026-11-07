@@ -2,6 +2,11 @@
 //! test in `tests/`: PDF strokes (scriptoria-ink) → skeletons (scriptoria-skeleton) → outlines
 //! (scriptoria-outline) → font glyphs (scriptoria-font, see [`font`]).
 
+// GPUI comes through gpui-kit (with its platform layer and GPUI Component); under this name the
+// `gpui::` paths read as usual.
+extern crate gpui_kit as gpui;
+
+pub mod app;
 pub mod assign;
 pub mod font;
 

@@ -8,9 +8,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-gpui = { package = "gpui-pre", version = "=0.3.11" }
-gpui-component = "0.9"
-gpui-platform = { package = "gpui-pre-platform", version = "=0.3.11" }
+# The UI: GPUI (a pinned snapshot of Zed's, as gpui-pre) with its platform layer and GPUI Component.
+gpui-kit = "0.9"
 lyon = "1.0"
 scriptoria-ink = { path = "crates/ink" }
 scriptoria-outline = { path = "crates/outline" }

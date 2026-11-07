@@ -2,6 +2,7 @@
 //! test in `tests/`: PDF strokes (scriptoria-ink) → skeletons (scriptoria-skeleton) → outlines
 //! (scriptoria-outline) → font glyphs (scriptoria-font, see [`font`]).
 
+pub mod assign;
 pub mod font;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

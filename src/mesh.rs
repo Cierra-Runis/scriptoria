@@ -30,11 +30,16 @@ impl Mesh {
 
     /// Tessellates any path. With `opaque`, every subpath is tessellated on its own (see below).
     pub fn from_path(path: &BezPath, shape: StrokeShape, opaque: bool) -> Option<Self> {
+        Self::from_path_with_tolerance(path, shape, opaque, TOLERANCE)
+    }
+
+    /// As [`Mesh::from_path`], within `tolerance` of the curves (in the path's units).
+    pub fn from_path_with_tolerance(path: &BezPath, shape: StrokeShape, opaque: bool, tolerance: f32) -> Option<Self> {
         let mut buf: VertexBuffers<lyon::math::Point, u32> = VertexBuffers::new();
         match shape {
             StrokeShape::Outline { non_zero } => {
                 let rule = if non_zero { FillRule::NonZero } else { FillRule::EvenOdd };
-                let options = FillOptions::tolerance(TOLERANCE).with_fill_rule(rule);
+                let options = FillOptions::tolerance(tolerance).with_fill_rule(rule);
                 let mut tess = FillTessellator::new();
                 // Opaque strokes: each subpath (small outline) on its own. Same-color overlaps look
                 // identical, and skipping the intersection work avoids a flood of tiny triangles.
@@ -47,7 +52,7 @@ impl Mesh {
             }
             StrokeShape::Line { width } => {
                 let path = to_lyon(path.elements());
-                let options = StrokeOptions::tolerance(TOLERANCE)
+                let options = StrokeOptions::tolerance(tolerance)
                     .with_line_width((width as f32).max(MIN_LINE_WIDTH))
                     .with_line_cap(LineCap::Round)
                     .with_line_join(LineJoin::Round);

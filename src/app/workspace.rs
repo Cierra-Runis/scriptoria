@@ -1,12 +1,13 @@
-//! The main window: the menu bar, the glyph grid on the left, the opened documents in tabs on the
-//! right. File operations (new, open, save, import) live here.
+//! The main window: the menu bar, the glyph grid on the left, the opened documents and glyphs in
+//! tabs on the right. File operations (new, open, save, import) and undo live here.
 
 use std::path::{Path, PathBuf};
 
+use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::menu::AppMenuBar;
-use gpui::component::tab::{Tab, TabBar};
-use gpui::component::{ActiveTheme as _, GlobalState, TitleBar, WindowExt as _, h_resizable, resizable_panel, v_flex};
 use gpui::component::notification::Notification;
+use gpui::component::tab::{Tab, TabBar};
+use gpui::component::{ActiveTheme as _, GlobalState, Sizable as _, TitleBar, WindowExt as _, h_resizable, resizable_panel, v_flex};
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, KeyBinding, Menu, MenuItem, PathPromptOptions, SharedString, Subscription, Window,
@@ -17,9 +18,10 @@ use scriptoria_project::Project;
 
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::font_view::{FontView, FontViewEvent};
+use crate::app::glyph_view::GlyphView;
 use crate::app::viewer::{Viewer, ViewerEvent};
 
-actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, Quit]);
+actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, Quit, Undo, Redo]);
 
 /// Key bindings and menus, once at startup.
 pub fn init(cx: &mut App) {
@@ -30,6 +32,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", SaveProjectAs, None),
         KeyBinding::new("ctrl-i", ImportPdf, None),
         KeyBinding::new("ctrl-q", Quit, None),
+        // Text inputs keep their own undo (their bindings are more specific).
+        KeyBinding::new("ctrl-z", Undo, None),
+        KeyBinding::new("ctrl-y", Redo, None),
+        KeyBinding::new("ctrl-shift-z", Redo, None),
     ]);
     GlobalState::global_mut(cx).set_app_menus(menus().into_iter().map(Menu::owned).collect());
     cx.set_menus(menus());
@@ -37,33 +43,42 @@ pub fn init(cx: &mut App) {
 }
 
 fn menus() -> Vec<Menu> {
-    vec![Menu {
-        name: "文件".into(),
-        items: vec![
-            MenuItem::action("新建工程", NewProject),
-            MenuItem::action("打开工程…", OpenProject),
-            MenuItem::separator(),
-            MenuItem::action("保存", SaveProject),
-            MenuItem::action("另存为…", SaveProjectAs),
-            MenuItem::separator(),
-            MenuItem::action("导入 PDF…", ImportPdf),
-            MenuItem::separator(),
-            MenuItem::action("退出", Quit),
-        ],
-        disabled: false,
-    }]
+    vec![
+        Menu {
+            name: "文件".into(),
+            items: vec![
+                MenuItem::action("新建工程", NewProject),
+                MenuItem::action("打开工程…", OpenProject),
+                MenuItem::separator(),
+                MenuItem::action("保存", SaveProject),
+                MenuItem::action("另存为…", SaveProjectAs),
+                MenuItem::separator(),
+                MenuItem::action("导入 PDF…", ImportPdf),
+                MenuItem::separator(),
+                MenuItem::action("退出", Quit),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "编辑".into(),
+            items: vec![MenuItem::action("撤销", Undo), MenuItem::action("重做", Redo)],
+            disabled: false,
+        },
+    ]
 }
 
-/// A document open in a tab.
+/// A document or glyph open in a tab.
 enum Page {
     /// A handwritten document, with the id of its source in the project.
     Pdf { title: SharedString, source: String, view: Entity<Viewer> },
+    /// A glyph, by its index in the project.
+    Glyph { title: SharedString, glyph: usize, view: Entity<GlyphView> },
 }
 
 impl Page {
     fn title(&self) -> SharedString {
         match self {
-            Page::Pdf { title, .. } => title.clone(),
+            Page::Pdf { title, .. } | Page::Glyph { title, .. } => title.clone(),
         }
     }
 }
@@ -97,7 +112,7 @@ impl Workspace {
             }),
             cx.subscribe_in(&font_view, window, |this, _, event: &FontViewEvent, window, cx| match event {
                 FontViewEvent::Selected(_) => this.refresh_pages(cx),
-                FontViewEvent::Open(_) => window.push_notification(Notification::info("单字视图在下一步加入"), cx),
+                FontViewEvent::Open(glyph) => this.open_glyph(*glyph, window, cx),
             }),
         ];
         let mut this = Workspace {
@@ -140,7 +155,54 @@ impl Workspace {
     pub fn pdf_view(&self, index: usize) -> Option<Entity<Viewer>> {
         match self.pages.get(index)? {
             Page::Pdf { view, .. } => Some(view.clone()),
+            Page::Glyph { .. } => None,
         }
+    }
+
+    /// The view of a glyph, if open in a tab.
+    pub fn glyph_view(&self, glyph: usize) -> Option<Entity<GlyphView>> {
+        self.pages.iter().find_map(|p| match p {
+            Page::Glyph { glyph: g, view, .. } if *g == glyph => Some(view.clone()),
+            _ => None,
+        })
+    }
+
+    /// The tab shown.
+    pub fn active_tab(&self) -> Option<usize> {
+        (!self.pages.is_empty()).then_some(self.active)
+    }
+
+    /// Shows a glyph in its tab, opened if needed.
+    pub fn open_glyph(&mut self, glyph: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.pages.iter().position(|p| matches!(p, Page::Glyph { glyph: g, .. } if *g == glyph));
+        let index = match existing {
+            Some(i) => i,
+            None => {
+                let Some(g) = self.document.read(cx).project.glyphs.get(glyph) else { return };
+                let chars: String = g.chars.iter().collect();
+                let title: SharedString = if chars.is_empty() { g.name.clone().into() } else { format!("「{chars}」").into() };
+                let view = cx.new(|cx| GlyphView::new(self.document.clone(), glyph, window, cx));
+                self.pages.push(Page::Glyph { title, glyph, view });
+                self.pages.len() - 1
+            }
+        };
+        self.active = index;
+        if let Some(Page::Glyph { view, .. }) = self.pages.get(index) {
+            let focus = view.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.pages.len() {
+            return;
+        }
+        self.pages.remove(index);
+        if index < self.active || self.active >= self.pages.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        cx.notify();
     }
 
     fn update_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -210,9 +272,14 @@ impl Workspace {
         let doc = self.document.read(cx);
         let target: Option<SharedString> =
             self.font_view.read(cx).selected().and_then(|g| doc.project.glyphs.get(g)).map(|g| g.chars.iter().collect::<String>().into());
-        let updates: Vec<_> = self.pages.iter().map(|p| match p {
-            Page::Pdf { source, view, .. } => (view.clone(), doc.used_strokes(source)),
-        }).collect();
+        let updates: Vec<_> = self
+            .pages
+            .iter()
+            .filter_map(|p| match p {
+                Page::Pdf { source, view, .. } => Some((view.clone(), doc.used_strokes(source))),
+                Page::Glyph { .. } => None,
+            })
+            .collect();
         for (view, used) in updates {
             let target = target.clone();
             view.update(cx, |v, cx| {
@@ -283,6 +350,18 @@ impl Workspace {
         .detach();
     }
 
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document.update(cx, |d, cx| d.undo(cx)).is_none() {
+            window.push_notification(Notification::info("没有可以撤销的修改"), cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document.update(cx, |d, cx| d.redo(cx)).is_none() {
+            window.push_notification(Notification::info("没有可以重做的修改"), cx);
+        }
+    }
+
     fn render_pages(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         if self.pages.is_empty() {
@@ -297,14 +376,23 @@ impl Workspace {
                 .into_any_element();
         }
         let tabs = TabBar::new("pages")
-            .children(self.pages.iter().map(|p| Tab::new().label(p.title())))
+            .children(self.pages.iter().enumerate().map(|(i, p)| {
+                let close = Button::new(("close-tab", i)).ghost().xsmall().label("×").on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_tab(i, cx);
+                }));
+                Tab::new().label(p.title()).suffix(close)
+            }))
             .selected_index(self.active)
             .on_click(cx.listener(|this, index: &usize, _, cx| {
-                this.active = *index;
-                cx.notify();
+                if *index < this.pages.len() {
+                    this.active = *index;
+                    cx.notify();
+                }
             }));
         let content = match &self.pages[self.active.min(self.pages.len() - 1)] {
             Page::Pdf { view, .. } => view.clone().into_any_element(),
+            Page::Glyph { view, .. } => view.clone().into_any_element(),
         };
         v_flex().size_full().child(tabs).child(div().flex_1().min_h_0().child(content)).into_any_element()
     }
@@ -321,6 +409,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_project))
             .on_action(cx.listener(Self::save_project_as))
             .on_action(cx.listener(Self::import))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)

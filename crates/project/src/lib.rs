@@ -80,7 +80,79 @@ impl Glyph {
 
     /// The strokes' placed outlines' bounding box (font units), if there are strokes.
     pub fn bounds(&self) -> Option<Rect> {
-        self.strokes.iter().map(|s| (s.placement * s.outline.path.clone()).bounding_box()).reduce(|a, b| a.union(b))
+        self.strokes_bounds(0..self.strokes.len())
+    }
+
+    /// Some strokes' placed outlines' bounding box (font units), if there are any.
+    pub fn strokes_bounds(&self, which: impl IntoIterator<Item = usize>) -> Option<Rect> {
+        which.into_iter().filter_map(|i| self.strokes.get(i)).map(GlyphStroke::bounds).reduce(|a, b| a.union(b))
+    }
+
+    /// Moves strokes in the em: `t` (font units) applies after their placement.
+    pub fn transform_strokes(&mut self, which: &[usize], t: Affine) {
+        for &i in which {
+            if let Some(s) = self.strokes.get_mut(i) {
+                s.placement = t * s.placement;
+            }
+        }
+    }
+
+    pub fn remove_strokes(&mut self, which: &[usize]) {
+        let mut i = 0;
+        self.strokes.retain(|_| {
+            i += 1;
+            !which.contains(&(i - 1))
+        });
+    }
+
+    /// Moves strokes one place earlier (or later) in writing order, each past the nearest stroke
+    /// not being moved; strokes already first (last) stay. Returns where the strokes are now.
+    pub fn reorder_strokes(&mut self, which: &[usize], earlier: bool) -> Vec<usize> {
+        let n = self.strokes.len();
+        let mut moving: Vec<bool> = (0..n).map(|i| which.contains(&i)).collect();
+        // Swaps of neighbors (i, i + 1) where the one moving passes the other.
+        let swaps: Box<dyn Iterator<Item = usize>> = if earlier { Box::new(0..n.saturating_sub(1)) } else { Box::new((0..n.saturating_sub(1)).rev()) };
+        for i in swaps {
+            let (ahead, behind) = if earlier { (i + 1, i) } else { (i, i + 1) };
+            if moving[ahead] && !moving[behind] {
+                self.strokes.swap(i, i + 1);
+                moving.swap(i, i + 1);
+            }
+        }
+        (0..n).filter(|&i| moving[i]).collect()
+    }
+
+    /// Moves all strokes sideways so that the left and right side bearings are equal.
+    pub fn center(&mut self) {
+        if let Some(b) = self.bounds() {
+            let dx = ((self.advance - b.width()) / 2.0 - b.x0).round();
+            self.transform_strokes(&(0..self.strokes.len()).collect::<Vec<_>>(), Affine::translate((dx, 0.0)));
+        }
+    }
+
+    /// Places the glyph as a full-width (CJK) character: an em wide, its strokes scaled so that the
+    /// larger side of their box is `face` (a fraction) of the em, centered in the em square
+    /// (descender to ascender).
+    pub fn fit_full_width(&mut self, info: &FontInfo, face: f64) {
+        let em = info.units_per_em as f64;
+        self.advance = em;
+        let Some(b) = self.bounds() else { return };
+        let k = face * em / b.width().max(b.height()).max(1e-9);
+        let center = Point::new(em / 2.0, (info.ascender as f64 + info.descender as f64) / 2.0);
+        let t = Affine::translate(center.to_vec2()) * Affine::scale(k) * Affine::translate(-b.center().to_vec2());
+        self.transform_strokes(&(0..self.strokes.len()).collect::<Vec<_>>(), t);
+    }
+}
+
+impl GlyphStroke {
+    /// The placed outline's bounding box (font units).
+    pub fn bounds(&self) -> Rect {
+        let b = self.outline.path.bounding_box();
+        let b = match self.outline.kind {
+            OutlineKind::Filled => b,
+            OutlineKind::Line { width } => b.inflate(width / 2.0, width / 2.0),
+        };
+        self.placement.transform_rect_bbox(b)
     }
 }
 
@@ -319,6 +391,63 @@ mod tests {
         assert_eq!(p.add_chars("界A"), 1);
         assert_eq!(p.glyphs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["uni4E16", "uni754C", "A"]);
         assert_eq!(p.glyph_for('A'), Some(2));
+    }
+
+    /// A glyph of `n` unit-square strokes side by side, each placed as is; stroke i's square is
+    /// at x = i.
+    fn squares(n: usize) -> Glyph {
+        let strokes = (0..n)
+            .map(|i| GlyphStroke {
+                origin: Some(StrokeOrigin { source: "s1".into(), page: 0, index: i }),
+                outline: Outline { kind: OutlineKind::Filled, path: Rect::new(i as f64, 0.0, i as f64 + 1.0, 1.0).to_path(1e-3) },
+                skeleton: Vec::new(),
+                placement: Affine::IDENTITY,
+            })
+            .collect();
+        Glyph { name: "x".into(), chars: vec!['x'], advance: 10.0, strokes }
+    }
+
+    fn order(g: &Glyph) -> Vec<usize> {
+        g.strokes.iter().map(|s| s.origin.as_ref().unwrap().index).collect()
+    }
+
+    #[test]
+    fn strokes_are_reordered_as_a_block() {
+        let mut g = squares(5);
+        assert_eq!(g.reorder_strokes(&[1, 3], true), [0, 2]);
+        assert_eq!(order(&g), [1, 0, 3, 2, 4]);
+        // The first stroke cannot move earlier; the other one closes up to it.
+        assert_eq!(g.reorder_strokes(&[0, 2], true), [0, 1]);
+        assert_eq!(order(&g), [1, 3, 0, 2, 4]);
+        assert_eq!(g.reorder_strokes(&[3, 4], false), [3, 4]);
+        assert_eq!(order(&g), [1, 3, 0, 2, 4]);
+        assert_eq!(g.reorder_strokes(&[0], false), [1]);
+        assert_eq!(order(&g), [3, 1, 0, 2, 4]);
+    }
+
+    #[test]
+    fn strokes_are_removed_and_moved() {
+        let mut g = squares(4);
+        g.remove_strokes(&[0, 2]);
+        assert_eq!(order(&g), [1, 3]);
+        g.transform_strokes(&[1], Affine::translate((10.0, 5.0)));
+        assert_eq!(g.strokes_bounds([1]), Some(Rect::new(13.0, 5.0, 14.0, 6.0)));
+        assert_eq!(g.bounds(), Some(Rect::new(1.0, 0.0, 14.0, 6.0)));
+    }
+
+    #[test]
+    fn glyphs_are_centered_and_fitted() {
+        let mut g = squares(2);
+        g.center();
+        assert_eq!(g.bounds(), Some(Rect::new(4.0, 0.0, 6.0, 1.0)));
+        let info = FontInfo::default();
+        g.fit_full_width(&info, 0.9);
+        assert_eq!(g.advance, 1000.0);
+        let b = g.bounds().unwrap();
+        // 2 × 1 scaled to 900 × 450, centered in the em square.
+        for (got, want) in [(b.x0, 50.0), (b.x1, 950.0), (b.y0, 155.0), (b.y1, 605.0)] {
+            assert!((got - want).abs() < 1e-9, "{b:?}");
+        }
     }
 
     #[test]

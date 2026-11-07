@@ -24,6 +24,16 @@ pub fn wght(scale: f64) -> f64 {
     }
 }
 
+/// The radius scale at a `wght` value, for the scales at the axis' minimum, default and maximum:
+/// linear on either side of the default (the inverse of [`wght`] for [`SCALES`]).
+pub fn scale_at(wght: f64, [s0, s1, s2]: [f64; 3]) -> f64 {
+    if wght <= AXIS.default {
+        s1 - (AXIS.default - wght) / (AXIS.default - AXIS.min) * (s1 - s0)
+    } else {
+        s1 + (wght - AXIS.default) / (AXIS.max - AXIS.default) * (s2 - s1)
+    }
+}
+
 /// How handwriting is placed in the em.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
@@ -108,6 +118,9 @@ mod tests {
         assert_eq!(wght(SCALES.1), AXIS.default);
         assert_eq!(wght(SCALES.2), AXIS.max);
         assert!((wght(2.0) - 650.0).abs() < 1e-9);
-
+        let scales = [SCALES.0, SCALES.1, SCALES.2];
+        for s in [0.3, 0.65, 1.0, 2.0, 3.0] {
+            assert!((scale_at(wght(s), scales) - s).abs() < 1e-9, "{s}");
+        }
     }
 }

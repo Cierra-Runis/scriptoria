@@ -9,7 +9,7 @@ use lyon::tessellation::{
     BuffersBuilder, FillOptions, FillRule, FillTessellator, FillVertex, LineCap, LineJoin, StrokeOptions,
     StrokeTessellator, StrokeVertex, VertexBuffers,
 };
-use scriptoria_ink::kurbo::{BezPath, PathEl};
+use scriptoria_ink::kurbo::{Affine, BezPath, PathEl};
 use scriptoria_ink::{Stroke, StrokeShape};
 
 /// Tessellation tolerance (pt): about 0.4 px of error at 20× zoom.
@@ -79,6 +79,19 @@ impl Mesh {
             let [x, y] = self.vertices[i as usize];
             point(px(ox + x * scale), px(oy + y * scale))
         };
+        self.build(map)
+    }
+
+    /// The mesh moved by `t` into window coordinates.
+    pub fn to_path_affine(&self, t: Affine) -> Path<Pixels> {
+        let [a, b, c, d, e, f] = t.as_coeffs().map(|v| v as f32);
+        self.build(|i: u32| {
+            let [x, y] = self.vertices[i as usize];
+            point(px(a * x + c * y + e), px(b * x + d * y + f))
+        })
+    }
+
+    fn build(&self, map: impl Fn(u32) -> Point<Pixels>) -> Path<Pixels> {
         let mut path = Path::new(map(self.indices[0]));
         // As in gpui's `PathBuilder::build_path`: solid fills use st = (0, 1).
         let st = (point(0., 1.), point(0., 1.), point(0., 1.));

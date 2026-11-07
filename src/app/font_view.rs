@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use gpui::TestSupportExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::{ActiveTheme as _, h_flex, v_flex};
@@ -177,6 +178,7 @@ impl FontView {
                     cx.emit(FontViewEvent::Open(index));
                 }
             }))
+            .test_support()
     }
 }
 

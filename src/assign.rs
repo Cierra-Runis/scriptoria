@@ -36,11 +36,14 @@ pub fn assign(project: &mut Project, glyph: usize, strokes: &[(&Stroke, StrokeOr
 
 /// A glyph stroke's skeleton in font units: moved by its placement.
 pub fn placed_skeleton(stroke: &GlyphStroke) -> Skeleton {
-    let t = stroke.placement;
+    skeleton_of(&stroke.skeleton, stroke.placement)
+}
+
+/// A stored skeleton moved by `t` (a similarity: radii scale with it).
+pub fn skeleton_of(pieces: &[SkeletonPiece], t: Affine) -> Skeleton {
     let k = t.determinant().abs().sqrt();
     Skeleton {
-        pieces: stroke
-            .skeleton
+        pieces: pieces
             .iter()
             .map(|p| Piece {
                 samples: p.circles.iter().map(|&(c, r)| Sample { p: t * c, r: r * k }).collect(),

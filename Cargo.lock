@@ -6420,6 +6420,7 @@ dependencies = [
  "scriptoria-project",
  "scriptoria-skeleton",
  "scriptoria-testkit",
+ "skrifa 0.49.0",
 ]
 
 [[package]]

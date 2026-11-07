@@ -92,7 +92,8 @@ fn projects_from_before_the_thinnest_weight_open() {
     let toml = dir.join("project.toml");
     let text = std::fs::read_to_string(&toml).unwrap().replace("thinnest = 0.5", "weight_scales = [0.3, 1.0, 3.0]");
     std::fs::write(&toml, text).unwrap();
-    assert_eq!(Project::load(&dir).unwrap().font.thinnest, 0.3);
+    let font = Project::load(&dir).unwrap().font;
+    assert_eq!((font.thinnest, font.written_weight), (0.3, 900.0));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

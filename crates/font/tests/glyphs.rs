@@ -13,8 +13,8 @@ use scriptoria_font::{Axis, FontSource, Glyph, build};
 use scriptoria_testkit::data;
 use scriptoria_testkit::report::{Panel, Report, Svg};
 
-/// The strokes as written are the default and the boldest weight.
-const AXIS: Axis = Axis { min: 100.0, default: 400.0, max: 400.0 };
+/// The strokes as written are the boldest weight (900).
+const AXIS: Axis = Axis { min: 100.0, default: 400.0, max: 900.0 };
 /// Largest distance of the quadratic splines from the cubics (font units).
 const ACCURACY: f64 = 0.5;
 /// Allowed on top of that: rounding to whole units (up to 0.71 at a master, as much between
@@ -33,7 +33,7 @@ fn source() -> FontSource {
         ascender: 880,
         descender: -120,
         axis: AXIS,
-        instances: vec![("Thin".into(), 100.0), ("Light".into(), 250.0), ("Regular".into(), 400.0)],
+        instances: vec![("Thin".into(), 100.0), ("Regular".into(), 400.0), ("Bold".into(), 700.0), ("Black".into(), 900.0)],
         glyphs,
         accuracy: ACCURACY,
         tolerance: TOLERANCE,
@@ -106,7 +106,7 @@ fn write_report(source: &FontSource, bytes: &[u8], summary: String) {
     let font = font(bytes);
     let mut report = Report::new("font-glyphs", "font · glyphs read back from the font");
     report.summary(summary);
-    for wght in [100.0, 175.0, 250.0, 325.0, 400.0] {
+    for wght in [100.0, 250.0, 400.0, 650.0, 900.0] {
         let section = report.section(format!("wght {wght}"), "black: the glyph drawn from the font (non-zero fill) · gray: the em from descender to ascender");
         for g in &source.glyphs {
             let path = outline(&font, gid(&font, g.chars[0]), wght);

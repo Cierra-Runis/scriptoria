@@ -7,10 +7,16 @@ use std::path::{Path, PathBuf};
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
-use scriptoria_project::{Glyph, Project, StrokeOrigin};
+use scriptoria_project::{FontInfo, Glyph, Project, StrokeOrigin};
 
-/// How many glyph changes can be undone.
+/// How many changes can be undone.
 const UNDO_LIMIT: usize = 200;
+
+/// What a change replaced: kept for undo (and what an undo replaced, for redo).
+enum Change {
+    Glyph(usize, Glyph),
+    Font(FontInfo),
+}
 
 pub struct Document {
     pub project: Project,
@@ -20,9 +26,8 @@ pub struct Document {
     /// Per glyph, bumped whenever it changes.
     revisions: Vec<u64>,
     next_revision: u64,
-    /// Glyphs as they were before a change (undo), or before an undo (redo).
-    undo: Vec<(usize, Glyph)>,
-    redo: Vec<(usize, Glyph)>,
+    undo: Vec<Change>,
+    redo: Vec<Change>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +36,8 @@ pub enum DocumentEvent {
     GlyphList,
     /// One glyph changed.
     Glyph(usize),
+    /// The font's settings changed.
+    Font,
     /// The project was saved or replaced.
     Saved,
 }
@@ -72,8 +79,19 @@ impl Document {
         let before = g.clone();
         f(g);
         if *g != before {
-            self.record(glyph, before);
+            self.record(Change::Glyph(glyph, before));
             self.changed(glyph, cx);
+        }
+    }
+
+    /// Changes the font's settings through `f`, as one step to undo (none if `f` changes nothing).
+    pub fn update_font(&mut self, f: impl FnOnce(&mut FontInfo), cx: &mut Context<Self>) {
+        let before = self.project.font.clone();
+        f(&mut self.project.font);
+        if self.project.font != before {
+            self.record(Change::Font(before));
+            self.touch(cx);
+            cx.emit(DocumentEvent::Font);
         }
     }
 
@@ -85,30 +103,45 @@ impl Document {
         !self.redo.is_empty()
     }
 
-    /// Takes back the last glyph change; returns the glyph.
-    pub fn undo(&mut self, cx: &mut Context<Self>) -> Option<usize> {
-        let (glyph, before) = self.undo.pop()?;
-        let after = std::mem::replace(self.project.glyphs.get_mut(glyph)?, before);
-        self.redo.push((glyph, after));
-        self.changed(glyph, cx);
-        Some(glyph)
+    /// Takes back the last change; false if there is none.
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(change) = self.undo.pop() else { return false };
+        let undone = self.apply(change, cx);
+        self.redo.push(undone);
+        true
     }
 
-    /// Makes the last undone change again; returns the glyph.
-    pub fn redo(&mut self, cx: &mut Context<Self>) -> Option<usize> {
-        let (glyph, after) = self.redo.pop()?;
-        let before = std::mem::replace(self.project.glyphs.get_mut(glyph)?, after);
-        self.undo.push((glyph, before));
-        self.changed(glyph, cx);
-        Some(glyph)
+    /// Makes the last undone change again; false if there is none.
+    pub fn redo(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(change) = self.redo.pop() else { return false };
+        let redone = self.apply(change, cx);
+        self.undo.push(redone);
+        true
     }
 
-    /// Keeps a glyph as it was before a change, for undo.
-    fn record(&mut self, glyph: usize, before: Glyph) {
+    /// Puts back what a change replaced; returns what that replaces in turn.
+    fn apply(&mut self, change: Change, cx: &mut Context<Self>) -> Change {
+        match change {
+            Change::Glyph(glyph, g) => {
+                let replaced = std::mem::replace(&mut self.project.glyphs[glyph], g);
+                self.changed(glyph, cx);
+                Change::Glyph(glyph, replaced)
+            }
+            Change::Font(font) => {
+                let replaced = std::mem::replace(&mut self.project.font, font);
+                self.touch(cx);
+                cx.emit(DocumentEvent::Font);
+                Change::Font(replaced)
+            }
+        }
+    }
+
+    /// Keeps what a change replaces, for undo.
+    fn record(&mut self, change: Change) {
         if self.undo.len() == UNDO_LIMIT {
             self.undo.remove(0);
         }
-        self.undo.push((glyph, before));
+        self.undo.push(change);
         self.redo.clear();
     }
 
@@ -122,7 +155,7 @@ impl Document {
             strokes.iter().map(|s| (s, StrokeOrigin { source: source.to_string(), page, index: s.order })).collect();
         let before = self.project.glyphs[glyph].clone();
         crate::assign::assign(&mut self.project, glyph, &list);
-        self.record(glyph, before);
+        self.record(Change::Glyph(glyph, before));
         self.changed(glyph, cx);
     }
 

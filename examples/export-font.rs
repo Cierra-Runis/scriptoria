@@ -1,10 +1,10 @@
-//! Makes a variable font (`wght` 100–400, the strokes as written at 400) from the sample
+//! Makes a variable font (`wght` 100–900, the strokes as written at 900) from the sample
 //! characters of `test/test.pdf` and a page to try it in a browser:
 //! `target/scriptoria-font/ScriptoriaSample.ttf` and `index.html` (the font embedded, a weight
-//! slider). With a weight given (`wght=250`), only that weight is shown and the slider is left
+//! slider). With a weight given (`wght=650`), only that weight is shown and the slider is left
 //! out, for screenshots.
 //!
-//! `cargo run --release --example export-font [-- wght=250]`
+//! `cargo run --release --example export-font [-- wght=650]`
 
 mod common;
 

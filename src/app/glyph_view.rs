@@ -27,7 +27,7 @@ use scriptoria_project::{Glyph, GlyphStroke, Outline, OutlineKind, SkeletonPiece
 
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::mesh::Mesh;
-use crate::font::AXIS;
+use crate::font::{AXIS, Weights};
 
 /// Tessellation tolerance (pt, the strokes' own units): an em of 4.5 pt is some 600 px here.
 const TOLERANCE: f32 = 0.001;
@@ -187,6 +187,8 @@ pub struct GlyphView {
     /// Per stroke of the glyph, in order.
     shapes: Vec<Shapes>,
     planning: Option<Task<()>>,
+    /// The radius scales (thinnest, boldest) the plans in `shapes` serve.
+    planned_for: (f64, f64),
     /// The weight shown (`wght`).
     weight: Entity<SliderState>,
     /// Show the strokes as written instead of regenerated from their skeletons.
@@ -204,12 +206,17 @@ pub struct GlyphView {
 
 impl GlyphView {
     pub fn new(document: Entity<Document>, glyph: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let weight = cx.new(|_| SliderState::new().min(AXIS.min as f32).max(AXIS.default as f32).step(1.0).default_value(AXIS.default as f32));
+        let weight = cx.new(|_| SliderState::new().max(AXIS.max as f32).min(AXIS.min as f32).step(1.0).default_value(AXIS.default as f32));
         let advance = cx.new(|cx| InputState::new(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&document, window, move |this, _, event: &DocumentEvent, window, cx| match event {
                 DocumentEvent::Glyph(g) if *g == this.glyph => this.sync(window, cx),
                 DocumentEvent::GlyphList | DocumentEvent::Saved => this.sync(window, cx),
+                DocumentEvent::Font => {
+                    this.ensure_plans(cx);
+                    this.regenerate(cx);
+                    cx.notify();
+                }
                 _ => {}
             }),
             cx.subscribe(&weight, |this, _, _: &SliderEvent, cx| {
@@ -229,6 +236,7 @@ impl GlyphView {
             glyph,
             shapes: Vec::new(),
             planning: None,
+            planned_for: (0.0, 0.0),
             weight,
             original: false,
             selection: BTreeSet::new(),
@@ -263,6 +271,11 @@ impl GlyphView {
         self.planning.is_none() && self.shapes.iter().all(|s| s.plan.is_some() || s.skeleton.is_empty())
     }
 
+    /// The radius scales, thinnest and boldest, the outlines are made for.
+    pub fn weight_range(&self) -> (f64, f64) {
+        self.planned_for
+    }
+
     /// Where a point of the em (font units) is in the window, once laid out.
     pub fn font_to_window(&self, p: kurbo::Point) -> Option<Point<Pixels>> {
         self.view().map(|v| v.to_window(p))
@@ -282,8 +295,12 @@ impl GlyphView {
     }
 
     /// The radius scale of the weight shown.
+    fn weights(&self, cx: &App) -> Weights {
+        Weights::of(&self.document.read(cx).project.font)
+    }
+
     fn scale(&self, cx: &App) -> f64 {
-        crate::font::scale_at(self.wght(cx), self.document.read(cx).project.font.thinnest)
+        self.weights(cx).scale(self.wght(cx))
     }
 
     fn regenerated(&self) -> bool {
@@ -320,6 +337,16 @@ impl GlyphView {
     /// Makes the outline plans strokes lack, on a background thread (again when done, for strokes
     /// added meanwhile).
     fn ensure_plans(&mut self, cx: &mut Context<Self>) {
+        // Plans serve the radius scales from the thinnest weight to the boldest; new ones when
+        // those change.
+        let (thinnest, _, boldest) = self.weights(cx).scales();
+        if self.planned_for != (thinnest, boldest) {
+            self.planned_for = (thinnest, boldest);
+            for s in &mut self.shapes {
+                s.plan = None;
+                s.regenerated = None;
+            }
+        }
         if self.planning.is_some() {
             return;
         }
@@ -328,8 +355,7 @@ impl GlyphView {
         if jobs.is_empty() {
             return;
         }
-        let thinnest = self.document.read(cx).project.font.thinnest;
-        let params = PlanParams { precision: PRECISION, weights: (thinnest, 1.0) };
+        let params = PlanParams { precision: PRECISION, weights: self.planned_for };
         let background = cx.background_executor().clone();
         self.planning = Some(cx.spawn(async move |this, cx| {
             let plans = background
@@ -342,7 +368,9 @@ impl GlyphView {
                 .await;
             this.update(cx, |this, cx| {
                 this.planning = None;
-                for (skeleton, plan) in plans {
+                // Plans for weights since changed are dropped.
+                let current = this.planned_for == params.weights;
+                for (skeleton, plan) in plans.into_iter().filter(|_| current) {
                     for s in this.shapes.iter_mut().filter(|s| s.plan.is_none() && s.skeleton == skeleton) {
                         s.plan = Some(plan.clone());
                     }

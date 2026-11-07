@@ -9,10 +9,11 @@ use std::rc::Rc;
 use gpui::TestSupportExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
+use gpui::component::slider::{Slider, SliderEvent, SliderState};
 use gpui::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::{
-    Bounds, ClickEvent, Context, Entity, EventEmitter, Pixels, SharedString, Subscription, Window, canvas, div, point,
+    App, Bounds, ClickEvent, Context, Entity, EventEmitter, Pixels, SharedString, Subscription, Window, canvas, div, point,
     px, uniform_list,
 };
 use scriptoria_ink::StrokeShape;
@@ -21,6 +22,7 @@ use scriptoria_project::{Glyph, OutlineKind};
 
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::mesh::Mesh;
+use crate::font::{AXIS, WRITTEN_MIN, Weights};
 
 /// A cell's drawing area (px, square), the margin inside it, and the label under it.
 const CELL: f32 = 76.0;
@@ -46,13 +48,31 @@ pub struct FontView {
     width: Rc<Cell<Pixels>>,
     /// Per glyph: its meshes (font units, y down from the ascender) at a revision.
     meshes: Rc<RefCell<HashMap<usize, (u64, Rc<Vec<Mesh>>)>>>,
+    /// The weight the strokes as written are (`wght`), set when the slider is let go.
+    written: Entity<SliderState>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl FontView {
     pub fn new(document: Entity<Document>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("输入或粘贴要做的字，回车加入"));
+        let written_weight = document.read(cx).project.font.written_weight;
+        let written = cx.new(|_| SliderState::new().max(AXIS.max as f32).min(WRITTEN_MIN as f32).step(10.0).default_value(written_weight as f32));
         let subscriptions = vec![
+            cx.subscribe(&written, |this, _, event: &SliderEvent, cx| match event {
+                SliderEvent::Change(_) => cx.notify(),
+                SliderEvent::Release(v) => {
+                    let w = v.start() as f64;
+                    this.document.update(cx, |d, cx| d.update_font(|f| f.written_weight = w, cx));
+                }
+            }),
+            // The slider follows the project (undo, another project opened).
+            cx.subscribe_in(&document, window, |this, document, event: &DocumentEvent, window, cx| {
+                if matches!(event, DocumentEvent::Font | DocumentEvent::Saved) {
+                    let w = document.read(cx).project.font.written_weight as f32;
+                    this.written.update(cx, |s, cx| s.set_value(w, window, cx));
+                }
+            }),
             cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = event {
                     this.add_typed(input.clone(), window, cx);
@@ -72,7 +92,21 @@ impl FontView {
                 }
             }),
         ];
-        FontView { document, input, selected: None, width: Rc::new(Cell::new(px(600.0))), meshes: Rc::default(), _subscriptions: subscriptions }
+        FontView {
+            document,
+            input,
+            selected: None,
+            width: Rc::new(Cell::new(px(600.0))),
+            meshes: Rc::default(),
+            written,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// The font's weights as the slider has them (also while it is dragged).
+    fn shown_weights(&self, cx: &App) -> Weights {
+        let thinnest = self.document.read(cx).project.font.thinnest;
+        Weights { thinnest, written: self.written.read(cx).value().start() as f64 }
     }
 
     pub fn selected(&self) -> Option<usize> {
@@ -207,6 +241,7 @@ impl Render for FontView {
         let rows = count.div_ceil(columns);
         let width = self.width.clone();
         let input = self.input.clone();
+        let weights = self.shown_weights(cx);
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -221,6 +256,24 @@ impl Render for FontView {
                     .child(Button::new("add-chars").primary().label("加入").on_click(cx.listener(move |this, _, window, cx| {
                         this.add_typed(input.clone(), window, cx);
                     }))),
+            )
+            .child(
+                // Which weight the handwriting is: the others are its strokes thinned or thickened.
+                h_flex()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .child(div().flex_shrink_0().child("原稿字重"))
+                    .child(div().id("written-weight").flex_1().min_w(px(80.0)).child(Slider::new(&self.written)).test_support())
+                    .child(div().flex_shrink_0().w(px(28.0)).child(format!("{:.0}", weights.written)))
+                    .child(div().flex_shrink_0().text_color(theme.muted_foreground).child(format!(
+                        "100 = ×{:.2} · 900 = ×{:.2}",
+                        weights.scale(AXIS.min),
+                        weights.scale(AXIS.max)
+                    ))),
             )
             .child(
                 div()

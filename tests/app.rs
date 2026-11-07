@@ -216,3 +216,79 @@ fn the_advance_is_typed(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.press("backspace", cx));
     assert_eq!(glyph(&workspace, cx).strokes.len(), n);
 }
+
+/// Collects the start of every contour of a drawn glyph.
+#[derive(Default)]
+struct Starts(Vec<Point>);
+
+impl skrifa::outline::OutlinePen for Starts {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.0.push(Point::new(x as f64, y as f64));
+    }
+    fn line_to(&mut self, _: f32, _: f32) {}
+    fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+    fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+    fn close(&mut self) {}
+}
+
+#[gpui_kit::test]
+fn the_project_exports_as_a_font(cx: &mut TestAppContext) {
+    use skrifa::MetadataProvider as _;
+
+    let (workspace, _view, cx) = open_shi(cx);
+    let dir = std::env::temp_dir().join(format!("scriptoria-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Hand.ttf");
+    workspace.update_in(cx, |w, window, cx| w.export_to(path.clone(), false, window, cx));
+    cx.run_until_parked();
+    assert!(!workspace.read_with(cx, |w, _| w.exporting()));
+    let bytes = std::fs::read(&path).expect("the font is written");
+    assert!(dir.join("Hand.html").is_file(), "the preview page is written next to it");
+
+    let font = skrifa::FontRef::new(&bytes).expect("a font");
+    let axis = font.axes().get(0).expect("a weight axis");
+    assert_eq!((axis.min_value(), axis.default_value(), axis.max_value()), (100.0, 400.0, 900.0));
+    // At 900 the glyph is the strokes as written, placed as in the project: a contour per stroke
+    // piece, in writing order, each starting where its stroke was put down.
+    let g = glyph(&workspace, cx);
+    let pieces: Vec<(Point, f64)> = g
+        .strokes
+        .iter()
+        .flat_map(|s| s.skeleton.iter().map(move |p| (s.placement * p.circles[0].0, p.circles[0].1 * s.placement.determinant().abs().sqrt())))
+        .collect();
+    let gid = font.charmap().map('世').expect("世 is in the font");
+    let location = font.axes().location([("wght", 900.0)]);
+    let mut starts = Starts::default();
+    let settings = skrifa::outline::DrawSettings::unhinted(skrifa::instance::Size::unscaled(), &location);
+    font.outline_glyphs().get(gid).unwrap().draw(settings, &mut starts).unwrap();
+    assert_eq!(starts.0.len(), pieces.len());
+    for (i, (start, (pen_down, r))) in starts.0.iter().zip(&pieces).enumerate() {
+        assert!((*start - *pen_down).hypot() <= r + 2.0, "contour {i} starts at {start:?}, its stroke at {pen_down:?} (radius {r:.1})");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui_kit::test]
+fn the_weight_of_the_handwriting_is_set_with_a_slider(cx: &mut TestAppContext) {
+    let (workspace, view, cx) = open_shi(cx);
+    let written = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, cx| w.document().read(cx).project.font.written_weight);
+    assert_eq!(written(cx), 900.0);
+    assert_eq!(view.read_with(cx, |v, _| v.weight_range()).1, 1.0);
+
+    // Drag the slider from its right end (900) to the middle of its range (600).
+    let bounds = cx.update(|window, _| window.find("written-weight").bounds());
+    let y = bounds.center().y;
+    let (right, middle) = (point(bounds.right() - px(2.0), y), point(bounds.center().x, y));
+    cx.update(|window, cx| window.drag(right, middle, cx));
+    let w = written(cx);
+    assert!((500.0..=700.0).contains(&w), "written at {w}");
+
+    // The glyph view now makes outlines bolder than written, up to 900.
+    cx.run_until_parked();
+    let (thinnest, boldest) = view.read_with(cx, |v, _| v.weight_range());
+    assert!(thinnest == 0.3 && boldest > 1.2, "{thinnest} – {boldest}");
+    assert!(view.read_with(cx, |v, _| v.ready()));
+
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(written(cx), 900.0);
+}

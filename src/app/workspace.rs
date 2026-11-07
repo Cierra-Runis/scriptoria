@@ -1,5 +1,5 @@
 //! The main window: the menu bar, the glyph grid on the left, the opened documents and glyphs in
-//! tabs on the right. File operations (new, open, save, import) and undo live here.
+//! tabs on the right. File operations (new, open, save, import, export) and undo live here.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,7 @@ use gpui::component::tab::{Tab, TabBar};
 use gpui::component::{ActiveTheme as _, GlobalState, Sizable as _, TitleBar, WindowExt as _, h_resizable, resizable_panel, v_flex};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, KeyBinding, Menu, MenuItem, PathPromptOptions, SharedString, Subscription, Window,
+    App, Context, Entity, FocusHandle, KeyBinding, Menu, MenuItem, PathPromptOptions, SharedString, Subscription, Task, Window,
     actions, div, px,
 };
 use scriptoria_ink::InkDocument;
@@ -21,7 +21,7 @@ use crate::app::font_view::{FontView, FontViewEvent};
 use crate::app::glyph_view::GlyphView;
 use crate::app::viewer::{Viewer, ViewerEvent};
 
-actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, Quit, Undo, Redo]);
+actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, ExportFont, Quit, Undo, Redo]);
 
 /// Key bindings and menus, once at startup.
 pub fn init(cx: &mut App) {
@@ -31,6 +31,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-s", SaveProject, None),
         KeyBinding::new("ctrl-shift-s", SaveProjectAs, None),
         KeyBinding::new("ctrl-i", ImportPdf, None),
+        KeyBinding::new("ctrl-e", ExportFont, None),
         KeyBinding::new("ctrl-q", Quit, None),
         // Text inputs keep their own undo (their bindings are more specific).
         KeyBinding::new("ctrl-z", Undo, None),
@@ -54,6 +55,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("另存为…", SaveProjectAs),
                 MenuItem::separator(),
                 MenuItem::action("导入 PDF…", ImportPdf),
+                MenuItem::action("导出字体…", ExportFont),
                 MenuItem::separator(),
                 MenuItem::action("退出", Quit),
             ],
@@ -90,6 +92,8 @@ pub struct Workspace {
     pages: Vec<Page>,
     active: usize,
     menu_bar: Entity<AppMenuBar>,
+    /// The font being exported, on a background thread.
+    exporting: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -122,6 +126,7 @@ impl Workspace {
             pages: Vec::new(),
             active: 0,
             menu_bar: AppMenuBar::new(cx),
+            exporting: None,
             _subscriptions: subscriptions,
         };
         let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) = start.into_iter().partition(|p| p.join("project.toml").is_file());
@@ -350,14 +355,71 @@ impl Workspace {
         .detach();
     }
 
+    fn export_font(&mut self, _: &ExportFont, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        if doc.project.glyphs.iter().all(|g| g.strokes.is_empty()) {
+            window.push_notification(Notification::warning("还没有写好的字：先在手写稿上选笔画，分配给字"), cx);
+            return;
+        }
+        let start = doc.folder.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        let name = format!("{}.ttf", doc.project.font.family);
+        let path = cx.prompt_for_new_path(&start, Some(&name));
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(path))) = path.await {
+                this.update_in(cx, |this, window, cx| this.export_to(path, true, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Whether a font is being exported.
+    pub fn exporting(&self) -> bool {
+        self.exporting.is_some()
+    }
+
+    /// Writes the project's font to `path` and a page to try it in next to it (`.html`), on a
+    /// background thread; then opens the page in the browser, if asked.
+    pub fn export_to(&mut self, path: PathBuf, open_preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.exporting.is_some() {
+            window.push_notification(Notification::warning("上一次导出还没完成"), cx);
+            return;
+        }
+        let project = self.document.read(cx).project.clone();
+        let n = project.glyphs.iter().filter(|g| !g.strokes.is_empty()).count();
+        window.push_notification(Notification::info(format!("正在导出 {n} 个字形…")), cx);
+        let background = cx.background_executor().clone();
+        self.exporting = Some(cx.spawn_in(window, async move |this, cx| {
+            let target = path.clone();
+            let result = background.spawn(async move { crate::font::write_font(&project, &target) }).await;
+            this.update_in(cx, |this, window, cx| {
+                this.exporting = None;
+                match result {
+                    Ok(w) => {
+                        let mut text = format!("已导出 {} 个字形到 {}（{} KB，每字 {:.1} 个母版）", w.glyphs, path.display(), w.bytes.div_ceil(1024), w.masters_per_glyph);
+                        if !w.empty.is_empty() {
+                            text += &format!("；{} 个字还没有笔画，没有导出", w.empty.len());
+                        }
+                        window.push_notification(Notification::success(text), cx);
+                        if open_preview {
+                            cx.open_with_system(&w.preview);
+                        }
+                    }
+                    Err(e) => window.push_notification(Notification::error(format!("导出失败：{e}")), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.document.update(cx, |d, cx| d.undo(cx)).is_none() {
+        if !self.document.update(cx, |d, cx| d.undo(cx)) {
             window.push_notification(Notification::info("没有可以撤销的修改"), cx);
         }
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.document.update(cx, |d, cx| d.redo(cx)).is_none() {
+        if !self.document.update(cx, |d, cx| d.redo(cx)) {
             window.push_notification(Notification::info("没有可以重做的修改"), cx);
         }
     }
@@ -409,6 +471,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_project))
             .on_action(cx.listener(Self::save_project_as))
             .on_action(cx.listener(Self::import))
+            .on_action(cx.listener(Self::export_font))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .size_full()

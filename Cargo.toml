@@ -22,6 +22,8 @@ scriptoria-project = { path = "crates/project" }
 # Headless windows and simulated input for the UI tests.
 gpui-kit = { version = "0.9", features = ["test-support"] }
 scriptoria-testkit = { path = "crates/testkit" }
+# Reading exported fonts back.
+skrifa = "0.49"
 
 # Optimize the compute-heavy packages even in debug builds, so the viewer and tests stay fast
 # (only these packages; they compile quickly).

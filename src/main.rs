@@ -4,7 +4,7 @@ mod viewer;
 use std::path::PathBuf;
 
 use gpui::{
-    App, AppContext, Application, Bounds, SharedString, TitlebarOptions, WindowBounds,
+    App, AppContext, Bounds, SharedString, TitlebarOptions, WindowBounds,
     WindowOptions, px, size,
 };
 
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_default()
         .into();
 
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.0), px(820.0)), cx);
         let title = SharedString::from(format!("Scriptoria — {file_name}"));
         cx.open_window(
@@ -36,7 +36,8 @@ fn main() -> anyhow::Result<()> {
             },
             |window, cx| {
                 let view = cx.new(|cx| Viewer::new(doc, file_name, cx));
-                window.focus(view.read(cx).focus_handle());
+                let focus = view.read(cx).focus_handle().clone();
+                window.focus(&focus, cx);
                 view
             },
         )

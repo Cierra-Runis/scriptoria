@@ -9,7 +9,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Bounds, ContentMask, Context, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Path, PathBuilder, Pixels, Point, ScrollWheelEvent, SharedString, Task, Window, canvas, div, hsla,
+    MouseUpEvent, Path, PathBuilder, Pixels, Point, ScrollEvent, SharedString, Task, Window, canvas, div, hsla,
     point, px, quad, rgb, size,
 };
 use scriptoria_ink::kurbo;
@@ -406,9 +406,9 @@ impl Viewer {
         cx.notify();
     }
 
-    fn on_scroll(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, ev: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let delta = ev.delta.pixel_delta(px(20.0));
-        if ev.modifiers.secondary() {
+        if ev.modifiers.secondary(cx) {
             // Ctrl + wheel, or a touchpad pinch: zoom.
             self.zoom_at(ev.position, (f32::from(delta.y) * ZOOM_PER_PX).exp(), cx);
         } else {
@@ -906,7 +906,7 @@ impl Render for Viewer {
                     .child(self.render_page_canvas())
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_canvas_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_canvas_down))
-                    .on_scroll_wheel(cx.listener(Self::on_scroll)),
+                    .on_scroll(cx.listener(Self::on_scroll)),
             )
             .child(bottom_bar)
     }

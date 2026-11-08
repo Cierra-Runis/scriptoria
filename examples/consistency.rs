@@ -4,8 +4,7 @@
 //!
 //! With `--try`, the same again after the project is (in memory only) placed after its reference
 //! font (or `--reference <font file>`), its proportions 70% of the way to the reference's made as wide
-//! as the hand writes, its strokes' widths evened out and its horizontals levelled to the font's
-//! typical slope.
+//! as the hand writes, and its strokes' widths evened out.
 //!
 //! `cargo run --example consistency -- <project folder> [--try] [--reference <font file>]`
 
@@ -32,23 +31,21 @@ fn main() {
         };
         let (bias, _) = scriptoria::assign::estimate_aspect_bias(&project, &reference).expect("glyphs to measure");
         println!(
-            "\n参考字体 {} {}，宽高比偏好 {bias:.2}（按自己的字估计），宽高比贴合 0.7，统一笔宽，横画取平之后：",
+            "\n参考字体 {} {}，宽高比偏好 {bias:.2}（按自己的字估计），宽高比贴合 0.7，统一笔宽之后：",
             reference.face().family,
             reference.face().style
         );
         project.font.aspect_strength = 0.7;
         project.font.aspect_bias = bias;
         let info = project.font.clone();
-        let min_length = 0.2 * (info.ascender - info.descender) as f64;
         for g in &mut project.glyphs {
             if g.chars.first().is_some_and(|&c| scriptoria_template::is_square(c)) && !g.strokes.is_empty() {
                 scriptoria::assign::fit(g, &info, &reference);
             }
         }
-        let (width, slope) = (project.typical_width().unwrap(), project.typical_slope(min_length).unwrap());
+        let width = project.typical_width().unwrap();
         for g in &mut project.glyphs {
             g.even_widths(width, 0.7);
-            g.level_to(slope, min_length);
         }
         report(&project);
     }

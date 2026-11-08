@@ -10,6 +10,7 @@ pub mod app;
 pub mod assign;
 pub mod font;
 pub mod groups;
+pub mod problems;
 pub mod template;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

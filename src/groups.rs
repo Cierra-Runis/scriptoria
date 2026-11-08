@@ -1,10 +1,13 @@
 //! A project's glyphs sorted into groups, to work on many at once (as FontForge shows a font by
 //! encoding and Unicode block): all of them; those written and those not yet; by Unicode block; by
-//! the practice sheet they were given on. Also characters typed as ranges of code points.
+//! the practice sheet they were given on; by the problems they have. Also characters typed as
+//! ranges of code points.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use scriptoria_project::Project;
+
+use crate::problems::Problem;
 use scriptoria_charsets::{Block, block, block_of};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,6 +21,8 @@ pub enum Group {
     NoBlock,
     /// A practice sheet, by its id.
     Template(u32),
+    /// Glyphs with a problem.
+    Problem(Problem),
 }
 
 /// Where a group is listed.
@@ -26,6 +31,7 @@ pub enum Section {
     Status,
     Blocks,
     Templates,
+    Problems,
 }
 
 /// A group as listed: its name, how many glyphs it holds and how many of them are written.
@@ -39,8 +45,9 @@ pub struct Listed {
 }
 
 /// The groups of a project, in the order listed: all, by state, by block (in code point order),
-/// by practice sheet.
-pub fn list(project: &Project) -> Vec<Listed> {
+/// by practice sheet, by problem (each glyph's problems given, by index; the problems no glyph
+/// has are left out).
+pub fn list(project: &Project, problems: &[Vec<Problem>]) -> Vec<Listed> {
     let glyphs = &project.glyphs;
     let written = glyphs.iter().filter(|g| !g.strokes.is_empty()).count();
     let mut out = vec![
@@ -74,6 +81,12 @@ pub fn list(project: &Project) -> Vec<Listed> {
         let w = members.iter().filter(|&&g| !glyphs[g].strokes.is_empty()).count();
         out.push(Listed { group: Group::Template(t.id), section: Section::Templates, name: format!("模板 #{}", t.id), glyphs: members.len(), written: w });
     }
+    for p in Problem::ALL {
+        let n = problems.iter().filter(|found| found.contains(&p)).count();
+        if n > 0 {
+            out.push(Listed { group: Group::Problem(p), section: Section::Problems, name: p.name().to_string(), glyphs: n, written: n });
+        }
+    }
     out
 }
 
@@ -93,8 +106,9 @@ fn template_members(by_char: &HashMap<char, usize>, chars: &str) -> Vec<usize> {
     chars.chars().filter_map(|c| by_char.get(&c).copied()).filter(|g| seen.insert(*g)).collect()
 }
 
-/// The glyphs of a group: in the project's order, or a sheet's in the sheet's.
-pub fn members(project: &Project, group: Group) -> Vec<usize> {
+/// The glyphs of a group (each glyph's problems given, by index): in the project's order, or a
+/// sheet's in the sheet's.
+pub fn members(project: &Project, group: Group, problems: &[Vec<Problem>]) -> Vec<usize> {
     let glyphs = &project.glyphs;
     let first_block = |i: usize| glyphs[i].chars.first().copied().and_then(block_of).map(|b| b.start);
     let all = 0..glyphs.len();
@@ -105,6 +119,7 @@ pub fn members(project: &Project, group: Group) -> Vec<usize> {
         Group::Block(start) => all.filter(|&i| first_block(i) == Some(start)).collect(),
         Group::NoBlock => all.filter(|&i| first_block(i).is_none()).collect(),
         Group::Template(id) => project.templates.iter().find(|t| t.id == id).map(|t| template_members(&chars_to_glyphs(project), &t.chars)).unwrap_or_default(),
+        Group::Problem(p) => all.filter(|&i| problems.get(i).is_some_and(|found| found.contains(&p))).collect(),
     }
 }
 
@@ -164,7 +179,7 @@ mod tests {
         written(&mut p, '世');
         written(&mut p, 'A');
         p.new_template(&['い', '界', 'Z']);
-        let listed = list(&p);
+        let listed = list(&p, &[]);
         let find = |g: Group| listed.iter().find(|l| l.group == g).map(|l| (l.name.as_str(), l.glyphs, l.written));
         assert_eq!(find(Group::All), Some(("全部", 6, 2)));
         assert_eq!(find(Group::Unwritten), Some(("未书写", 4, 0)));
@@ -177,10 +192,10 @@ mod tests {
         let blocks: Vec<Group> = listed.iter().filter(|l| l.section == Section::Blocks).map(|l| l.group).collect();
         assert_eq!(blocks, [Group::Block(0), Group::Block(0x3040), Group::Block(0x4E00)]);
 
-        assert_eq!(members(&p, Group::Block(0x4E00)), [0, 1]);
-        assert_eq!(members(&p, Group::Written), [0, 4]);
+        assert_eq!(members(&p, Group::Block(0x4E00), &[]), [0, 1]);
+        assert_eq!(members(&p, Group::Written, &[]), [0, 4]);
         // A sheet's glyphs in the sheet's order.
-        assert_eq!(members(&p, Group::Template(1)), [3, 1]);
+        assert_eq!(members(&p, Group::Template(1), &[]), [3, 1]);
     }
 
     #[test]

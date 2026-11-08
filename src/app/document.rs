@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
+use scriptoria_ink::kurbo::Rect;
 use scriptoria_project::{FontInfo, Glyph, GlyphStroke, Part, Project, Reference, Template};
+
+use crate::problems::Problem;
 use scriptoria_reference::ReferenceFont;
 
 /// How many changes can be undone.
@@ -43,6 +46,10 @@ pub struct Document {
     generation: u64,
     /// The outlines in glyphs (see [`Document::used_outlines`]), for a generation.
     used: std::cell::RefCell<Option<(u64, Arc<HashSet<u64>>)>>,
+    /// Each glyph's problems (see [`Document::problems`]), for a generation.
+    problems: std::cell::RefCell<Option<(u64, Arc<Vec<Vec<Problem>>>)>>,
+    /// The reference font's box of each character asked for (font units).
+    reference_boxes: std::cell::RefCell<std::collections::HashMap<char, Option<Rect>>>,
     /// Per glyph, bumped whenever it changes.
     revisions: Vec<u64>,
     next_revision: u64,
@@ -83,7 +90,7 @@ impl Document {
         let revisions = vec![0; project.glyphs.len()];
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        Document { project, folder, modified: false, id, reference: reference.map(Arc::new), generation: 0, used: Default::default(), revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
+        Document { project, folder, modified: false, id, reference: reference.map(Arc::new), generation: 0, used: Default::default(), problems: Default::default(), reference_boxes: Default::default(), revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
     }
 
     /// Different for every document made (a project opened twice is two documents).
@@ -108,6 +115,7 @@ impl Document {
     /// Uses another reference font (or none), as a change to undo.
     pub fn set_reference(&mut self, reference: Option<Reference>, cx: &mut Context<Self>) -> Result<(), scriptoria_reference::Error> {
         self.reference = reference.as_ref().map(crate::assign::open_reference).transpose()?.map(Arc::new);
+        self.reference_boxes.borrow_mut().clear();
         self.update_font(|f| f.reference = reference, cx);
         Ok(())
     }
@@ -241,6 +249,7 @@ impl Document {
     pub fn replace_font(&mut self, info: FontInfo, cx: &mut Context<Self>) -> Result<(), scriptoria_reference::Error> {
         if info.reference != self.project.font.reference {
             self.reference = info.reference.as_ref().map(crate::assign::open_reference).transpose()?.map(Arc::new);
+            self.reference_boxes.borrow_mut().clear();
         }
         self.update_font(|f| *f = info, cx);
         Ok(())
@@ -298,6 +307,7 @@ impl Document {
             Change::Font(font) => {
                 if font.reference != self.project.font.reference {
                     self.reference = font.reference.as_ref().and_then(|r| crate::assign::open_reference(r).ok()).map(Arc::new);
+                    self.reference_boxes.borrow_mut().clear();
                 }
                 let replaced = std::mem::replace(&mut self.project.font, font);
                 self.touch(cx);
@@ -420,6 +430,32 @@ impl Document {
             cx,
         );
         replaced
+    }
+
+    /// Each glyph's problems (see [`crate::problems::check`]), by index. Kept until the project
+    /// changes.
+    pub fn problems(&self) -> Arc<Vec<Vec<Problem>>> {
+        if let Some((generation, found)) = &*self.problems.borrow()
+            && *generation == self.generation
+        {
+            return found.clone();
+        }
+        let upm = self.project.font.units_per_em as f64;
+        let mut boxes = self.reference_boxes.borrow_mut();
+        let found: Arc<Vec<Vec<Problem>>> = Arc::new(
+            self.project
+                .glyphs
+                .iter()
+                .map(|g| {
+                    let reference = g.chars.first().and_then(|&c| {
+                        *boxes.entry(c).or_insert_with(|| self.reference.as_ref().and_then(|r| r.glyph(c, upm)).map(|g| g.bounds))
+                    });
+                    crate::problems::check(g, &self.project.font, reference)
+                })
+                .collect(),
+        );
+        *self.problems.borrow_mut() = Some((self.generation, found.clone()));
+        found
     }
 
     /// The outlines of the strokes in glyphs, as fingerprints (see

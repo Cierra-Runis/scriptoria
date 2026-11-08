@@ -907,3 +907,27 @@ fn the_fonts_settings_are_edited_in_one_place(cx: &mut TestAppContext) {
     });
     assert_eq!(document.read_with(cx, |d, _| d.project.font.clone()), before);
 }
+
+#[gpui_kit::test]
+fn glyphs_with_problems_are_found(cx: &mut TestAppContext) {
+    use scriptoria::problems::Problem;
+    let (workspace, cx) = two_glyphs(cx);
+    let font_view = workspace.read_with(cx, |w, _| w.font_view().clone());
+    let problem_groups = |cx: &mut VisualTestContext| -> Vec<Group> {
+        font_view.update(cx, |f, cx| f.groups(cx)).into_iter().map(|l| l.group).filter(|g| matches!(g, Group::Problem(_))).collect()
+    };
+    assert!(!problem_groups(cx).contains(&Group::Problem(Problem::Duplicate)));
+    // A stroke of 丗 there twice.
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    document.update(cx, |d, cx| d.update_glyph(1, |g| g.strokes.push(g.strokes[0].clone()), cx));
+    assert!(problem_groups(cx).contains(&Group::Problem(Problem::Duplicate)));
+    let at = font_view.update(cx, |f, cx| f.groups(cx)).iter().position(|l| l.group == Group::Problem(Problem::Duplicate)).unwrap();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("group", at), cx);
+    });
+    assert_eq!(font_view.update(cx, |f, cx| f.glyphs(cx)), [1]);
+    // Fixed (undone), the problem's group goes.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert!(!problem_groups(cx).contains(&Group::Problem(Problem::Duplicate)));
+}

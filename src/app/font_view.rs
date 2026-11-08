@@ -1,7 +1,7 @@
 //! The glyph grid, as in FontForge's main window: the project's glyphs in cells, drawn as the font
 //! draws them at the default weight (from their strokes as written until that is ready), with
 //! their characters. A list beside it sorts the glyphs into groups (all; not written yet, written;
-//! by Unicode block; by practice sheet) and the grid shows one group, in the project's order or by
+//! by Unicode block; by practice sheet; by the problems they have, see [`crate::problems`]) and the grid shows one group, in the project's order or by
 //! code point. Characters typed or pasted into the box above become new glyphs (`U+4E00-U+4E2F`
 //! adds a range); a block is filled in with the characters the reference font has. A click
 //! selects a glyph (Ctrl adds or removes, Shift selects a range), a double click opens it.
@@ -210,12 +210,13 @@ impl FontView {
         let key = (doc.id(), doc.generation(), self.group, self.by_code);
         if self.shown.as_ref().is_none_or(|s| s.key != key) {
             let project = &doc.project;
-            let listed = groups::list(project);
+            let problems = doc.problems();
+            let listed = groups::list(project, &problems);
             // A group gone (its sheet forgotten, its last glyph removed): all of them.
             if !listed.iter().any(|l| l.group == self.group) {
                 self.group = Group::All;
             }
-            let mut glyphs = groups::members(project, self.group);
+            let mut glyphs = groups::members(project, self.group, &problems);
             if self.by_code {
                 glyphs.sort_by_key(|&g| project.glyphs[g].chars.first().map_or(u32::MAX, |&c| c as u32));
             }
@@ -465,12 +466,13 @@ impl FontView {
                     Section::Status => "状态",
                     Section::Blocks => "Unicode 区块",
                     Section::Templates => "格子模板",
+                    Section::Problems => "检查",
                 };
                 list = list.child(div().px_2().pt_3().pb_1().text_xs().text_color(muted).child(title));
             }
             let current = l.group == self.group;
             let count = match l.group {
-                Group::Unwritten | Group::Written => l.glyphs.to_string(),
+                Group::Unwritten | Group::Written | Group::Problem(_) => l.glyphs.to_string(),
                 _ => format!("{}/{}", l.written, l.glyphs),
             };
             let group = l.group;
@@ -509,7 +511,11 @@ impl FontView {
             .py_1()
             .gap_1()
             .flex_wrap()
-            .child(div().flex_1().min_w(px(120.0)).text_xs().text_color(theme.muted_foreground).child(format!("{name}：{n} 个字形，已写 {written}")));
+            .child(div().flex_1().min_w(px(120.0)).text_xs().text_color(theme.muted_foreground).child(match self.group {
+                // A problem: what it means and what to do.
+                Group::Problem(p) => format!("{name}：{n} 个字形。{}", p.advice()),
+                _ => format!("{name}：{n} 个字形，已写 {written}"),
+            }));
         match self.group {
             Group::Block(start) => {
                 let missing = shown.missing;

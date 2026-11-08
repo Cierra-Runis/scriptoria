@@ -45,6 +45,10 @@ const GROUPS: f32 = 172.0;
 const TOLERANCE: f32 = 2.0;
 /// What a full-width glyph's larger side becomes, as a fraction of the em.
 const FACE: f64 = 0.9;
+/// How far 统一笔宽 draws strokes' widths towards the typical one.
+const EVEN_WIDTHS: f64 = 0.7;
+/// How long a stroke must be (a share of the em) to count as a horizontal stroke for 横画取平.
+const HORIZONTAL_LENGTH: f64 = 0.2;
 
 pub enum FontViewEvent {
     /// The selected glyph changed.
@@ -286,6 +290,23 @@ impl FontView {
     fn edit_selection(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Glyph)) {
         let glyphs = self.selection();
         self.document.update(cx, |d, cx| d.update_glyphs(&glyphs, f, cx));
+    }
+
+    /// Draws the selected glyphs' strokes towards the font's typical width, as one step to undo.
+    fn even_widths(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.document.read(cx).project.typical_width() else { return };
+        self.edit_selection(cx, move |g| g.even_widths(target, EVEN_WIDTHS));
+    }
+
+    /// Shears the selected glyphs so that their horizontal strokes slope as the font's typically do,
+    /// as one step to undo.
+    fn level_horizontals(&mut self, cx: &mut Context<Self>) {
+        let font = &self.document.read(cx).project.font;
+        let min_length = HORIZONTAL_LENGTH * (font.ascender - font.descender) as f64;
+        let Some(target) = self.document.read(cx).project.typical_slope(min_length) else { return };
+        self.edit_selection(cx, move |g| {
+            g.level_to(target, min_length);
+        });
     }
 
     /// Removes the selected glyphs, as one step to undo.
@@ -582,6 +603,20 @@ impl FontView {
                     .on_click(cx.listener(move |this, _, _, cx| this.edit_selection(cx, |g| g.fit_full_width(&font, FACE)))),
             )
             .child(Button::new("center-selection").xsmall().label("居中").on_click(cx.listener(|this, _, _, cx| this.edit_selection(cx, Glyph::center))))
+            .child(
+                Button::new("even-widths")
+                    .xsmall()
+                    .label("统一笔宽")
+                    .tooltip("每一笔的粗细向全字体的典型笔宽靠拢七成（只改笔宽）")
+                    .on_click(cx.listener(|this, _, _, cx| this.even_widths(cx))),
+            )
+            .child(
+                Button::new("level-horizontals")
+                    .xsmall()
+                    .label("横画取平")
+                    .tooltip("上下错切每个字，让横画的倾斜和全字体的典型倾斜一致（竖画保持竖直）")
+                    .on_click(cx.listener(|this, _, _, cx| this.level_horizontals(cx))),
+            )
             .child(
                 Button::new("template-selection")
                     .xsmall()

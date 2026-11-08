@@ -931,3 +931,47 @@ fn glyphs_with_problems_are_found(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert!(!problem_groups(cx).contains(&Group::Problem(Problem::Duplicate)));
 }
+
+#[gpui_kit::test]
+fn glyphs_are_made_alike(cx: &mut TestAppContext) {
+    let (workspace, cx) = two_glyphs(cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    // 丗 written heavier and tilted: its pen doubled, sheared 8° up to the right.
+    let tilt = 8f64.to_radians().tan();
+    document.update(cx, |d, cx| {
+        d.update_glyph(
+            1,
+            |g| {
+                let all: Vec<usize> = (0..g.strokes.len()).collect();
+                g.transform_strokes(&all, scriptoria_ink::kurbo::Affine::new([1.0, tilt, 0.0, 1.0, 0.0, 0.0]));
+                g.strokes.iter_mut().for_each(|s| s.pen *= 2.0);
+            },
+            cx,
+        )
+    });
+    let em = 1000.0;
+    let slope = |g: &Glyph| g.horizontal_slope(0.2 * em).unwrap();
+    let before = glyphs(&workspace, cx);
+    assert!((slope(&before[1]) - slope(&before[0])).abs() > 0.1);
+    cx.update(|window, cx| {
+        window.click(("cell", 0usize), cx);
+        window.click_with_modifiers(("cell", 1usize), gpui_kit::Modifiers::control(), cx);
+        window.render_frame(cx);
+        window.click("level-horizontals", cx);
+        window.click("even-widths", cx);
+    });
+    let after = glyphs(&workspace, cx);
+    // Their horizontals slope alike now; their strokes are nearer one width.
+    assert!((slope(&after[1]) - slope(&after[0])).abs() < 0.1 * (slope(&before[1]) - slope(&before[0])).abs());
+    let spread = |gs: &[Glyph]| {
+        let w: Vec<f64> = gs.iter().flat_map(|g| g.strokes.iter().filter_map(|s| s.width())).collect();
+        w.iter().cloned().fold(0.0, f64::max) / w.iter().cloned().fold(f64::INFINITY, f64::min)
+    };
+    assert!(spread(&after) < spread(&before), "{} < {}", spread(&after), spread(&before));
+    // Each its own step back.
+    cx.update(|window, cx| {
+        window.press("ctrl-z", cx);
+        window.press("ctrl-z", cx);
+    });
+    assert_eq!(glyphs(&workspace, cx), before);
+}

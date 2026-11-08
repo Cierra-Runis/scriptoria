@@ -20,6 +20,7 @@
 //! The glyph files open in a browser, the glyph upright. See [`svg`] for their details.
 
 mod skeleton;
+mod style;
 mod svg;
 
 pub use skeleton::Node;
@@ -80,6 +81,10 @@ pub struct FontInfo {
     /// reference's. Positions always follow the reference.
     #[serde(default = "default_fit_strength")]
     pub fit_strength: f64,
+    /// How far glyphs placed after the reference take its proportions (width to height): 0 keeps
+    /// the hand's, 1 takes the reference's.
+    #[serde(default = "default_aspect_strength")]
+    pub aspect_strength: f64,
     /// The family name in Latin letters, for software that wants one; `family` is then its
     /// Chinese name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -128,6 +133,10 @@ fn default_version() -> f64 {
     1.0
 }
 
+fn default_aspect_strength() -> f64 {
+    0.5
+}
+
 impl Default for FontInfo {
     fn default() -> Self {
         FontInfo {
@@ -140,6 +149,7 @@ impl Default for FontInfo {
             pt_per_em: DEFAULT_PT_PER_EM,
             reference: None,
             fit_strength: default_fit_strength(),
+            aspect_strength: default_aspect_strength(),
             english_name: String::new(),
             version: default_version(),
             copyright: String::new(),
@@ -318,9 +328,10 @@ impl Glyph {
     }
 
     /// Places the glyph as the reference places its character (`frame`):
+    /// - its proportions: drawn towards the reference's as far as the font's `aspect_strength`
+    ///   goes (0 keeps the hand's), but for very long or very flat characters (一, 丨);
     /// - its size: the area of its box made the reference's, or for very long or very flat
-    ///   characters (一, 丨) the long side, keeping the hand's proportions; `strength` (0 to 1) goes
-    ///   from the size written to the reference's;
+    ///   characters the long side; `strength` (0 to 1) goes from the size written to the reference's;
     /// - across: a full-width reference (an em wide) has the box centered on the reference's, and
     ///   the advance an em, and it stays within [`FULL_WIDTH_LIMIT`] of the em; otherwise the
     ///   reference's side bearings around the box make the advance;
@@ -331,6 +342,16 @@ impl Glyph {
         let r = frame.bounds;
         let em = info.units_per_em as f64;
         let long = |w: f64, h: f64| w.max(h) > 2.5 * w.min(h);
+        // The hand's proportions drawn towards the reference's, as far as `aspect_strength` goes (the
+        // area kept).
+        let s = info.aspect_strength.clamp(0.0, 1.0);
+        if s > 0.0 && !long(b.width(), b.height()) && !long(r.width(), r.height()) && b.area() > 0.0 && r.area() > 0.0 {
+            let (aspect, reference) = (b.width() / b.height(), r.width() / r.height());
+            let kx = (aspect.powf(1.0 - s) * reference.powf(s) / aspect).sqrt();
+            let c = b.center().to_vec2();
+            self.transform_strokes(&self.all(), Affine::translate(c) * Affine::scale_non_uniform(kx, 1.0 / kx) * Affine::translate(-c));
+        }
+        let Some(b) = self.ink_bounds() else { return };
         let wide = b.width() >= b.height();
         let measure = move |b: Rect| match (long(b.width(), b.height()) || long(r.width(), r.height()), wide) {
             (true, true) => b.width(),
@@ -777,6 +798,19 @@ mod tests {
         let mut g = boxed(400.0, 350.0);
         g.fit(&Frame { bounds: Rect::new(100.0, -50.0, 900.0, 650.0), advance: 1000.0 }, &info, 0.0);
         assert!(close(g.bounds().unwrap(), Rect::new(300.0, 125.0, 700.0, 475.0)), "{:?}", g.bounds());
+    }
+
+    #[test]
+    fn proportions_go_towards_the_references_as_far_as_asked() {
+        // A hand twice as wide as high, a square reference: its proportions kept, met halfway, taken.
+        for (strength, aspect) in [(0.0, 2.0), (0.5, 2f64.sqrt()), (1.0, 1.0)] {
+            let info = FontInfo { aspect_strength: strength, ..FontInfo::default() };
+            let mut g = boxed(400.0, 200.0);
+            g.fit(&Frame { bounds: Rect::new(300.0, 100.0, 700.0, 500.0), advance: 1000.0 }, &info, 1.0);
+            let b = g.bounds().unwrap();
+            assert!((b.width() / b.height() - aspect).abs() < 1e-6, "{strength}: {b:?}");
+            assert!((b.area() - 400.0 * 400.0).abs() < 1.0, "the reference's area: {b:?}");
+        }
     }
 
     #[test]

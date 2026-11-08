@@ -33,10 +33,11 @@ enum Field {
     PtPerEm,
     Thinnest,
     FitStrength,
+    AspectStrength,
 }
 
 impl Field {
-    const ALL: [Field; 14] = [
+    const ALL: [Field; 15] = [
         Field::Family,
         Field::English,
         Field::Version,
@@ -51,6 +52,7 @@ impl Field {
         Field::PtPerEm,
         Field::Thinnest,
         Field::FitStrength,
+        Field::AspectStrength,
     ];
 
     /// Its label, the id of its box, and a note beside it.
@@ -70,6 +72,7 @@ impl Field {
             Field::PtPerEm => ("手写字号", "info-pt-per-em", "pt / em：手写一个 em 多大"),
             Field::Thinnest => ("最细倍数", "info-thinnest", "wght 100 时笔宽是原稿的几倍"),
             Field::FitStrength => ("贴合强度", "info-fit-strength", "0 保持手写大小，1 完全照参考"),
+            Field::AspectStrength => ("宽高比贴合", "info-aspect-strength", "0 保持手写的宽高比，1 照参考"),
         }
     }
 
@@ -89,6 +92,7 @@ impl Field {
             Field::PtPerEm => f.pt_per_em.to_string(),
             Field::Thinnest => f.thinnest.to_string(),
             Field::FitStrength => f.fit_strength.to_string(),
+            Field::AspectStrength => f.aspect_strength.to_string(),
         }
     }
 
@@ -116,6 +120,7 @@ impl Field {
             Field::PtPerEm => f.pt_per_em = number(0.5, 500.0)?,
             Field::Thinnest => f.thinnest = number(0.05, 1.0)?,
             Field::FitStrength => f.fit_strength = number(0.0, 1.0)?,
+            Field::AspectStrength => f.aspect_strength = number(0.0, 1.0)?,
         }
         Ok(())
     }
@@ -224,7 +229,7 @@ impl Render for FontInfoForm {
         };
         let names = rows(&[Field::Family, Field::English, Field::Version, Field::Copyright, Field::Designer, Field::License], self, cx);
         let lines = rows(&[Field::Ascender, Field::Descender, Field::LineGap, Field::XHeight, Field::CapHeight], self, cx);
-        let hand = rows(&[Field::PtPerEm, Field::Thinnest, Field::FitStrength], self, cx);
+        let hand = rows(&[Field::PtPerEm, Field::Thinnest, Field::FitStrength, Field::AspectStrength], self, cx);
         let file: SharedString = self.reference.as_ref().map_or("（不用参考字体）".into(), |r| r.file.display().to_string().into());
         let chosen = self.reference.as_ref().map(|r| r.face);
         let faces: Vec<_> = self

@@ -34,10 +34,11 @@ enum Field {
     Thinnest,
     FitStrength,
     AspectStrength,
+    AspectBias,
 }
 
 impl Field {
-    const ALL: [Field; 15] = [
+    const ALL: [Field; 16] = [
         Field::Family,
         Field::English,
         Field::Version,
@@ -53,6 +54,7 @@ impl Field {
         Field::Thinnest,
         Field::FitStrength,
         Field::AspectStrength,
+        Field::AspectBias,
     ];
 
     /// Its label, the id of its box, and a note beside it.
@@ -73,6 +75,7 @@ impl Field {
             Field::Thinnest => ("最细倍数", "info-thinnest", "wght 100 时笔宽是原稿的几倍"),
             Field::FitStrength => ("贴合强度", "info-fit-strength", "0 保持手写大小，1 完全照参考"),
             Field::AspectStrength => ("宽高比贴合", "info-aspect-strength", "0 保持手写的宽高比，1 照参考"),
+            Field::AspectBias => ("宽高比偏好", "info-aspect-bias", "比参考宽多少倍（1 一样，1.2 宽两成）"),
         }
     }
 
@@ -93,6 +96,7 @@ impl Field {
             Field::Thinnest => f.thinnest.to_string(),
             Field::FitStrength => f.fit_strength.to_string(),
             Field::AspectStrength => f.aspect_strength.to_string(),
+            Field::AspectBias => format!("{:.2}", f.aspect_bias),
         }
     }
 
@@ -121,6 +125,7 @@ impl Field {
             Field::Thinnest => f.thinnest = number(0.05, 1.0)?,
             Field::FitStrength => f.fit_strength = number(0.0, 1.0)?,
             Field::AspectStrength => f.aspect_strength = number(0.0, 1.0)?,
+            Field::AspectBias => f.aspect_bias = number(0.3, 3.0)?,
         }
         Ok(())
     }
@@ -199,6 +204,24 @@ impl FontInfoForm {
         }
     }
 
+    /// How much wider than the reference chosen the hand writes, measured on the glyphs written,
+    /// into its box.
+    fn estimate_bias(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(reference) = self.reference.as_ref().and_then(|r| crate::assign::open_reference(r).ok()) else {
+            window.push_notification(Notification::warning("先选一个参考字体"), cx);
+            return;
+        };
+        match crate::assign::estimate_aspect_bias(&self.document.read(cx).project, &reference) {
+            Some((bias, n)) => {
+                if let Some((_, input)) = self.fields.iter().find(|(f, _)| *f == Field::AspectBias) {
+                    input.update(cx, |s, cx| s.set_value(format!("{bias:.2}"), window, cx));
+                }
+                window.push_notification(Notification::info(format!("按 {n} 个字估计：比参考宽 {:+.0}%", (bias - 1.0) * 100.0)), cx);
+            }
+            None => window.push_notification(Notification::warning("还没有可以量的字"), cx),
+        }
+    }
+
     /// Applies the settings (one step to undo) and closes the dialog; or says what is wrong.
     pub fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let result = self.settings(cx).and_then(|info| self.document.update(cx, |d, cx| d.replace_font(info, cx)).map_err(|e| format!("参考字体打不开：{e}")));
@@ -229,7 +252,7 @@ impl Render for FontInfoForm {
         };
         let names = rows(&[Field::Family, Field::English, Field::Version, Field::Copyright, Field::Designer, Field::License], self, cx);
         let lines = rows(&[Field::Ascender, Field::Descender, Field::LineGap, Field::XHeight, Field::CapHeight], self, cx);
-        let hand = rows(&[Field::PtPerEm, Field::Thinnest, Field::FitStrength, Field::AspectStrength], self, cx);
+        let hand = rows(&[Field::PtPerEm, Field::Thinnest, Field::FitStrength, Field::AspectStrength, Field::AspectBias], self, cx);
         let file: SharedString = self.reference.as_ref().map_or("（不用参考字体）".into(), |r| r.file.display().to_string().into());
         let chosen = self.reference.as_ref().map(|r| r.face);
         let faces: Vec<_> = self
@@ -276,6 +299,15 @@ impl Render for FontInfoForm {
                     )
                     .child(section("手写与字重"))
                     .children(hand)
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new("aspect-bias-estimate")
+                                .xsmall()
+                                .label("宽高比偏好按我的字估计")
+                                .tooltip("量已写的字比所选参考字体宽多少（按上面选的参考字体）")
+                                .on_click(cx.listener(|this, _, window, cx| this.estimate_bias(window, cx))),
+                        ),
+                    )
                     .child(section("参考字体"))
                     .child(div().text_xs().child(file))
                     .child(

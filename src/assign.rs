@@ -134,6 +134,35 @@ pub fn estimate_pt_per_em(project: &Project, reference: &ReferenceFont) -> Optio
     Some((sizes[sizes.len() / 2], sizes.len()))
 }
 
+/// How much wider than the reference the hand writes, all over: the median, over the glyphs
+/// written in one go that the reference has, of their width-to-height against the reference's
+/// (see [`FontInfo::aspect_bias`]); with how many glyphs that is. None without any.
+pub fn estimate_aspect_bias(project: &Project, reference: &ReferenceFont) -> Option<(f64, usize)> {
+    use scriptoria_ink::kurbo::Shape as _;
+    let upm = project.font.units_per_em as f64;
+    let mut ratios: Vec<f64> = project
+        .glyphs
+        .iter()
+        .filter_map(|g| {
+            let c = *g.chars.first()?;
+            let first = g.strokes.first()?.placement;
+            if g.strokes.iter().any(|s| s.placement != first) {
+                return None;
+            }
+            let hand = g.strokes.iter().map(|s| s.outline.path.bounding_box()).reduce(|a, b| a.union(b))?;
+            let model = reference.glyph(c, upm)?.bounds;
+            let tall = |w: f64, h: f64| w.max(h) > 2.5 * w.min(h);
+            (hand.area() > 0.0 && model.area() > 0.0 && !tall(hand.width(), hand.height()) && !tall(model.width(), model.height()))
+                .then(|| (hand.width() / hand.height()) / (model.width() / model.height()))
+        })
+        .collect();
+    if ratios.is_empty() {
+        return None;
+    }
+    ratios.sort_by(f64::total_cmp);
+    Some((ratios[ratios.len() / 2], ratios.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +214,11 @@ mod tests {
         p.glyphs[1].strokes = vec![stroke(0.0, Rect::new(0.0, 0.0, 3.0, 0.3))];
         let (pt, n) = estimate_pt_per_em(&p, &reference()).unwrap();
         assert!((pt - 3.0).abs() < 1e-6 && n == 1, "{pt}");
+        // Written twice as wide as high, against a square 口: twice as wide, all over.
+        p.glyphs[0].strokes = vec![stroke(0.0, Rect::new(10.0, 10.0, 14.8, 12.4))];
+        let (bias, n) = estimate_aspect_bias(&p, &reference()).unwrap();
+        assert!((bias - 2.0).abs() < 1e-6 && n == 1, "{bias}");
+        p.glyphs[0].strokes = vec![stroke(0.0, Rect::new(10.0, 10.0, 12.4, 11.0)), stroke(0.0, Rect::new(10.0, 11.0, 11.0, 12.4))];
         // Strokes placed apart (one moved on its own) do not make one box.
         p.glyphs[0].strokes[1] = stroke(1.0, Rect::new(10.0, 11.0, 11.0, 12.4));
         assert_eq!(estimate_pt_per_em(&p, &reference()), None);

@@ -85,6 +85,11 @@ pub struct FontInfo {
     /// the hand's, 1 takes the reference's.
     #[serde(default = "default_aspect_strength")]
     pub aspect_strength: f64,
+    /// How much wider (above 1) or narrower the hand writes than the reference, all over: the
+    /// proportions glyphs are drawn towards are the reference's times this, so that they keep the
+    /// reference's relations between characters but the hand's width.
+    #[serde(default = "default_aspect_bias")]
+    pub aspect_bias: f64,
     /// The family name in Latin letters, for software that wants one; `family` is then its
     /// Chinese name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -137,6 +142,10 @@ fn default_aspect_strength() -> f64 {
     0.5
 }
 
+fn default_aspect_bias() -> f64 {
+    1.0
+}
+
 impl Default for FontInfo {
     fn default() -> Self {
         FontInfo {
@@ -150,6 +159,7 @@ impl Default for FontInfo {
             reference: None,
             fit_strength: default_fit_strength(),
             aspect_strength: default_aspect_strength(),
+            aspect_bias: default_aspect_bias(),
             english_name: String::new(),
             version: default_version(),
             copyright: String::new(),
@@ -328,8 +338,9 @@ impl Glyph {
     }
 
     /// Places the glyph as the reference places its character (`frame`):
-    /// - its proportions: drawn towards the reference's as far as the font's `aspect_strength`
-    ///   goes (0 keeps the hand's), but for very long or very flat characters (一, 丨);
+    /// - its proportions: drawn towards the reference's (times the font's `aspect_bias`) as far as
+    ///   its `aspect_strength` goes (0 keeps the hand's), but for very long or very flat characters
+    ///   (一, 丨);
     /// - its size: the area of its box made the reference's, or for very long or very flat
     ///   characters the long side; `strength` (0 to 1) goes from the size written to the reference's;
     /// - across: a full-width reference (an em wide) has the box centered on the reference's, and
@@ -346,7 +357,7 @@ impl Glyph {
         // area kept).
         let s = info.aspect_strength.clamp(0.0, 1.0);
         if s > 0.0 && !long(b.width(), b.height()) && !long(r.width(), r.height()) && b.area() > 0.0 && r.area() > 0.0 {
-            let (aspect, reference) = (b.width() / b.height(), r.width() / r.height());
+            let (aspect, reference) = (b.width() / b.height(), r.width() / r.height() * info.aspect_bias.max(0.1));
             let kx = (aspect.powf(1.0 - s) * reference.powf(s) / aspect).sqrt();
             let c = b.center().to_vec2();
             self.transform_strokes(&self.all(), Affine::translate(c) * Affine::scale_non_uniform(kx, 1.0 / kx) * Affine::translate(-c));
@@ -811,6 +822,13 @@ mod tests {
             assert!((b.width() / b.height() - aspect).abs() < 1e-6, "{strength}: {b:?}");
             assert!((b.area() - 400.0 * 400.0).abs() < 1.0, "the reference's area: {b:?}");
         }
+        // A hand writing half as wide again as the reference, taken all the way: the reference's
+        // proportions, made that much wider.
+        let info = FontInfo { aspect_strength: 1.0, aspect_bias: 1.5, ..FontInfo::default() };
+        let mut g = boxed(400.0, 200.0);
+        g.fit(&Frame { bounds: Rect::new(300.0, 100.0, 700.0, 500.0), advance: 1000.0 }, &info, 1.0);
+        let b = g.bounds().unwrap();
+        assert!((b.width() / b.height() - 1.5).abs() < 1e-6, "{b:?}");
     }
 
     #[test]

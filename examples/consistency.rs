@@ -3,8 +3,9 @@
 //! what makes handwriting look uneven as a font. Reads the project only.
 //!
 //! With `--try`, the same again after the project is (in memory only) placed after its reference
-//! font (or `--reference <font file>`) with its proportions half way to the reference's, its strokes'
-//! widths evened out and its horizontals levelled to the font's typical slope.
+//! font (or `--reference <font file>`), its proportions 70% of the way to the reference's made as wide
+//! as the hand writes, its strokes' widths evened out and its horizontals levelled to the font's
+//! typical slope.
 //!
 //! `cargo run --example consistency -- <project folder> [--try] [--reference <font file>]`
 
@@ -29,8 +30,14 @@ fn main() {
             Some(i) => scriptoria_reference::ReferenceFont::open(std::path::Path::new(&args[i + 1]), None).expect("the font"),
             None => scriptoria::assign::open_reference(project.font.reference.as_ref().expect("a reference font")).expect("the reference"),
         };
-        println!("\n参考字体 {} {}，宽高比贴合 0.5，统一笔宽，横画取平之后：", reference.face().family, reference.face().style);
-        project.font.aspect_strength = 0.5;
+        let (bias, _) = scriptoria::assign::estimate_aspect_bias(&project, &reference).expect("glyphs to measure");
+        println!(
+            "\n参考字体 {} {}，宽高比偏好 {bias:.2}（按自己的字估计），宽高比贴合 0.7，统一笔宽，横画取平之后：",
+            reference.face().family,
+            reference.face().style
+        );
+        project.font.aspect_strength = 0.7;
+        project.font.aspect_bias = bias;
         let info = project.font.clone();
         let min_length = 0.2 * (info.ascender - info.descender) as f64;
         for g in &mut project.glyphs {

@@ -339,6 +339,26 @@ fn notdef_points(source: &FontSource) -> Points {
     Points { masters: vec![points], ends: vec![3, 7] }
 }
 
+/// The points a path becomes in the font's `glyf` table, as [`build`] writes a glyph with this
+/// one outline: per contour, (x, y, on the curve), in font units; cubic curves made quadratic
+/// splines within `accuracy`, the on-curve points between two off-curve ones left implied. For
+/// showing the outline as the font will have it.
+pub fn glyf_points(path: &BezPath, accuracy: f64) -> Vec<Vec<(f64, f64, bool)>> {
+    let g = Glyph { name: String::new(), chars: Vec::new(), advance: 0.0, masters: vec![(0.0, path.clone())] };
+    let Ok(points) = glyph_points(&g, accuracy) else { return Vec::new() };
+    let all: Vec<(f64, f64, bool)> = points.masters[0].iter().map(|p| (p.x as f64, p.y as f64, p.on_curve)).collect();
+    let mut start = 0;
+    points
+        .ends
+        .iter()
+        .map(|&end| {
+            let contour = all[start..=end].to_vec();
+            start = end + 1;
+            contour
+        })
+        .collect()
+}
+
 /// A glyph's points at each of its masters.
 fn glyph_points(g: &Glyph, accuracy: f64) -> Result<Points, Error> {
     let paths: Vec<&BezPath> = g.masters.iter().map(|m| &m.1).collect();

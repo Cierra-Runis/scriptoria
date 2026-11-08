@@ -622,3 +622,90 @@ fn the_hands_size_is_typed_and_sheets_follow_it(cx: &mut TestAppContext) {
     assert_eq!(font(cx).pt_per_em, scriptoria_project::DEFAULT_PT_PER_EM);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The linear part of a placement: [a, b, c, d] (x' = a x + c y, y' = b x + d y).
+fn linear(s: &scriptoria_project::GlyphStroke) -> [f64; 4] {
+    let [a, b, c, d, _, _] = s.placement.as_coeffs();
+    [a, b, c, d]
+}
+
+/// `m` × `l` for linear parts.
+fn times(m: [f64; 4], l: [f64; 4]) -> [f64; 4] {
+    [m[0] * l[0] + m[2] * l[1], m[1] * l[0] + m[3] * l[1], m[0] * l[2] + m[2] * l[3], m[1] * l[2] + m[3] * l[3]]
+}
+
+fn close(a: [f64; 4], b: [f64; 4]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6 * (1.0 + y.abs()))
+}
+
+#[gpui_kit::test]
+fn strokes_turn_flip_and_stretch_keeping_their_width(cx: &mut TestAppContext) {
+    let (workspace, view, cx) = open_shi(cx);
+    let before = glyph(&workspace, cx);
+
+    // One stroke turned a quarter counterclockwise; the others stay; pens stay.
+    cx.update(|window, cx| {
+        window.click(("stroke", 1usize), cx);
+        window.click("turn-left", cx);
+    });
+    let turned = glyph(&workspace, cx);
+    assert!(close(linear(&turned.strokes[1]), times([0.0, 1.0, -1.0, 0.0], linear(&before.strokes[1]))));
+    assert_eq!(turned.strokes[0], before.strokes[0]);
+    assert!(turned.strokes.iter().zip(&before.strokes).all(|(a, b)| a.pen == b.pen));
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(glyph(&workspace, cx), before);
+
+    // The whole glyph flipped across: as wide as before, where it was.
+    cx.update(|window, cx| {
+        window.press("escape", cx);
+        window.click("flip-across", cx);
+    });
+    let flipped = glyph(&workspace, cx);
+    assert!(close(linear(&flipped.strokes[2]), times([-1.0, 0.0, 0.0, 1.0], linear(&before.strokes[2]))));
+    // (Flipped about the middle of the outlines shown, which is near the ink's.)
+    let (a, b) = (before.ink_bounds().unwrap(), flipped.ink_bounds().unwrap());
+    assert!((a.width() - b.width()).abs() < 1e-6 && (a.center() - b.center()).hypot() < 10.0, "{a:?} {b:?}");
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+
+    // Stretched across by half as much again, typed.
+    cx.update(|window, cx| {
+        window.click("scale-x", cx);
+        window.press("ctrl-a", cx);
+        window.input("150", cx);
+        window.click("apply-transform", cx);
+    });
+    let stretched = glyph(&workspace, cx);
+    assert!(close(linear(&stretched.strokes[0]), times([1.5, 0.0, 0.0, 1.0], linear(&before.strokes[0]))));
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(glyph(&workspace, cx), before);
+
+    // With the mouse: everything selected, the right edge dragged out stretches across only...
+    cx.update(|window, cx| {
+        window.click(("stroke", 0usize), cx);
+        window.press("ctrl-a", cx);
+        window.render_frame(cx);
+    });
+    let (_, edges, turn) = view.read_with(cx, |v, cx| v.handles(cx)).expect("a selection box");
+    cx.update(|window, cx| window.drag(edges[1], edges[1] + point(px(40.0), px(0.0)), cx));
+    let wider = glyph(&workspace, cx);
+    let k = linear(&wider.strokes[0])[0] / linear(&before.strokes[0])[0];
+    assert!(k > 1.05 && close(linear(&wider.strokes[0]), times([k, 0.0, 0.0, 1.0], linear(&before.strokes[0]))), "{k}");
+    // ...and the handle above turns it, sizes kept.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.drag(turn, turn + point(px(60.0), px(20.0)), cx);
+    });
+    let turned = glyph(&workspace, cx);
+    let (l0, l1) = (linear(&before.strokes[0]), linear(&turned.strokes[0]));
+    let det = |l: [f64; 4]| l[0] * l[3] - l[1] * l[2];
+    assert!((det(l0) - det(l1)).abs() < 1e-6 * det(l0).abs() && !close(l0, l1), "{l0:?} {l1:?}");
+    assert!(turned.strokes.iter().zip(&before.strokes).all(|(a, b)| a.pen == b.pen));
+
+    // The outline's points, as the font will have them.
+    cx.update(|window, cx| {
+        window.click("nodes-quadratic", cx);
+        window.render_frame(cx);
+    });
+    assert_eq!(view.read_with(cx, |v, _| v.nodes()), scriptoria::app::glyph_view::Nodes::Quadratic);
+}

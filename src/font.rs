@@ -13,6 +13,9 @@ use scriptoria_skeleton::{Piece, Sample, Skeleton};
 /// each other and lose the hand's shapes.
 pub const AXIS: Axis = Axis { min: 100.0, default: 400.0, max: 900.0 };
 
+/// How close the font's quadratic splines are to the cubic curves made from skeletons (font units).
+pub const QUADRATIC_ACCURACY: f64 = 0.5;
+
 /// The radius scale of the thinnest weight (`wght` 100) by default.
 pub const THINNEST: f64 = 0.3;
 
@@ -186,7 +189,7 @@ pub fn export(project: &Project) -> Export {
         axis: AXIS,
         instances: INSTANCES.iter().map(|&(name, w)| (name.to_string(), w)).collect(),
         glyphs,
-        accuracy: 0.5,
+        accuracy: QUADRATIC_ACCURACY,
         tolerance: 2.0 * precision,
     };
     Export { source, empty: without.iter().map(|g| g.name.clone()).collect() }

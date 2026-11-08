@@ -1,8 +1,11 @@
 //! One glyph, as in FontForge's glyph window: its strokes in the em with the metric lines
 //! (ascender, baseline, descender, advance) and each stroke's place in the writing order at its
-//! start, at any weight of the axis. Strokes are selected (click, box, the list beside) and moved
-//! (drag, arrow keys), scaled (the selection box's corners), deleted and reordered; the advance is
-//! dragged or typed. Every change is one step to undo.
+//! start, at any weight of the axis; on demand the outlines' points and handles, as cubic curves or
+//! as the font's quadratic splines. Strokes are selected (click, box, the list beside) and moved
+//! (drag, arrow keys), scaled (the selection box's corners), stretched (its edges), turned (the
+//! handle above it), turned, flipped, stretched and slanted by the numbers (the panel beside),
+//! deleted and reordered; their widths stay the pen's through all of it. The advance is dragged or
+//! typed. Every change is one step to undo.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -19,7 +22,7 @@ use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClickEvent, ContentMask, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, SharedString, Subscription, Task, TextAlign, Window, canvas,
-    div, point, px, quad, size,
+    PathBuilder, div, point, px, quad, size,
 };
 use scriptoria_ink::StrokeShape;
 use scriptoria_ink::kurbo::{self, Affine, BezPath, ParamCurveNearest as _, Shape as _};
@@ -39,6 +42,8 @@ const PRECISION: f64 = 0.004;
 /// How near (px) the pointer must be to a stroke, a handle or the advance line to grab it.
 const HIT_PX: f64 = 4.0;
 const HANDLE_PX: f32 = 4.0;
+/// How far (px) the turning handle sits above the selection box.
+const ROTATE_PX: f32 = 22.0;
 /// A drag shorter than this (px) is a click.
 const DRAG_THRESHOLD: f32 = 3.0;
 /// Zoom range, relative to "fit to window", and zoom per scrolled pixel.
@@ -107,12 +112,14 @@ struct Shapes {
     /// The outline regenerated at a radius scale: (scale, outline, mesh), in font units before the
     /// placement's translation. Its strokes keep the pen's width (see `FontInfo::pen_scale`).
     regenerated: Option<(f64, BezPath, Option<Rc<Mesh>>)>,
+    /// Until it is: the ink drawn quickly from the skeleton ([`capsules`]), for a radius scale.
+    quick: std::cell::RefCell<Option<(f64, Option<Rc<Mesh>>)>>,
 }
 
 impl Shapes {
     fn new(s: &GlyphStroke) -> Self {
         let original = Mesh::from_path_with_tolerance(&s.outline.path, shape(s.outline.kind), true, TOLERANCE).map(Rc::new);
-        Shapes { skeleton: s.skeleton.clone(), outline: s.outline.clone(), original, linear: form(s), plan: None, regenerated: None }
+        Shapes { skeleton: s.skeleton.clone(), outline: s.outline.clone(), original, linear: form(s), plan: None, regenerated: None, quick: Default::default() }
     }
 
     /// Whether these are the shapes of a stroke (wherever it is placed).
@@ -128,6 +135,7 @@ impl Shapes {
             self.linear = l;
             self.plan = None;
             self.regenerated = None;
+            self.quick.take();
         }
     }
 
@@ -135,10 +143,21 @@ impl Shapes {
         self.regenerated.as_ref().filter(|_| wanted)
     }
 
-    /// The mesh shown and what puts it into font units.
-    fn mesh(&self, placement: Affine, regenerated: bool) -> Option<(Rc<Mesh>, Affine)> {
+    /// The mesh shown and what puts it into font units: the regenerated outline; until that is made
+    /// (after a change of the stroke's shape), the ink drawn from the skeleton at radius scale
+    /// `scale`, so that the stroke keeps its width meanwhile; the outline as written when asked.
+    fn mesh(&self, placement: Affine, regenerated: bool, scale: f64) -> Option<(Rc<Mesh>, Affine)> {
+        let at = Affine::translate(placement.translation());
         match self.regenerated(regenerated) {
-            Some((_, _, mesh)) => Some((mesh.clone()?, Affine::translate(placement.translation()))),
+            Some((_, _, mesh)) => Some((mesh.clone()?, at)),
+            None if regenerated && !self.skeleton.is_empty() => {
+                let mut quick = self.quick.borrow_mut();
+                if quick.as_ref().is_none_or(|q| (q.0 - scale).abs() > 1e-9) {
+                    let [a, b, c, d, pen] = self.linear;
+                    *quick = Some((scale, capsules(&self.skeleton, Affine::new([a, b, c, d, 0.0, 0.0]), pen * scale)));
+                }
+                Some((quick.as_ref()?.1.clone()?, at))
+            }
             None => Some((self.original.clone()?, placement)),
         }
     }
@@ -177,6 +196,127 @@ impl Shapes {
     }
 }
 
+/// Which points of the outlines are shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nodes {
+    Hidden,
+    /// The cubic curves as made from the skeleton.
+    Cubic,
+    /// The quadratic splines the font gets (see [`scriptoria_font::glyf_points`]).
+    Quadratic,
+}
+
+/// A mark of an outline's points (font units).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Node {
+    On(kurbo::Point),
+    Off(kurbo::Point),
+    /// An on-curve point the font leaves out (halfway between two off-curve ones).
+    Implied(kurbo::Point),
+    /// A line from a point on the curve to its off-curve point (or between off-curve points).
+    Handle(kurbo::Point, kurbo::Point),
+}
+
+/// The marks of an outline's points, as cubic curves or as the font's quadratic splines.
+fn nodes_of(path: &BezPath, nodes: Nodes) -> Vec<Node> {
+    let mut out = Vec::new();
+    match nodes {
+        Nodes::Hidden => {}
+        Nodes::Cubic => {
+            let mut last = kurbo::Point::ZERO;
+            for el in path.elements() {
+                match *el {
+                    kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => {
+                        out.push(Node::On(p));
+                        last = p;
+                    }
+                    kurbo::PathEl::QuadTo(c, p) => {
+                        out.extend([Node::Handle(last, c), Node::Handle(c, p), Node::Off(c), Node::On(p)]);
+                        last = p;
+                    }
+                    kurbo::PathEl::CurveTo(c1, c2, p) => {
+                        out.extend([Node::Handle(last, c1), Node::Handle(c2, p), Node::Off(c1), Node::Off(c2), Node::On(p)]);
+                        last = p;
+                    }
+                    kurbo::PathEl::ClosePath => {}
+                }
+            }
+        }
+        Nodes::Quadratic => {
+            for contour in scriptoria_font::glyf_points(path, crate::font::QUADRATIC_ACCURACY) {
+                let n = contour.len();
+                for (k, &(x, y, on)) in contour.iter().enumerate() {
+                    let p = kurbo::Point::new(x, y);
+                    let (nx, ny, next_on) = contour[(k + 1) % n];
+                    let next = kurbo::Point::new(nx, ny);
+                    // The control polygon, but not along straight segments.
+                    if !(on && next_on) {
+                        out.push(Node::Handle(p, next));
+                    }
+                    if !on && !next_on {
+                        out.push(Node::Implied(p.midpoint(next)));
+                    }
+                    out.push(if on { Node::On(p) } else { Node::Off(p) });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a transform only moves things.
+fn is_translation(t: Affine) -> bool {
+    let [a, b, c, d, _, _] = t.as_coeffs();
+    (a - 1.0).abs() < 1e-12 && b.abs() < 1e-12 && c.abs() < 1e-12 && (d - 1.0).abs() < 1e-12
+}
+
+/// A stroke's ink drawn quickly from its skeleton (while its outline is being made): each circle,
+/// and the band between each two along a piece, at `shape` (the linear part of a placement), the
+/// radii times `radius` (font units).
+fn capsules(skeleton: &[SkeletonPiece], shape: Affine, radius: f64) -> Option<Rc<Mesh>> {
+    // Every shape counterclockwise (y up), so that the non-zero fill is their union.
+    fn polygon(path: &mut BezPath, points: &[kurbo::Point]) {
+        let area: f64 = (0..points.len()).map(|i| points[i].to_vec2().cross(points[(i + 1) % points.len()].to_vec2())).sum();
+        let ordered: Vec<kurbo::Point> = if area < 0.0 { points.iter().rev().copied().collect() } else { points.to_vec() };
+        path.move_to(ordered[0]);
+        for p in &ordered[1..] {
+            path.line_to(*p);
+        }
+        path.close_path();
+    }
+    const SIDES: usize = 16;
+    let mut path = BezPath::new();
+    let mut largest: f64 = 0.0;
+    for piece in skeleton {
+        let circles: Vec<(kurbo::Point, f64)> = piece.circles.iter().map(|&(c, r)| (shape * c, r * radius)).collect();
+        for &(c, r) in &circles {
+            largest = largest.max(r);
+            let ring: Vec<kurbo::Point> = (0..SIDES).map(|k| c + kurbo::Vec2::from_angle(k as f64 * std::f64::consts::TAU / SIDES as f64) * r).collect();
+            polygon(&mut path, &ring);
+        }
+        for w in circles.windows(2) {
+            let ((c0, r0), (c1, r1)) = (w[0], w[1]);
+            let d = c1 - c0;
+            let len = d.hypot();
+            // One circle within the other: the larger one is the band.
+            if len <= (r0 - r1).abs() {
+                continue;
+            }
+            let (u, a) = (d / len, (r0 - r1) / len);
+            let b = (1.0 - a * a).max(0.0).sqrt();
+            let normal = |side: f64| u * a + kurbo::Vec2::new(-u.y, u.x) * (b * side);
+            let (n0, n1) = (normal(1.0), normal(-1.0));
+            polygon(&mut path, &[c0 + n0 * r0, c1 + n0 * r1, c1 + n1 * r1, c0 + n1 * r0]);
+        }
+    }
+    if path.elements().is_empty() {
+        return None;
+    }
+    // A tenth of a pixel or so at the sizes shown.
+    let tolerance = (largest * 0.02).max(0.05) as f32;
+    Mesh::from_path_with_tolerance(&path, StrokeShape::Outline { non_zero: true }, true, tolerance).map(Rc::new)
+}
+
 fn shape(kind: OutlineKind) -> StrokeShape {
     match kind {
         OutlineKind::Filled => StrokeShape::Outline { non_zero: true },
@@ -190,6 +330,11 @@ enum DragKind {
     Move,
     /// Scaling the selection about `anchor`, by the grabbed `corner` (font units).
     Scale { anchor: kurbo::Point, corner: kurbo::Point },
+    /// Stretching the selection across (or up and down) from `anchor`, the middle of the edge
+    /// opposite the grabbed `edge` (font units).
+    Stretch { anchor: kurbo::Point, edge: kurbo::Point, across: bool },
+    /// Turning the selection about `center` (font units).
+    Rotate { center: kurbo::Point },
     /// Moving the advance line, from `from`.
     Advance { from: f64 },
     /// A selection box; with `add`, added to the selection.
@@ -204,10 +349,17 @@ struct Drag {
     start: Point<Pixels>,
     last: Point<Pixels>,
     moved: bool,
+    /// Shift held: turns go by 15°.
+    snap: bool,
 }
 
 fn scale_about(center: kurbo::Point, k: f64) -> Affine {
-    Affine::translate(center.to_vec2()) * Affine::scale(k) * Affine::translate(-center.to_vec2())
+    about(center, Affine::scale(k))
+}
+
+/// A transform `t` made about a point instead of the origin.
+fn about(center: kurbo::Point, t: Affine) -> Affine {
+    Affine::translate(center.to_vec2()) * t * Affine::translate(-center.to_vec2())
 }
 
 /// Font units shown without a fraction when whole.
@@ -231,12 +383,19 @@ pub struct GlyphView {
     weight: Entity<SliderState>,
     /// Show the strokes as written instead of regenerated from their skeletons.
     original: bool,
+    /// Whether the outline's points and handles are shown, and as what curves.
+    nodes: Nodes,
     selection: BTreeSet<usize>,
     hovered: Option<usize>,
     zoom: f32,
     pan: Point<Pixels>,
     drag: Option<Drag>,
     advance: Entity<InputState>,
+    /// A transform typed: turn (degrees, counterclockwise), scale across and up (%), slant (degrees).
+    turn: Entity<InputState>,
+    scale_x: Entity<InputState>,
+    scale_y: Entity<InputState>,
+    slant: Entity<InputState>,
     /// Written while painting, read by the event handlers.
     fit: Rc<Cell<Option<View>>>,
     _subscriptions: Vec<Subscription>,
@@ -246,6 +405,8 @@ impl GlyphView {
     pub fn new(document: Entity<Document>, glyph: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let weight = cx.new(|_| SliderState::new().max(AXIS.max as f32).min(AXIS.min as f32).step(1.0).default_value(AXIS.default as f32));
         let advance = cx.new(|cx| InputState::new(window, cx));
+        let typed = |value: &'static str, window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx).default_value(value));
+        let (turn, scale_x, scale_y, slant) = (typed("0", window, cx), typed("100", window, cx), typed("100", window, cx), typed("0", window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&document, window, move |this, _, event: &DocumentEvent, window, cx| match event {
                 DocumentEvent::Glyph(g) if *g == this.glyph => this.sync(window, cx),
@@ -280,12 +441,17 @@ impl GlyphView {
             planned_pen: 0.0,
             weight,
             original: false,
+            nodes: Nodes::Hidden,
             selection: BTreeSet::new(),
             hovered: None,
             zoom: 1.0,
             pan: Point::default(),
             drag: None,
             advance,
+            turn,
+            scale_x,
+            scale_y,
+            slant,
             fit: Rc::default(),
             _subscriptions: subscriptions,
         };
@@ -315,6 +481,23 @@ impl GlyphView {
     /// The radius scales, thinnest and boldest, the outlines are made for.
     pub fn weight_range(&self) -> (f64, f64) {
         self.planned_for
+    }
+
+    /// Where the selection box's handles are in the window: its corners, the middles of its edges
+    /// (left, right, bottom, top) and the turning handle above it.
+    pub fn handles(&self, cx: &App) -> Option<([Point<Pixels>; 4], [Point<Pixels>; 4], Point<Pixels>)> {
+        let (view, glyph) = (self.view()?, self.glyph(cx)?);
+        let b = self.selection_bounds(glyph)?;
+        let c = b.center();
+        let at = |x: f64, y: f64| view.to_window(kurbo::Point::new(x, y));
+        let corners = [at(b.x0, b.y0), at(b.x1, b.y0), at(b.x1, b.y1), at(b.x0, b.y1)];
+        let edges = [at(b.x0, c.y), at(b.x1, c.y), at(c.x, b.y0), at(c.x, b.y1)];
+        Some((corners, edges, at(c.x, b.y1) - point(px(0.0), px(ROTATE_PX))))
+    }
+
+    /// How the outlines' points are shown.
+    pub fn nodes(&self) -> Nodes {
+        self.nodes
     }
 
     /// Where a point of the em (font units) is in the window, once laid out.
@@ -464,6 +647,40 @@ impl GlyphView {
         self.selection.iter().copied().collect()
     }
 
+    /// The strokes a transform acts on: those selected, or all of them.
+    fn targets(&self) -> Vec<usize> {
+        if self.selection.is_empty() { (0..self.shapes.len()).collect() } else { self.selected() }
+    }
+
+    /// Transforms the strokes acted on about the middle of their box, as one step to undo. Strokes
+    /// keep their width (only where their skeleton lies changes).
+    pub fn transform(&mut self, t: Affine, cx: &mut Context<Self>) {
+        let which = self.targets();
+        let Some(glyph) = self.glyph(cx) else { return };
+        let Some(b) = which.iter().filter_map(|&i| self.stroke_bounds(glyph, i)).reduce(|a, b| a.union(b)) else { return };
+        let t = about(b.center(), t);
+        self.edit(cx, |g| g.transform_strokes(&which, t));
+    }
+
+    /// Applies the transform typed (turn, then slant, then scale, about the middle), then clears it.
+    fn apply_typed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let read = |input: &Entity<InputState>, cx: &App| input.read(cx).value().trim().trim_end_matches(['%', '°']).parse::<f64>().ok().filter(|v| v.is_finite());
+        let (turn, sx, sy, slant) = (read(&self.turn, cx), read(&self.scale_x, cx), read(&self.scale_y, cx), read(&self.slant, cx));
+        let (Some(turn), Some(sx), Some(sy), Some(slant)) = (turn, sx, sy, slant) else {
+            window.push_notification(Notification::warning("变换要填数字：旋转和倾斜是角度，缩放是百分比"), cx);
+            return;
+        };
+        if sx.abs() < 1.0 || sy.abs() < 1.0 || slant.abs() >= 80.0 {
+            window.push_notification(Notification::warning("缩放至少 1%，倾斜不超过 80°"), cx);
+            return;
+        }
+        let t = Affine::rotate(turn.to_radians()) * Affine::skew(slant.to_radians().tan(), 0.0) * Affine::scale_non_uniform(sx / 100.0, sy / 100.0);
+        self.transform(t, cx);
+        for (input, value) in [(&self.turn, "0"), (&self.scale_x, "100"), (&self.scale_y, "100"), (&self.slant, "0")] {
+            input.update(cx, |s, cx| s.set_value(value, window, cx));
+        }
+    }
+
     fn nudge(&mut self, dx: f64, dy: f64, cx: &mut Context<Self>) {
         let which = self.selected();
         self.edit(cx, |g| g.transform_strokes(&which, Affine::translate((dx, dy))));
@@ -538,6 +755,21 @@ impl GlyphView {
                 let (c, t) = (corner - anchor, to - anchor);
                 Some(scale_about(anchor, (t.dot(c) / c.hypot2().max(1e-9)).max(0.02)))
             }
+            DragKind::Stretch { anchor, edge, across } => {
+                let (e, t) = (edge - anchor, to - anchor);
+                let k = if across { t.x / e.x } else { t.y / e.y };
+                let k = if k.is_finite() { k.max(0.02) } else { 1.0 };
+                let (kx, ky) = if across { (k, 1.0) } else { (1.0, k) };
+                Some(about(anchor, Affine::scale_non_uniform(kx, ky)))
+            }
+            DragKind::Rotate { center } => {
+                let mut angle = (to - center).atan2() - (from - center).atan2();
+                if d.snap {
+                    let step = 15f64.to_radians();
+                    angle = (angle / step).round() * step;
+                }
+                Some(about(center, Affine::rotate(angle)))
+            }
             _ => None,
         }
     }
@@ -571,7 +803,7 @@ impl GlyphView {
             MouseButton::Left => self.grab(ev.position, add, cx),
             _ => return,
         };
-        self.drag = Some(Drag { button: ev.button, kind, start: ev.position, last: ev.position, moved: false });
+        self.drag = Some(Drag { button: ev.button, kind, start: ev.position, last: ev.position, moved: false, snap: ev.modifiers.shift });
         cx.notify();
     }
 
@@ -583,10 +815,29 @@ impl GlyphView {
         };
         if let Some(glyph) = self.glyph(cx) {
             if let Some(b) = self.selection_bounds(glyph) {
+                let c = b.center();
+                // The turning handle, above the box's top.
+                let handle = view.to_window(kurbo::Point::new(c.x, b.y1)) - point(px(0.0), px(ROTATE_PX));
+                let d = handle - pos;
+                if f32::from(d.x).hypot(f32::from(d.y)) <= HANDLE_PX + 3.0 {
+                    return DragKind::Rotate { center: c };
+                }
                 let corners = [(b.x0, b.y0), (b.x1, b.y0), (b.x1, b.y1), (b.x0, b.y1)].map(kurbo::Point::from);
                 for (k, &corner) in corners.iter().enumerate() {
                     if near(corner, HANDLE_PX + 2.0) {
                         return DragKind::Scale { anchor: corners[(k + 2) % 4], corner };
+                    }
+                }
+                // The edges' middles: left, right, bottom, top.
+                let edges = [
+                    ((b.x0, c.y), (b.x1, c.y), true),
+                    ((b.x1, c.y), (b.x0, c.y), true),
+                    ((c.x, b.y0), (c.x, b.y1), false),
+                    ((c.x, b.y1), (c.x, b.y0), false),
+                ];
+                for (edge, anchor, across) in edges {
+                    if near(edge.into(), HANDLE_PX + 2.0) {
+                        return DragKind::Stretch { anchor: anchor.into(), edge: edge.into(), across };
                     }
                 }
             }
@@ -628,6 +879,7 @@ impl GlyphView {
             if !drag.moved && f32::from(d.x).hypot(f32::from(d.y)) >= DRAG_THRESHOLD {
                 drag.moved = true;
             }
+            drag.snap = ev.modifiers.shift;
             if drag.moved {
                 if drag.kind == DragKind::Pan {
                     self.pan = self.pan + (ev.position - drag.last);
@@ -754,6 +1006,7 @@ impl GlyphView {
         let advance = self.drag_advance().unwrap_or(glyph.advance);
         let preview = self.drag_transform();
         let regenerated = self.regenerated();
+        let scale = self.scale(cx);
         // Per stroke: mesh and what puts it into the em (with the drag so far), start, color.
         let strokes: Vec<(Option<(Rc<Mesh>, Affine)>, Option<kurbo::Point>, Hsla)> = glyph
             .strokes
@@ -774,7 +1027,17 @@ impl GlyphView {
                 } else {
                     ink
                 };
-                (shapes.mesh(s.placement, regenerated).map(|(mesh, t)| (mesh, moved * t)), start, color)
+                // Turned, stretched or scaled by the drag: drawn from the skeleton at its new shape, so that
+                // its width stays the pen's (as it will be).
+                let reshaped = regenerated && !is_translation(moved) && !s.skeleton.is_empty();
+                let mesh = if reshaped {
+                    let placed = moved * s.placement;
+                    let linear = Affine::new([placed.as_coeffs()[0], placed.as_coeffs()[1], placed.as_coeffs()[2], placed.as_coeffs()[3], 0.0, 0.0]);
+                    capsules(&s.skeleton, linear, s.pen * scale).map(|m| (m, Affine::translate(placed.translation())))
+                } else {
+                    shapes.mesh(s.placement, regenerated, scale).map(|(mesh, t)| (mesh, moved * t))
+                };
+                (mesh, start, color)
             })
             .collect();
         // The reference font's glyph, underneath.
@@ -788,6 +1051,19 @@ impl GlyphView {
             None => b,
         });
         let marquee = self.drag_box();
+        // The outlines' points (not while strokes are reshaped by a drag).
+        let nodes: Vec<Node> = if self.nodes == Nodes::Hidden || !regenerated || preview.is_some_and(|p| !is_translation(p)) {
+            Vec::new()
+        } else {
+            glyph.strokes.iter().zip(&self.shapes).enumerate().flat_map(|(i, (s, shapes))| {
+                let moved = match preview {
+                    Some(p) if self.selection.contains(&i) => p,
+                    _ => Affine::IDENTITY,
+                };
+                shapes.regenerated.as_ref().map(|(_, path, _)| nodes_of(&(Affine::translate((moved * s.placement).translation()) * path.clone()), self.nodes)).unwrap_or_default()
+            }).collect()
+        };
+        let (on_color, off_color, handle_color) = (p.blue.hsla(), p.peach.hsla(), p.overlay1.hsla());
         let fit_cell = self.fit.clone();
         let (zoom, pan) = (self.zoom, self.pan);
 
@@ -853,13 +1129,47 @@ impl GlyphView {
                         window.paint_quad(quad(badge, px(8.0), order_color, px(0.0), gpui::transparent_black(), Default::default()));
                         label_centered(window, cx, &(i + 1).to_string(), badge.center(), on_badge, px(10.0));
                     }
+                    // Points and handles: handles first, then off-curve points (round), then on-curve ones (square).
+                    for node in &nodes {
+                        if let Node::Handle(a, b) = node {
+                            let mut builder = PathBuilder::stroke(px(1.0));
+                            builder.move_to(view.to_window(*a));
+                            builder.line_to(view.to_window(*b));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, handle_color);
+                            }
+                        }
+                    }
+                    for node in &nodes {
+                        let (p, half, round, fill, edge) = match *node {
+                            Node::On(p) => (p, 3.0, 0.0, on_color, on_color),
+                            Node::Off(p) => (p, 3.0, 3.0, paper, off_color),
+                            Node::Implied(p) => (p, 1.5, 1.5, handle_color, handle_color),
+                            Node::Handle(..) => continue,
+                        };
+                        let c = view.to_window(p);
+                        let b = Bounds::new(c - point(px(half), px(half)), size(px(2.0 * half), px(2.0 * half)));
+                        window.paint_quad(quad(b, px(round), fill, px(1.0), edge, Default::default()));
+                    }
                     if let Some(b) = selection_box {
                         let r = view.rect(b);
                         window.paint_quad(quad(r, px(0.0), gpui::transparent_black(), px(1.0), accent, Default::default()));
+                        // Corners scale, the edges' middles stretch (smaller), the round handle above turns.
+                        let handle = |window: &mut Window, c: Point<Pixels>, half: f32, round: f32| {
+                            let h = Bounds::new(c - point(px(half), px(half)), size(px(2.0 * half), px(2.0 * half)));
+                            window.paint_quad(quad(h, px(round), paper, px(1.0), accent, Default::default()));
+                        };
                         for c in [r.origin, r.top_right(), r.bottom_right(), r.bottom_left()] {
-                            let h = Bounds::new(c - point(px(HANDLE_PX), px(HANDLE_PX)), size(px(2.0 * HANDLE_PX), px(2.0 * HANDLE_PX)));
-                            window.paint_quad(quad(h, px(1.0), paper, px(1.0), accent, Default::default()));
+                            handle(window, c, HANDLE_PX, 1.0);
                         }
+                        let m = r.center();
+                        for c in [point(r.left(), m.y), point(r.right(), m.y), point(m.x, r.top()), point(m.x, r.bottom())] {
+                            handle(window, c, HANDLE_PX - 1.0, 0.0);
+                        }
+                        let turn = point(m.x, r.top() - px(ROTATE_PX));
+                        let stem = Bounds::new(point(m.x - px(0.5), turn.y), size(px(1.0), px(ROTATE_PX)));
+                        window.paint_quad(quad(stem, px(0.0), accent, px(0.0), gpui::transparent_black(), Default::default()));
+                        handle(window, turn, HANDLE_PX + 1.0, HANDLE_PX + 1.0);
                     }
                     if let Some(m) = marquee {
                         window.paint_quad(quad(view.rect(m), px(0.0), accent.opacity(0.08), px(1.0), accent, Default::default()));
@@ -926,6 +1236,7 @@ impl GlyphView {
             .border_color(border)
             .child(div().px_2().py_1().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("笔画（按笔顺）"))
             .child(div().id("stroke-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
+            .child(self.render_transforms(cx))
             .child(
                 h_flex()
                     .gap_1()
@@ -945,8 +1256,62 @@ impl GlyphView {
             )
     }
 
+    /// A button showing the outlines' points as `nodes` (again: hiding them).
+    fn nodes_button(&self, id: &'static str, label: &'static str, tip: &'static str, nodes: Nodes, cx: &mut Context<Self>) -> Button {
+        Button::new(id).small().label(label).tooltip(tip).selected(self.nodes == nodes).on_click(cx.listener(move |this, _, _, cx| {
+            this.nodes = if this.nodes == nodes { Nodes::Hidden } else { nodes };
+            cx.notify();
+        }))
+    }
+
+    /// Turning, flipping, stretching and slanting the selected strokes (or all of them), about
+    /// their middle; their widths stay.
+    fn render_transforms(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (border, muted) = (theme.border, theme.muted_foreground);
+        let what = if self.selection.is_empty() { "整个字" } else { "选中的笔画" };
+        let field = |label: &'static str, input: &Entity<InputState>, id: &'static str, unit: &'static str| {
+            h_flex()
+                .gap_1()
+                .text_xs()
+                .child(div().w(px(28.0)).child(label))
+                .child(div().w(px(56.0)).child(Input::new(input).xsmall().id(id)))
+                .child(div().text_color(muted).child(unit))
+        };
+        let quick = |id: &'static str, label: &'static str, tip: &'static str, t: Affine| {
+            Button::new(id).xsmall().label(label).tooltip(tip).on_click(cx.listener(move |this, _, _, cx| this.transform(t, cx)))
+        };
+        let quarter = std::f64::consts::FRAC_PI_2;
+        v_flex()
+            .gap_1()
+            .p_2()
+            .border_t_1()
+            .border_color(border)
+            .child(h_flex().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("变换").child(div().ml_2().text_xs().text_color(muted).child(what)))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(quick("turn-left", "↺ 90°", "逆时针转 90°", Affine::rotate(quarter)))
+                    .child(quick("turn-right", "↻ 90°", "顺时针转 90°", Affine::rotate(-quarter)))
+                    .child(quick("flip-across", "⇋ 翻转", "左右翻转", Affine::scale_non_uniform(-1.0, 1.0)))
+                    .child(quick("flip-up", "⇅ 翻转", "上下翻转", Affine::scale_non_uniform(1.0, -1.0))),
+            )
+            .child(field("旋转", &self.turn, "turn", "°（逆时针）"))
+            .child(field("横向", &self.scale_x, "scale-x", "%"))
+            .child(field("纵向", &self.scale_y, "scale-y", "%"))
+            .child(field("倾斜", &self.slant, "slant", "°"))
+            .child(
+                Button::new("apply-transform")
+                    .xsmall()
+                    .label("应用")
+                    .tooltip("先旋转，再倾斜，再缩放，都绕中心；笔画粗细不变")
+                    .on_click(cx.listener(|this, _, window, cx| this.apply_typed(window, cx))),
+            )
+    }
+
     fn status_text(&self, cx: &App) -> String {
-        let hints = "点选或框选笔画（Ctrl/Shift 加选，Ctrl+A 全选）· 拖动移动，拖选框四角缩放 · 方向键微调（Shift 加大）· Delete 删除 · Alt+↑/↓ 调整笔顺 · 拖蓝线改字宽 · 滚轮或中键拖动平移，Ctrl+滚轮缩放";
+        let hints = "点选或框选笔画（Ctrl/Shift 加选，Ctrl+A 全选）· 拖动移动 · 选框四角等比缩放，边中点单向拉伸，上方圆点旋转（Shift 按 15°）· 方向键微调（Shift 加大）· Delete 删除 · Alt+↑/↓ 调整笔顺 · 拖蓝线改字宽 · 滚轮或中键拖动平移，Ctrl+滚轮缩放";
         let (Some(i), Some(glyph)) = (self.hovered, self.glyph(cx)) else { return hints.into() };
         let Some(s) = glyph.strokes.get(i) else { return hints.into() };
         let circles: usize = s.skeleton.iter().map(|p| p.circles.len()).sum();
@@ -1049,6 +1414,8 @@ impl Render for GlyphView {
                         cx.notify();
                     })),
             )
+            .child(self.nodes_button("nodes-cubic", "三次节点", "显示由骨架生成的三次曲线的节点和把手", Nodes::Cubic, cx))
+            .child(self.nodes_button("nodes-quadratic", "二次节点", "显示导出到字体里的二次曲线的点（空心是曲线外的控制点，小点是省略的曲线上的点）", Nodes::Quadratic, cx))
             .when(self.planning.is_some(), |d| d.child(div().text_xs().text_color(muted).child("计算中…")))
             .child(div().flex_1())
             .child(Button::new("zoom-out").small().label("−").on_click(cx.listener(|this, _, _, cx| this.zoom_at_center(0.8, cx))))
@@ -1084,6 +1451,41 @@ impl Render for GlyphView {
                     .child(self.render_stroke_list(cx)),
             )
             .child(view_bar)
-            .child(div().px_3().pb_1().text_xs().text_color(muted).child(self.status_text(cx)))
+            // Two lines high whatever it says, so that the canvas (and the glyph in it) stays put.
+            .child(div().flex_shrink_0().h(px(36.0)).px_3().pb_1().overflow_hidden().text_xs().text_color(muted).child(self.status_text(cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strokes_are_drawn_from_their_skeletons_meanwhile() {
+        // Two circles of radius 0.1 and 0.2 a unit apart, placed twice as large, with a pen of 10.
+        let piece = SkeletonPiece {
+            circles: vec![(kurbo::Point::new(0.0, 0.0), 0.1), (kurbo::Point::new(1.0, 0.0), 0.2)],
+            spine: vec![kurbo::CubicBez::new((0.0, 0.0), (0.3, 0.0), (0.7, 0.0), (1.0, 0.0))],
+        };
+        let mesh = capsules(&[piece], Affine::scale(2.0), 10.0).expect("ink");
+        assert!(mesh.triangle_count() > 0);
+        // A circle inside another adds no band; an empty skeleton draws nothing.
+        let inside = SkeletonPiece { circles: vec![(kurbo::Point::ZERO, 1.0), (kurbo::Point::new(0.1, 0.0), 0.5)], spine: Vec::new() };
+        assert!(capsules(&[inside], Affine::IDENTITY, 1.0).is_some());
+        assert!(capsules(&[], Affine::IDENTITY, 1.0).is_none());
+    }
+
+    #[test]
+    fn the_fonts_points_are_marked() {
+        let mut path = BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.curve_to((0.0, 300.0), (300.0, 300.0), (300.0, 0.0));
+        path.close_path();
+        let cubic = nodes_of(&path, Nodes::Cubic);
+        assert_eq!(cubic.iter().filter(|n| matches!(n, Node::Off(_))).count(), 2);
+        assert_eq!(cubic.iter().filter(|n| matches!(n, Node::Handle(..))).count(), 2);
+        let quadratic = nodes_of(&path, Nodes::Quadratic);
+        assert!(quadratic.iter().any(|n| matches!(n, Node::Off(_))) && quadratic.iter().any(|n| matches!(n, Node::On(_))));
+        assert!(nodes_of(&path, Nodes::Hidden).is_empty());
     }
 }

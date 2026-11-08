@@ -120,3 +120,26 @@ fn masters_must_include_the_default() {
     source.glyphs[0].masters.remove(1);
     assert!(build(&source).is_err());
 }
+
+#[test]
+fn outlines_show_the_points_the_font_gets() {
+    use kurbo::BezPath;
+    use scriptoria_font::glyf_points;
+    // A square of lines, then a contour with one cubic.
+    let mut path = BezPath::new();
+    path.move_to((0.0, 0.0));
+    path.line_to((0.0, 100.0));
+    path.line_to((100.0, 100.0));
+    path.line_to((100.0, 0.0));
+    path.close_path();
+    path.move_to((200.0, 0.0));
+    path.curve_to((200.0, 300.0), (500.0, 300.0), (500.0, 0.0));
+    path.close_path();
+    let contours = glyf_points(&path, 0.5);
+    assert_eq!(contours.len(), 2);
+    assert_eq!(contours[0], [(0.0, 0.0, true), (0.0, 100.0, true), (100.0, 100.0, true), (100.0, 0.0, true)]);
+    // The cubic: off-curve points between its ends, which stay on the curve.
+    let curve = &contours[1];
+    assert_eq!((curve[0], *curve.last().unwrap()), ((200.0, 0.0, true), (500.0, 0.0, true)));
+    assert!(curve[1..curve.len() - 1].iter().all(|p| !p.2) && curve.len() > 3, "{curve:?}");
+}

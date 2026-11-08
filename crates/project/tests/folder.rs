@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use kurbo::{Affine, BezPath, CubicBez, Point, Rect};
 use scriptoria_project::{
-    Error, FORMAT, Glyph, GlyphStroke, Outline, OutlineKind, Project, SkeletonPiece, StrokeOrigin, initial_placement,
+    Error, FORMAT, Glyph, GlyphStroke, Outline, OutlineKind, Project, SkeletonPiece, fingerprint, initial_placement,
 };
 
 /// A fresh, empty folder under the system's temporary directory.
@@ -14,7 +14,7 @@ fn folder(name: &str) -> PathBuf {
     dir
 }
 
-fn stroke(x: f64, origin: Option<StrokeOrigin>, kind: OutlineKind) -> GlyphStroke {
+fn stroke(x: f64, kind: OutlineKind) -> GlyphStroke {
     let mut path = BezPath::new();
     path.move_to((x, 1.0 / 3.0));
     path.curve_to((x + 0.1, 0.2), (x + 0.3, 0.25), (x + 0.4, 1.0));
@@ -26,7 +26,6 @@ fn stroke(x: f64, origin: Option<StrokeOrigin>, kind: OutlineKind) -> GlyphStrok
     };
     let dot = SkeletonPiece { circles: vec![(Point::new(x, 2.0), 0.2)], spine: vec![] };
     GlyphStroke {
-        origin,
         outline: Outline { kind, path },
         skeleton: vec![piece, dot],
         placement: initial_placement(Rect::new(x, 0.0, x + 4.5, 4.5), &Default::default()) * Affine::rotate(0.01),
@@ -36,13 +35,12 @@ fn stroke(x: f64, origin: Option<StrokeOrigin>, kind: OutlineKind) -> GlyphStrok
 
 fn sample() -> Project {
     let mut p = Project::new("Test Hand");
-    let source = p.source_for(&PathBuf::from("notes/page.pdf"));
     p.add_chars("世A a");
     p.glyphs[0].strokes = vec![
-        stroke(1.0, Some(StrokeOrigin { source: source.clone(), page: 2, index: 1617 }), OutlineKind::Filled),
-        stroke(2.0, None, OutlineKind::Line { width: 0.25 }),
+        stroke(1.0, OutlineKind::Filled),
+        stroke(2.0, OutlineKind::Line { width: 0.25 }),
     ];
-    p.glyphs[1].strokes = vec![stroke(3.0, Some(StrokeOrigin { source, page: 0, index: 7 }), OutlineKind::Filled)];
+    p.glyphs[1].strokes = vec![stroke(3.0, OutlineKind::Filled)];
     p.glyphs[1].advance = 612.5;
     // A practice sheet: its id and grid come back too.
     let first = p.new_template(&['世', 'A']).id;
@@ -121,4 +119,35 @@ fn a_broken_glyph_file_names_itself() {
 fn empty_glyphs_have_no_strokes() {
     let g = Glyph::for_char('x', &Default::default());
     assert!(g.bounds().is_none());
+}
+
+#[test]
+fn projects_that_named_their_sources_open() {
+    // Projects before 2026-11-08 noted the documents strokes came from, and where in them.
+    let dir = folder("sources");
+    let p = sample();
+    p.save(&dir).unwrap();
+    let toml = dir.join("project.toml");
+    let text = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(&toml, text.replace("[[glyph]]", "[[source]]\nid = \"s1\"\nfile = 'notes/page.pdf'\n\n[[glyph]]")).unwrap();
+    for entry in std::fs::read_dir(dir.join("glyphs")).unwrap() {
+        let file = entry.unwrap().path();
+        let svg = std::fs::read_to_string(&file).unwrap().replace("class=\"stroke\"", "class=\"stroke\" data-origin=\"s1 2 1617\"");
+        std::fs::write(&file, svg).unwrap();
+    }
+    assert_eq!(Project::load(&dir).unwrap(), p);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn strokes_are_known_by_their_outlines() {
+    let (a, b) = (stroke(1.0, OutlineKind::Filled), stroke(2.0, OutlineKind::Filled));
+    assert_eq!(fingerprint(&a.outline.path), fingerprint(&a.clone().outline.path));
+    assert_ne!(fingerprint(&a.outline.path), fingerprint(&b.outline.path));
+    // Read back from a project, a stroke is the same stroke.
+    let dir = folder("fingerprint");
+    sample().save(&dir).unwrap();
+    let back = Project::load(&dir).unwrap();
+    assert_eq!(fingerprint(&back.glyphs[0].strokes[0].outline.path), fingerprint(&sample().glyphs[0].strokes[0].outline.path));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

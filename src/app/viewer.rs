@@ -95,16 +95,19 @@ impl Layout {
     }
 }
 
-/// One page: its strokes and their pre-tessellated meshes.
+/// One page: its strokes, their pre-tessellated meshes and their outlines' fingerprints (to find
+/// those in glyphs).
 struct PageData {
     ink: InkPage,
     meshes: Vec<Option<Mesh>>,
+    fingerprints: Vec<u64>,
 }
 
 impl PageData {
     fn new(ink: InkPage) -> Self {
         let meshes = ink.strokes.iter().map(Mesh::tessellate).collect();
-        Self { ink, meshes }
+        let fingerprints = ink.strokes.iter().map(|s| scriptoria_project::fingerprint(&s.path)).collect();
+        Self { ink, meshes, fingerprints }
     }
 }
 
@@ -192,8 +195,8 @@ enum Marquee {
 }
 
 pub enum ViewerEvent {
-    /// Put these strokes (in writing order, from this page) into the target glyph.
-    Assign { page: usize, strokes: Vec<Stroke> },
+    /// Put these strokes (in writing order, from one page) into the target glyph.
+    Assign { strokes: Vec<Stroke> },
 }
 
 impl EventEmitter<ViewerEvent> for Viewer {}
@@ -283,8 +286,10 @@ pub struct Viewer {
     cache: Rc<RefCell<PathCache>>,
     /// Selected strokes of this page, by index.
     selection: BTreeSet<usize>,
-    /// Strokes already in some glyph: (page, index).
-    assigned: Rc<HashSet<(usize, usize)>>,
+    /// The outlines of the strokes in glyphs (their fingerprints).
+    used: Arc<HashSet<u64>>,
+    /// This page's strokes among them, by index.
+    assigned: Rc<HashSet<usize>>,
     /// The glyph selected strokes would go to.
     target: Option<SharedString>,
     marquee: Option<Marquee>,
@@ -320,6 +325,7 @@ impl Viewer {
             weight_bounds: Rc::default(),
             cache: Rc::default(),
             selection: BTreeSet::new(),
+            used: Arc::default(),
             assigned: Rc::default(),
             target: None,
             marquee: None,
@@ -339,8 +345,8 @@ impl Viewer {
         self.layout().map(|l| l.to_window(p))
     }
 
-    /// The strokes marked as already in a glyph: (page, index).
-    pub fn assigned(&self) -> &HashSet<(usize, usize)> {
+    /// The strokes of the page shown marked as already in a glyph, by index.
+    pub fn assigned(&self) -> &HashSet<usize> {
         &self.assigned
     }
 
@@ -366,10 +372,17 @@ impl Viewer {
 
     // ---- Selection and assignment ----
 
-    /// Marks the strokes already in a glyph: (page, index).
-    pub fn set_assigned(&mut self, assigned: HashSet<(usize, usize)>, cx: &mut Context<Self>) {
-        self.assigned = Rc::new(assigned);
+    /// Marks the strokes already in glyphs: those whose outlines are among `used` (fingerprints,
+    /// see [`scriptoria_project::fingerprint`]), wherever their document came from.
+    pub fn set_used(&mut self, used: Arc<HashSet<u64>>, cx: &mut Context<Self>) {
+        self.used = used;
+        self.mark_used();
         cx.notify();
+    }
+
+    fn mark_used(&mut self) {
+        let page = &self.page;
+        self.assigned = Rc::new((0..page.fingerprints.len()).filter(|&i| self.used.contains(&page.fingerprints[i])).collect());
     }
 
     /// The glyph selected strokes would go to (its label), if any.
@@ -407,7 +420,7 @@ impl Viewer {
         }
         let strokes = self.selection.iter().map(|&i| self.page.ink.strokes[i].clone()).collect();
         self.selection.clear();
-        cx.emit(ViewerEvent::Assign { page: self.page_index, strokes });
+        cx.emit(ViewerEvent::Assign { strokes });
         cx.notify();
     }
 
@@ -421,6 +434,7 @@ impl Viewer {
             self.playing = None;
             self.page_index = index;
             self.page = Rc::new(PageData::new(ink));
+            self.mark_used();
             self.visible = self.total();
             self.hovered = None;
             self.skeletons = None;
@@ -742,7 +756,7 @@ impl Viewer {
         let visible = self.visible;
         // Strokes already in a glyph are gray.
         let colors: Vec<Hsla> = (0..page.ink.strokes.len())
-            .map(|i| if self.assigned.contains(&(self.page_index, i)) { LATTE.surface2.hsla() } else { self.stroke_color(i) })
+            .map(|i| if self.assigned.contains(&i) { LATTE.surface2.hsla() } else { self.stroke_color(i) })
             .collect();
         // The last stroke shown is marked while replaying (not when all are shown).
         let current = (visible < page.ink.strokes.len()).then(|| visible.checked_sub(1)).flatten();

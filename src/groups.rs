@@ -210,7 +210,6 @@ mod tests {
     fn written(project: &mut Project, c: char) {
         let g = project.glyph_for(c).unwrap();
         project.glyphs[g].strokes.push(GlyphStroke {
-            origin: None,
             outline: Outline { path: BezPath::new(), kind: OutlineKind::Filled },
             skeleton: Vec::new(),
             placement: Affine::IDENTITY,

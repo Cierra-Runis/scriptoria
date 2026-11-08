@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use scriptoria_ink::kurbo::{Affine, Point, Rect};
 use scriptoria_ink::{InkPage, Stroke};
-use scriptoria_project::{FontInfo, Glyph, GlyphStroke, Project, StrokeOrigin, Template};
+use scriptoria_project::{FontInfo, Glyph, GlyphStroke, Project, Template};
 use scriptoria_reference::ReferenceFont;
 use scriptoria_template::{CODE, Lines, Model, Sheet, is_sheet_color, is_square, read_code};
 
@@ -69,8 +69,7 @@ pub struct Written {
     pub advance: f64,
 }
 
-/// The characters written on a sheet's page (`sheet_page` of `template`), which is page
-/// `page_index` of `source`: the handwriting in each cell (a stroke belongs to the cell its box's
+/// The characters written on a sheet's page (`sheet_page` of `template`): the handwriting in each cell (a stroke belongs to the cell its box's
 /// center lies in), in writing order, its square made the em. Characters written in squares (CJK)
 /// are an em wide; others keep their height and take the reference's side bearings (a tenth of the
 /// em each without a reference). Skeletons are recovered on all cores.
@@ -78,8 +77,6 @@ pub fn read_sheet_page(
     info: &FontInfo,
     template: &Template,
     sheet_page: usize,
-    source: &str,
-    page_index: usize,
     page: &InkPage,
     reference: Option<&ReferenceFont>,
 ) -> Vec<Written> {
@@ -105,7 +102,7 @@ pub fn read_sheet_page(
         let placement = Affine::new([k, 0.0, 0.0, -k, -square.x0 * k, square.y1 * k + info.descender as f64]);
         let strokes = strokes
             .iter()
-            .map(|s| crate::assign::glyph_stroke(s, Some(StrokeOrigin { source: source.to_string(), page: page_index, index: s.order }), placement, k))
+            .map(|s| crate::assign::glyph_stroke(s, placement, k))
             .collect();
         let mut glyph = Glyph { name: String::new(), chars: vec![c], advance: upm, strokes };
         if !is_square(c) {

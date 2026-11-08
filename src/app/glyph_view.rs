@@ -874,8 +874,6 @@ impl GlyphView {
     fn render_stroke_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (accent, muted, border) = (palette(cx).mauve.hsla(), theme.muted_foreground, theme.border);
-        let doc = self.document.read(cx);
-        let sources = &doc.project.sources;
         let rows: Vec<_> = self
             .glyph(cx)
             .map(|g| g.strokes.as_slice())
@@ -883,13 +881,9 @@ impl GlyphView {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let from = match &s.origin {
-                    Some(o) => {
-                        let file = sources.iter().find(|x| x.id == o.source).and_then(|x| x.file.file_name()).map(|n| n.to_string_lossy().into_owned());
-                        format!("{} 第 {} 页 #{}", file.unwrap_or_else(|| o.source.clone()), o.page + 1, o.index)
-                    }
-                    None => "来源不明".into(),
-                };
+                // Where the pen came down (font units).
+                let start = s.skeleton.first().and_then(|p| p.circles.first()).map(|&(c, _)| s.placement * c);
+                let from = start.map_or_else(|| "（没有骨架）".to_string(), |p| format!("落笔 ({:.0}, {:.0})", p.x, p.y));
                 let selected = self.selection.contains(&i);
                 let hovered = self.hovered == Some(i);
                 h_flex()

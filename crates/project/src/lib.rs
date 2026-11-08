@@ -2,15 +2,16 @@
 //! is written with, in writing order, each placed in the em.
 //!
 //! Strokes are copied into the project (their outline as written and their skeleton, both in the
-//! coordinates of the page they came from, with a note of where that was), so a project opens
-//! without its source documents. A stroke's placement maps its page coordinates to font units
-//! (y up).
+//! coordinates of the page they came from), so a project depends on no other file: documents
+//! written in may move, change or go. A stroke's placement maps its page coordinates to font units
+//! (y up). Where a stroke was written is not kept; a page's strokes already used are recognized by
+//! their outlines ([`fingerprint`]).
 //!
 //! On disk a project is a folder:
 //!
 //! ```text
-//! project.toml         format version, font settings, sources, the glyph list (name, characters,
-//!                      advance, file)
+//! project.toml         format version, font settings, the glyph list (name, characters, advance,
+//!                      file), the practice sheets made
 //! glyphs/<file>.svg    one per glyph with strokes: each stroke a <g class="stroke"> whose
 //!                      transform is its placement, holding its outline and its skeleton
 //! ```
@@ -34,8 +35,6 @@ pub const FULL_WIDTH_LIMIT: f64 = 0.96;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     pub font: FontInfo,
-    /// Documents strokes were taken from.
-    pub sources: Vec<Source>,
     /// The glyphs, in font order.
     pub glyphs: Vec<Glyph>,
     /// The practice sheets made for it, to find their pages again when written.
@@ -151,14 +150,6 @@ impl Project {
 pub struct Frame {
     pub bounds: Rect,
     pub advance: f64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Source {
-    /// How strokes refer to it.
-    pub id: String,
-    /// The document as it was imported (absolute, or relative to the project folder).
-    pub file: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -349,8 +340,6 @@ impl GlyphStroke {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlyphStroke {
-    /// Where the stroke was written, if known.
-    pub origin: Option<StrokeOrigin>,
     /// The stroke as written (page coordinates).
     pub outline: Outline,
     /// Its skeleton (page coordinates): circles along a centerline, piece by piece.
@@ -363,12 +352,40 @@ pub struct GlyphStroke {
     pub pen: f64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct StrokeOrigin {
-    pub source: String,
-    pub page: usize,
-    /// The stroke's index on its page, in writing order.
-    pub index: usize,
+/// A stroke's outline as written, as a number: the same stroke of the same page gives the same
+/// number however often it is read (in one run of the program: it is not kept), so that a page's
+/// strokes already in glyphs are found again without noting where strokes came from.
+pub fn fingerprint(path: &BezPath) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut point = |p: Point| (p.x.to_bits(), p.y.to_bits()).hash(&mut h);
+    let mut tags = Vec::new();
+    for el in path.elements() {
+        match *el {
+            kurbo::PathEl::MoveTo(p) => {
+                tags.push(0u8);
+                point(p);
+            }
+            kurbo::PathEl::LineTo(p) => {
+                tags.push(1);
+                point(p);
+            }
+            kurbo::PathEl::QuadTo(a, b) => {
+                tags.push(2);
+                point(a);
+                point(b);
+            }
+            kurbo::PathEl::CurveTo(a, b, c) => {
+                tags.push(3);
+                point(a);
+                point(b);
+                point(c);
+            }
+            kurbo::PathEl::ClosePath => tags.push(4),
+        }
+    }
+    tags.hash(&mut h);
+    h.finish()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -413,7 +430,7 @@ pub fn initial_placement(bounds: Rect, info: &FontInfo) -> Affine {
 
 impl Project {
     pub fn new(family: impl Into<String>) -> Self {
-        Project { font: FontInfo { family: family.into(), ..FontInfo::default() }, sources: Vec::new(), glyphs: Vec::new(), templates: Vec::new() }
+        Project { font: FontInfo { family: family.into(), ..FontInfo::default() }, glyphs: Vec::new(), templates: Vec::new() }
     }
 
     /// The glyph mapped to a character.
@@ -434,16 +451,6 @@ impl Project {
         self.glyphs.len() - before
     }
 
-    /// The source with this file, added if new; returns its id.
-    pub fn source_for(&mut self, file: &Path) -> String {
-        if let Some(s) = self.sources.iter().find(|s| s.file == file) {
-            return s.id.clone();
-        }
-        let id = format!("s{}", self.sources.len() + 1);
-        self.sources.push(Source { id: id.clone(), file: file.to_path_buf() });
-        id
-    }
-
     pub fn load(dir: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(dir.join(PROJECT_FILE)).map_err(|e| Error::Io(dir.join(PROJECT_FILE), e))?;
         let file: ProjectFile = toml::from_str(&text).map_err(|e| Error::Toml(e.to_string()))?;
@@ -462,7 +469,7 @@ impl Project {
             };
             glyphs.push(Glyph { name: g.name, chars: g.chars.chars().collect(), advance: g.advance, strokes });
         }
-        Ok(Project { font: file.font, sources: file.source, glyphs, templates: file.template })
+        Ok(Project { font: file.font, glyphs, templates: file.template })
     }
 
     /// Writes the project into `dir` (created if needed): `project.toml` and a file per glyph
@@ -480,7 +487,7 @@ impl Project {
             }
             entries.push(GlyphEntry { name: g.name.clone(), chars: g.chars.iter().collect(), advance: g.advance, file });
         }
-        let file = ProjectFile { format: FORMAT, font: self.font.clone(), source: self.sources.clone(), glyph: entries, template: self.templates.clone() };
+        let file = ProjectFile { format: FORMAT, font: self.font.clone(), glyph: entries, template: self.templates.clone() };
         write(&dir.join(PROJECT_FILE), &toml::to_string_pretty(&file).map_err(|e| Error::Toml(e.to_string()))?)?;
         for entry in std::fs::read_dir(&glyph_dir).map_err(|e| Error::Io(glyph_dir.clone(), e))?.flatten() {
             let path = entry.path();
@@ -528,8 +535,7 @@ fn file_name(name: &str) -> String {
 struct ProjectFile {
     format: u32,
     font: FontInfo,
-    #[serde(default)]
-    source: Vec<Source>,
+    // Projects before 2026-11-08 also list `[[source]]`: the documents strokes came from (ignored).
     #[serde(default)]
     glyph: Vec<GlyphEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -595,7 +601,6 @@ mod tests {
     fn squares(n: usize) -> Glyph {
         let strokes = (0..n)
             .map(|i| GlyphStroke {
-                origin: Some(StrokeOrigin { source: "s1".into(), page: 0, index: i }),
                 outline: Outline { kind: OutlineKind::Filled, path: Rect::new(i as f64, 0.0, i as f64 + 1.0, 1.0).to_path(1e-3) },
                 skeleton: Vec::new(),
                 placement: Affine::IDENTITY,
@@ -606,7 +611,8 @@ mod tests {
     }
 
     fn order(g: &Glyph) -> Vec<usize> {
-        g.strokes.iter().map(|s| s.origin.as_ref().unwrap().index).collect()
+        // Which square each is: where its outline starts.
+        g.strokes.iter().map(|s| s.outline.path.bounding_box().x0 as usize).collect()
     }
 
     #[test]

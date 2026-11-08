@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
-use scriptoria_project::{FontInfo, Glyph, Project, Reference, StrokeOrigin, Template};
+use scriptoria_project::{FontInfo, Glyph, Project, Reference, Template};
 use scriptoria_reference::ReferenceFont;
 
 /// How many changes can be undone.
@@ -39,6 +39,8 @@ pub struct Document {
     reference: Option<Arc<ReferenceFont>>,
     /// Bumped whenever anything changes.
     generation: u64,
+    /// The outlines in glyphs (see [`Document::used_outlines`]), for a generation.
+    used: std::cell::RefCell<Option<(u64, Arc<HashSet<u64>>)>>,
     /// Per glyph, bumped whenever it changes.
     revisions: Vec<u64>,
     next_revision: u64,
@@ -77,7 +79,7 @@ impl Document {
         let revisions = vec![0; project.glyphs.len()];
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        Document { project, folder, modified: false, id, reference: reference.map(Arc::new), generation: 0, revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
+        Document { project, folder, modified: false, id, reference: reference.map(Arc::new), generation: 0, used: Default::default(), revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
     }
 
     /// Different for every document made (a project opened twice is two documents).
@@ -308,12 +310,11 @@ impl Document {
         self.redo.clear();
     }
 
-    /// Adds written strokes (from page `page` of source `source`, in writing order) to the end of a
-    /// glyph (see [`crate::assign::assign`]).
-    pub fn assign(&mut self, glyph: usize, source: &str, page: usize, strokes: &[Stroke], cx: &mut Context<Self>) {
+    /// Adds written strokes (from one page, in writing order) to the end of a glyph (see
+    /// [`crate::assign::assign`]).
+    pub fn assign(&mut self, glyph: usize, strokes: &[Stroke], cx: &mut Context<Self>) {
         let Some(before) = self.project.glyphs.get(glyph).cloned() else { return };
-        let list: Vec<(&Stroke, StrokeOrigin)> =
-            strokes.iter().map(|s| (s, StrokeOrigin { source: source.to_string(), page, index: s.order })).collect();
+        let list: Vec<&Stroke> = strokes.iter().collect();
         crate::assign::assign(&mut self.project, glyph, &list, self.reference.as_deref());
         if self.project.glyphs[glyph] != before {
             self.changed(glyph, cx);
@@ -375,16 +376,20 @@ impl Document {
         replaced
     }
 
-    /// The strokes of a source some glyph uses: (page, index).
-    pub fn used_strokes(&self, source: &str) -> HashSet<(usize, usize)> {
-        self.project
-            .glyphs
-            .iter()
-            .flat_map(|g| &g.strokes)
-            .filter_map(|s| s.origin.as_ref())
-            .filter(|o| o.source == source)
-            .map(|o| (o.page, o.index))
-            .collect()
+    /// The outlines of the strokes in glyphs, as fingerprints (see
+    /// [`scriptoria_project::fingerprint`]): a page's strokes among them are used. Kept until the
+    /// project changes.
+    pub fn used_outlines(&self) -> Arc<HashSet<u64>> {
+        let mut used = self.used.borrow_mut();
+        match &*used {
+            Some((generation, set)) if *generation == self.generation => set.clone(),
+            _ => {
+                let set: Arc<HashSet<u64>> =
+                    Arc::new(self.project.glyphs.iter().flat_map(|g| &g.strokes).map(|s| scriptoria_project::fingerprint(&s.outline.path)).collect());
+                *used = Some((self.generation, set.clone()));
+                set
+            }
+        }
     }
 
     fn changed(&mut self, glyph: usize, cx: &mut Context<Self>) {

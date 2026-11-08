@@ -122,8 +122,8 @@ fn menus(appearance: Appearance) -> Vec<Menu> {
 
 /// A document or glyph open in a tab.
 enum Page {
-    /// A handwritten document, with the id of its source in the project.
-    Pdf { title: SharedString, source: String, view: Entity<Viewer> },
+    /// A handwritten document.
+    Pdf { title: SharedString, view: Entity<Viewer> },
     /// A glyph, by its index in the project.
     Glyph { title: SharedString, glyph: usize, view: Entity<GlyphView> },
     /// The sample text.
@@ -363,31 +363,24 @@ impl Workspace {
         }
     }
 
-    /// Opens a handwritten PDF in a tab, as a source of the project. Pages written on the
-    /// project's practice sheets are read at once: their cells' handwriting goes into the glyphs.
+    /// Opens a handwritten PDF in a tab, to take strokes from (the project keeps no note of it).
+    /// Pages written on the project's practice sheets are read at once: their cells' handwriting goes
+    /// into the glyphs.
     pub fn import_pdf(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        // Sources are kept by absolute path, so the same file is the same source however it was named.
-        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let path = absolute.as_path();
         let opened = std::fs::read(path).map_err(anyhow::Error::from).and_then(|data| InkDocument::open(data).map_err(Into::into));
         match opened {
             Ok(ink) => {
                 let sheets = self.sheet_pages(&ink, cx);
                 let title: SharedString = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default().into();
                 let view = cx.new(|cx| Viewer::new(ink, title.clone(), cx));
-                let source = self.document.update(cx, |d, cx| {
-                    cx.notify();
-                    d.project.source_for(path)
-                });
-                let id = source.clone();
                 self._subscriptions.push(cx.subscribe_in(&view, window, move |this, _, event: &ViewerEvent, window, cx| match event {
-                    ViewerEvent::Assign { page, strokes } => this.assign(&id, *page, strokes, window, cx),
+                    ViewerEvent::Assign { strokes } => this.assign(strokes, window, cx),
                 }));
-                self.pages.push(Page::Pdf { title, source: source.clone(), view });
+                self.pages.push(Page::Pdf { title, view });
                 self.active = self.pages.len() - 1;
                 self.refresh_pages(cx);
                 if !sheets.is_empty() {
-                    self.read_sheets(source, sheets, window, cx);
+                    self.read_sheets(sheets, window, cx);
                 }
                 cx.notify();
             }
@@ -418,7 +411,7 @@ impl Workspace {
 
     /// Reads written sheet pages on a background thread (skeletons take a while), then puts what
     /// was written into the glyphs, as one step to undo.
-    fn read_sheets(&mut self, source: String, sheets: Vec<(usize, InkPage, usize, usize)>, window: &mut Window, cx: &mut Context<Self>) {
+    fn read_sheets(&mut self, sheets: Vec<(usize, InkPage, usize, usize)>, window: &mut Window, cx: &mut Context<Self>) {
         let doc = self.document.read(cx);
         let (info, templates, reference) = (doc.project.font.clone(), doc.project.templates.clone(), doc.reference().cloned());
         window.push_notification(Notification::info(format!("认出 {} 页格子模板，正在读取…", sheets.len())), cx);
@@ -428,9 +421,7 @@ impl Workspace {
                 .spawn(async move {
                     sheets
                         .iter()
-                        .flat_map(|(page, ink, t, sheet_page)| {
-                            crate::template::read_sheet_page(&info, &templates[*t], *sheet_page, &source, *page, ink, reference.as_deref())
-                        })
+                        .flat_map(|(_, ink, t, sheet_page)| crate::template::read_sheet_page(&info, &templates[*t], *sheet_page, ink, reference.as_deref()))
                         .collect::<Vec<_>>()
                 })
                 .await;
@@ -537,12 +528,12 @@ impl Workspace {
 
     /// Puts strokes into the glyph selected in the grid, then moves the selection on to the next
     /// glyph still without strokes.
-    fn assign(&mut self, source: &str, page: usize, strokes: &[scriptoria_ink::Stroke], window: &mut Window, cx: &mut Context<Self>) {
+    fn assign(&mut self, strokes: &[scriptoria_ink::Stroke], window: &mut Window, cx: &mut Context<Self>) {
         let Some(glyph) = self.font_view.read(cx).selected() else {
             window.push_notification(Notification::warning("先在左边的字形表里选一个字"), cx);
             return;
         };
-        self.document.update(cx, |d, cx| d.assign(glyph, source, page, strokes, cx));
+        self.document.update(cx, |d, cx| d.assign(glyph, strokes, cx));
         self.font_view.update(cx, |f, cx| f.select_next_empty(cx));
     }
 
@@ -551,18 +542,19 @@ impl Workspace {
         let doc = self.document.read(cx);
         let target: Option<SharedString> =
             self.font_view.read(cx).selected().and_then(|g| doc.project.glyphs.get(g)).map(|g| g.chars.iter().collect::<String>().into());
-        let updates: Vec<_> = self
+        let used = doc.used_outlines();
+        let views: Vec<_> = self
             .pages
             .iter()
             .filter_map(|p| match p {
-                Page::Pdf { source, view, .. } => Some((view.clone(), doc.used_strokes(source))),
+                Page::Pdf { view, .. } => Some(view.clone()),
                 _ => None,
             })
             .collect();
-        for (view, used) in updates {
-            let target = target.clone();
+        for view in views {
+            let (target, used) = (target.clone(), used.clone());
             view.update(cx, |v, cx| {
-                v.set_assigned(used, cx);
+                v.set_used(used, cx);
                 v.set_target(target, cx);
             });
         }

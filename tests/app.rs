@@ -86,13 +86,12 @@ fn strokes_boxed_on_a_page_go_into_the_selected_glyph(cx: &mut TestAppContext) {
 
     let expected: Vec<usize> = shi_strokes().iter().map(|s| s.order).collect();
     assert!(expected.len() >= 4, "the character's strokes: {expected:?}");
-    let got: Vec<(usize, usize)> = workspace.read_with(cx, |w, cx| {
-        w.document().read(cx).project.glyphs[0].strokes.iter().map(|s| s.origin.as_ref().map(|o| (o.page, o.index)).unwrap()).collect()
-    });
-    assert_eq!(got, expected.iter().map(|&i| (2, i)).collect::<Vec<_>>());
-    // The page now marks them as used.
-    let marked = viewer.read_with(cx, |v, _| expected.iter().all(|&i| v.assigned().contains(&(2, i))));
-    assert!(marked);
+    // The glyph has them, as written, in writing order.
+    let got = order(&glyph(&workspace, cx));
+    assert_eq!(got, expected);
+    // The page now marks them (and only them) as used: their outlines are in a glyph.
+    let marked: std::collections::BTreeSet<usize> = viewer.read_with(cx, |v, _| v.assigned().iter().copied().collect());
+    assert_eq!(marked, expected.iter().copied().collect());
 }
 
 /// The main window with 世 written into its first glyph, the glyph opened by a double click.
@@ -101,7 +100,7 @@ fn open_shi(cx: &mut TestAppContext) -> (Entity<Workspace>, Entity<GlyphView>, &
     let document = workspace.read_with(cx, |w, _| w.document().clone());
     document.update(cx, |d, cx| {
         d.add_chars("世", cx);
-        d.assign(0, "s1", 2, &shi_strokes(), cx);
+        d.assign(0, &shi_strokes(), cx);
     });
     cx.update(|window, cx| {
         window.render_frame(cx);
@@ -119,9 +118,10 @@ fn glyph(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Glyph {
     workspace.read_with(cx, |w, cx| w.document().read(cx).project.glyphs[0].clone())
 }
 
-/// Where each stroke came from: its index on the page.
+/// Which of the page's strokes each stroke is (its index on page 3), known by its outline.
 fn order(g: &Glyph) -> Vec<usize> {
-    g.strokes.iter().map(|s| s.origin.as_ref().unwrap().index).collect()
+    let page = shi_strokes();
+    g.strokes.iter().map(|s| page.iter().find(|p| p.path == s.outline.path).expect("a stroke of the page").order).collect()
 }
 
 /// The pen-down point of stroke `i` (font units).
@@ -337,7 +337,7 @@ fn new_glyphs_take_the_reference_place(cx: &mut TestAppContext) {
     document.update(cx, |d, cx| {
         d.set_reference(Some(scriptoria_project::Reference { file, face: 0 }), cx).unwrap();
         d.add_chars("世", cx);
-        d.assign(0, "s1", 2, &shi_strokes(), cx);
+        d.assign(0, &shi_strokes(), cx);
     });
     let placed = |g: &Glyph| g.ink_bounds().unwrap();
     let b = placed(&glyph(&workspace, cx));
@@ -366,8 +366,8 @@ fn two_glyphs(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestCon
     let document = workspace.read_with(cx, |w, _| w.document().clone());
     document.update(cx, |d, cx| {
         d.add_chars("世丗", cx);
-        d.assign(0, "s1", 2, &shi_strokes(), cx);
-        d.assign(1, "s1", 2, &shi_strokes(), cx);
+        d.assign(0, &shi_strokes(), cx);
+        d.assign(1, &shi_strokes(), cx);
     });
     cx.update(|window, cx| window.render_frame(cx));
     (workspace, cx)

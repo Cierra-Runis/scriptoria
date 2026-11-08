@@ -3,7 +3,7 @@
 //! ```text
 //! <svg viewBox="…" …>                          the em (font units, y flipped for viewing)
 //!   <g transform="scale(1 -1)">                font units, y up
-//!     <g class="stroke" data-origin="s1 2 1617" data-pen="222.2" transform="matrix(a b c d e f)">
+//!     <g class="stroke" data-pen="222.2" transform="matrix(a b c d e f)">
 //!                                              one per stroke, in writing order; the matrix is its
 //!                                              placement, page coordinates to font units; data-pen
 //!                                              its pen scale (font units per page unit for widths)
@@ -19,13 +19,14 @@
 //! ```
 //!
 //! Numbers are written in full (`f64` round trips exactly); everything else (titles, colors,
-//! the viewing transform) is for people and ignored when reading.
+//! the viewing transform) is for people and ignored when reading. (Files from before 2026-11-08
+//! also name where each stroke was written, `data-origin`: ignored too.)
 
 use std::fmt::Write as _;
 
 use kurbo::{Affine, BezPath, CubicBez, PathEl, Point};
 
-use crate::{FontInfo, Glyph, GlyphStroke, Outline, OutlineKind, SkeletonPiece, StrokeOrigin};
+use crate::{FontInfo, Glyph, GlyphStroke, Outline, OutlineKind, SkeletonPiece};
 
 const INK: &str = "#1f2937";
 const SKELETON: &str = "#2563eb";
@@ -49,8 +50,7 @@ pub(crate) fn write_strokes(glyph: &Glyph, font: &FontInfo) -> String {
     s += "<g transform=\"scale(1 -1)\">\n";
     for stroke in &glyph.strokes {
         let [a, b, c, d, e, f] = stroke.placement.as_coeffs();
-        let origin = stroke.origin.as_ref().map_or(String::new(), |o| format!(" data-origin=\"{} {} {}\"", escape(&o.source), o.page, o.index));
-        let _ = writeln!(s, "<g class=\"stroke\"{origin} data-pen=\"{}\" transform=\"matrix({a} {b} {c} {d} {e} {f})\">", stroke.pen);
+        let _ = writeln!(s, "<g class=\"stroke\" data-pen=\"{}\" transform=\"matrix({a} {b} {c} {d} {e} {f})\">", stroke.pen);
         match stroke.outline.kind {
             OutlineKind::Filled => {
                 let _ = writeln!(s, "<path class=\"outline\" data-kind=\"filled\" fill=\"{INK}\" d=\"{}\"/>", stroke.outline.path.to_svg());
@@ -99,19 +99,11 @@ pub(crate) fn read_strokes(text: &str, pen: f64) -> Result<Vec<GlyphStroke>, Str
         match (tag.name.as_str(), tag.close) {
             ("g", false) if tag.get("class").as_deref() == Some("stroke") => {
                 let placement = matrix(&tag.get("transform").ok_or("a stroke without a transform")?)?;
-                let origin = match tag.get("data-origin") {
-                    Some(o) => {
-                        let parts: Vec<&str> = o.split_whitespace().collect();
-                        let [source, page, index] = parts[..] else { return Err(format!("bad data-origin {o:?}")) };
-                        Some(StrokeOrigin { source: source.into(), page: number(page)?, index: number(index)? })
-                    }
-                    None => None,
-                };
                 let pen = match tag.get("data-pen") {
                     Some(p) => number(&p)?,
                     None => pen,
                 };
-                strokes.push(GlyphStroke { origin, outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: Vec::new(), placement, pen });
+                strokes.push(GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: Vec::new(), placement, pen });
                 in_stroke = true;
             }
             ("g", true) => in_stroke = false,

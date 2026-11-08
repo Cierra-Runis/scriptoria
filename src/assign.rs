@@ -1,16 +1,16 @@
 //! Putting written strokes into a project's glyphs, and placing glyphs as the reference font does.
 
-use scriptoria_ink::kurbo::{Affine, Rect};
+use scriptoria_ink::kurbo::{Affine, Rect, Shape as _};
 use scriptoria_ink::{Stroke, StrokeShape};
 use scriptoria_project::{
-    FontInfo, Frame, Glyph, GlyphStroke, Outline, OutlineKind, Project, Reference, SkeletonPiece, StrokeOrigin, initial_placement,
+    FontInfo, Frame, Glyph, GlyphStroke, Outline, OutlineKind, Project, Reference, SkeletonPiece, initial_placement,
 };
 use scriptoria_reference::ReferenceFont;
 use scriptoria_skeleton::{Piece, Sample, Skeleton};
 
-/// A written stroke as a glyph's stroke: its outline, its skeleton (recovered now) and where it
-/// came from, placed by `placement`, its width at `pen` (see [`GlyphStroke::pen`]).
-pub fn glyph_stroke(stroke: &Stroke, origin: Option<StrokeOrigin>, placement: Affine, pen: f64) -> GlyphStroke {
+/// A written stroke as a glyph's stroke: its outline and its skeleton (recovered now), placed by
+/// `placement`, its width at `pen` (see [`GlyphStroke::pen`]).
+pub fn glyph_stroke(stroke: &Stroke, placement: Affine, pen: f64) -> GlyphStroke {
     let kind = match stroke.shape {
         StrokeShape::Outline { .. } => OutlineKind::Filled,
         StrokeShape::Line { width } => OutlineKind::Line { width },
@@ -20,29 +20,29 @@ pub fn glyph_stroke(stroke: &Stroke, origin: Option<StrokeOrigin>, placement: Af
         .iter()
         .map(|p| SkeletonPiece { circles: p.samples.iter().map(|s| (s.p, s.r)).collect(), spine: p.spine.clone() })
         .collect();
-    GlyphStroke { origin, outline: Outline { kind, path: stroke.path.clone() }, skeleton, placement, pen }
+    GlyphStroke { outline: Outline { kind, path: stroke.path.clone() }, skeleton, placement, pen }
 }
 
-/// Adds strokes (with where they came from) to the end of a glyph, in the order given, all
-/// placed alike.
+/// Adds written strokes to the end of a glyph, in the order given, all placed alike.
 ///
-/// Strokes from the page the glyph's last stroke came from join it where they were written
-/// (they take its placement: a stroke forgotten in the first go). Otherwise the box around them
+/// Strokes written next to the glyph's last stroke (within an em of it on the page) join it where
+/// they were written: they take its placement (a stroke forgotten in the first go). Otherwise the box around them
 /// is scaled by the project's page units per em, its bottom on the descender, its left edge at
 /// x = 0; and a glyph that had no strokes is then placed as the reference font places its
 /// character ([`fit`]), or takes the box's width as its advance without a reference.
-pub fn assign(project: &mut Project, glyph: usize, strokes: &[(&Stroke, StrokeOrigin)], reference: Option<&ReferenceFont>) {
-    let Some(bounds) = strokes.iter().map(|(s, _)| s.bbox).reduce(|a: Rect, b| a.union(b)) else { return };
+pub fn assign(project: &mut Project, glyph: usize, strokes: &[&Stroke], reference: Option<&ReferenceFont>) {
+    let Some(bounds) = strokes.iter().map(|s| s.bbox).reduce(|a: Rect, b| a.union(b)) else { return };
     let info = project.font.clone();
     let g = &mut project.glyphs[glyph];
-    let same_page = |s: &GlyphStroke| {
-        let (a, b) = (s.origin.as_ref(), strokes.first().map(|(_, o)| o));
-        a.zip(b).is_some_and(|(a, b)| a.source == b.source && a.page == b.page)
+    let em = info.pt_per_em;
+    let near = |s: &GlyphStroke| {
+        let b = s.outline.path.bounding_box().inflate(em, em);
+        b.x0 <= bounds.x1 && bounds.x0 <= b.x1 && b.y0 <= bounds.y1 && bounds.y0 <= b.y1
     };
-    let joining = g.strokes.last().filter(|s| same_page(s)).map(|s| (s.placement, s.pen));
+    let joining = g.strokes.last().filter(|s| near(s)).map(|s| (s.placement, s.pen));
     let was_empty = g.strokes.is_empty();
     let (placement, pen) = joining.unwrap_or_else(|| (initial_placement(bounds, &info), info.pen_scale()));
-    g.strokes.extend(strokes.iter().map(|(s, origin)| glyph_stroke(s, Some(origin.clone()), placement, pen)));
+    g.strokes.extend(strokes.iter().map(|s| glyph_stroke(s, placement, pen)));
     if was_empty {
         g.advance = (bounds.width() * info.pen_scale()).round();
         if let Some(reference) = reference {
@@ -107,7 +107,7 @@ pub fn skeleton_of(pieces: &[SkeletonPiece], t: Affine, radius: f64) -> Skeleton
 /// How large a project's hand writes, as the reference font measures it: the points per em (see
 /// [`FontInfo::pt_per_em`]) at which its written glyphs are as large as the reference's
 /// characters, by the square root of their ink boxes' areas, the median over the glyphs (those
-/// written in one place, that the reference has); with how many glyphs that is. None without any.
+/// whose strokes are placed alike, that the reference has); with how many glyphs that is. None without any.
 pub fn estimate_pt_per_em(project: &Project, reference: &ReferenceFont) -> Option<(f64, usize)> {
     use scriptoria_ink::kurbo::Shape as _;
     let upm = project.font.units_per_em as f64;
@@ -116,10 +116,10 @@ pub fn estimate_pt_per_em(project: &Project, reference: &ReferenceFont) -> Optio
         .iter()
         .filter_map(|g| {
             let c = *g.chars.first()?;
-            // Outlines are in their page's coordinates: all from one page, or the box means nothing.
-            let page = |s: &GlyphStroke| s.origin.as_ref().map(|o| (o.source.clone(), o.page));
-            let first = page(g.strokes.first()?);
-            if g.strokes.iter().any(|s| page(s) != first) {
+            // Outlines are in their page's coordinates: only strokes placed together (written in one
+            // go, on one page) make a box that means something.
+            let first = g.strokes.first()?.placement;
+            if g.strokes.iter().any(|s| s.placement != first) {
                 return None;
             }
             let hand = g.strokes.iter().map(|s| s.outline.path.bounding_box()).reduce(|a, b| a.union(b))?;
@@ -138,7 +138,6 @@ pub fn estimate_pt_per_em(project: &Project, reference: &ReferenceFont) -> Optio
 mod tests {
     use super::*;
     use scriptoria_font::{Axis, FontSource, build};
-    use scriptoria_ink::kurbo::Shape as _;
 
     /// A reference font with 口 an 800 × 800 square.
     fn reference() -> ReferenceFont {
@@ -163,12 +162,12 @@ mod tests {
         ReferenceFont::from_bytes(build(&source).unwrap(), None).unwrap()
     }
 
-    fn stroke(page: usize, r: Rect) -> GlyphStroke {
+    /// A stroke of box `r`, placed by a translation of `dx`.
+    fn stroke(dx: f64, r: Rect) -> GlyphStroke {
         GlyphStroke {
-            origin: Some(StrokeOrigin { source: "s1".into(), page, index: 0 }),
             outline: Outline { kind: OutlineKind::Filled, path: r.to_path(0.1) },
             skeleton: Vec::new(),
-            placement: Affine::IDENTITY,
+            placement: Affine::translate((dx, 0.0)),
             pen: 1.0,
         }
     }
@@ -179,13 +178,13 @@ mod tests {
         assert_eq!(estimate_pt_per_em(&p, &reference()), None);
         p.add_chars("口一");
         // 口 written 2.4 pt square (two strokes), as large as the reference's 800 units at 3 pt per em.
-        p.glyphs[0].strokes = vec![stroke(0, Rect::new(10.0, 10.0, 12.4, 11.0)), stroke(0, Rect::new(10.0, 11.0, 11.0, 12.4))];
+        p.glyphs[0].strokes = vec![stroke(0.0, Rect::new(10.0, 10.0, 12.4, 11.0)), stroke(0.0, Rect::new(10.0, 11.0, 11.0, 12.4))];
         // 一 is not in the reference.
-        p.glyphs[1].strokes = vec![stroke(0, Rect::new(0.0, 0.0, 3.0, 0.3))];
+        p.glyphs[1].strokes = vec![stroke(0.0, Rect::new(0.0, 0.0, 3.0, 0.3))];
         let (pt, n) = estimate_pt_per_em(&p, &reference()).unwrap();
         assert!((pt - 3.0).abs() < 1e-6 && n == 1, "{pt}");
-        // Strokes from two pages do not make one box.
-        p.glyphs[0].strokes[1] = stroke(1, Rect::new(10.0, 11.0, 11.0, 12.4));
+        // Strokes placed apart (one moved on its own) do not make one box.
+        p.glyphs[0].strokes[1] = stroke(1.0, Rect::new(10.0, 11.0, 11.0, 12.4));
         assert_eq!(estimate_pt_per_em(&p, &reference()), None);
     }
 }

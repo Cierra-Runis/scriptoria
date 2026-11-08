@@ -1,20 +1,23 @@
 //! The open project, shared by the views. Changes go through here: it marks the project modified,
 //! tells the views which glyphs changed (each glyph has a revision number for their caches) and
-//! keeps what changed for undo.
+//! keeps what changed for undo. It also holds the project's reference font.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
-use scriptoria_project::{FontInfo, Glyph, Project, StrokeOrigin};
+use scriptoria_project::{FontInfo, Glyph, Project, Reference, StrokeOrigin};
+use scriptoria_reference::ReferenceFont;
 
 /// How many changes can be undone.
 const UNDO_LIMIT: usize = 200;
 
 /// What a change replaced: kept for undo (and what an undo replaced, for redo).
 enum Change {
-    Glyph(usize, Glyph),
+    /// Glyphs, by index, as they were.
+    Glyphs(Vec<(usize, Glyph)>),
     Font(FontInfo),
 }
 
@@ -23,6 +26,8 @@ pub struct Document {
     /// The project's folder, once opened or saved.
     pub folder: Option<PathBuf>,
     pub modified: bool,
+    /// The font characters are placed after, if any.
+    reference: Option<Arc<ReferenceFont>>,
     /// Per glyph, bumped whenever it changes.
     revisions: Vec<u64>,
     next_revision: u64,
@@ -45,14 +50,34 @@ pub enum DocumentEvent {
 impl EventEmitter<DocumentEvent> for Document {}
 
 impl Document {
-    pub fn new(project: Project, folder: Option<PathBuf>) -> Self {
+    /// A project to work on. Its reference font is opened; a project without one gets the font
+    /// installed here, if any (see [`crate::assign::system_reference`]).
+    pub fn new(mut project: Project, folder: Option<PathBuf>) -> Self {
+        let reference = match &project.font.reference {
+            Some(r) => crate::assign::open_reference(r).ok(),
+            None => crate::assign::system_reference().map(|(r, font)| {
+                project.font.reference = Some(r);
+                font
+            }),
+        };
         let revisions = vec![0; project.glyphs.len()];
-        Document { project, folder, modified: false, revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
+        Document { project, folder, modified: false, reference: reference.map(Arc::new), revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
     }
 
     /// The glyph's revision: changes whenever the glyph does.
     pub fn revision(&self, glyph: usize) -> u64 {
         self.revisions.get(glyph).copied().unwrap_or(0)
+    }
+
+    pub fn reference(&self) -> Option<&Arc<ReferenceFont>> {
+        self.reference.as_ref()
+    }
+
+    /// Uses another reference font (or none), as a change to undo.
+    pub fn set_reference(&mut self, reference: Option<Reference>, cx: &mut Context<Self>) -> Result<(), scriptoria_reference::Error> {
+        self.reference = reference.as_ref().map(crate::assign::open_reference).transpose()?.map(Arc::new);
+        self.update_font(|f| f.reference = reference, cx);
+        Ok(())
     }
 
     /// The project's name for titles: its folder's name, or its family name before it is saved.
@@ -75,13 +100,47 @@ impl Document {
 
     /// Changes a glyph through `f`, as one step to undo (none if `f` changes nothing).
     pub fn update_glyph(&mut self, glyph: usize, f: impl FnOnce(&mut Glyph), cx: &mut Context<Self>) {
-        let Some(g) = self.project.glyphs.get_mut(glyph) else { return };
-        let before = g.clone();
-        f(g);
-        if *g != before {
-            self.record(Change::Glyph(glyph, before));
-            self.changed(glyph, cx);
+        let mut f = Some(f);
+        self.update_glyphs(&[glyph], |g| (f.take().expect("one glyph"))(g), cx);
+    }
+
+    /// Changes glyphs through `f`, all as one step to undo; returns how many changed.
+    pub fn update_glyphs(&mut self, glyphs: &[usize], mut f: impl FnMut(&mut Glyph), cx: &mut Context<Self>) -> usize {
+        let mut before = Vec::new();
+        for &i in glyphs {
+            let Some(g) = self.project.glyphs.get_mut(i) else { continue };
+            let was = g.clone();
+            f(g);
+            if *g != was {
+                before.push((i, was));
+            }
         }
+        let changed = before.len();
+        if changed > 0 {
+            for &(i, _) in &before {
+                self.changed(i, cx);
+            }
+            self.record(Change::Glyphs(before));
+        }
+        changed
+    }
+
+    /// Places glyphs as the reference font places their characters (see
+    /// [`crate::assign::fit`]), as one step to undo; returns how many the reference has.
+    pub fn fit_to_reference(&mut self, glyphs: &[usize], cx: &mut Context<Self>) -> usize {
+        let Some(reference) = self.reference.clone() else { return 0 };
+        let info = self.project.font.clone();
+        let mut found = 0;
+        self.update_glyphs(
+            glyphs,
+            |g| {
+                if !g.strokes.is_empty() && crate::assign::fit(g, &info, &reference) {
+                    found += 1;
+                }
+            },
+            cx,
+        );
+        found
     }
 
     /// Changes the font's settings through `f`, as one step to undo (none if `f` changes nothing).
@@ -122,12 +181,21 @@ impl Document {
     /// Puts back what a change replaced; returns what that replaces in turn.
     fn apply(&mut self, change: Change, cx: &mut Context<Self>) -> Change {
         match change {
-            Change::Glyph(glyph, g) => {
-                let replaced = std::mem::replace(&mut self.project.glyphs[glyph], g);
-                self.changed(glyph, cx);
-                Change::Glyph(glyph, replaced)
+            Change::Glyphs(glyphs) => {
+                let replaced = glyphs
+                    .into_iter()
+                    .map(|(i, g)| {
+                        let was = std::mem::replace(&mut self.project.glyphs[i], g);
+                        self.changed(i, cx);
+                        (i, was)
+                    })
+                    .collect();
+                Change::Glyphs(replaced)
             }
             Change::Font(font) => {
+                if font.reference != self.project.font.reference {
+                    self.reference = font.reference.as_ref().and_then(|r| crate::assign::open_reference(r).ok()).map(Arc::new);
+                }
                 let replaced = std::mem::replace(&mut self.project.font, font);
                 self.touch(cx);
                 cx.emit(DocumentEvent::Font);
@@ -148,15 +216,14 @@ impl Document {
     /// Adds written strokes (from page `page` of source `source`, in writing order) to the end of a
     /// glyph (see [`crate::assign::assign`]).
     pub fn assign(&mut self, glyph: usize, source: &str, page: usize, strokes: &[Stroke], cx: &mut Context<Self>) {
-        if glyph >= self.project.glyphs.len() {
-            return;
-        }
+        let Some(before) = self.project.glyphs.get(glyph).cloned() else { return };
         let list: Vec<(&Stroke, StrokeOrigin)> =
             strokes.iter().map(|s| (s, StrokeOrigin { source: source.to_string(), page, index: s.order })).collect();
-        let before = self.project.glyphs[glyph].clone();
-        crate::assign::assign(&mut self.project, glyph, &list);
-        self.record(Change::Glyph(glyph, before));
-        self.changed(glyph, cx);
+        crate::assign::assign(&mut self.project, glyph, &list, self.reference.as_deref());
+        if self.project.glyphs[glyph] != before {
+            self.changed(glyph, cx);
+            self.record(Change::Glyphs(vec![(glyph, before)]));
+        }
     }
 
     /// The strokes of a source some glyph uses: (page, index).

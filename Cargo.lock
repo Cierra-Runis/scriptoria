@@ -6418,6 +6418,7 @@ dependencies = [
  "scriptoria-ink",
  "scriptoria-outline",
  "scriptoria-project",
+ "scriptoria-reference",
  "scriptoria-skeleton",
  "scriptoria-testkit",
  "skrifa 0.49.0",
@@ -6459,6 +6460,16 @@ dependencies = [
  "kurbo 0.13.1",
  "serde",
  "toml 1.2.0+spec-1.1.0",
+]
+
+[[package]]
+name = "scriptoria-reference"
+version = "0.1.0"
+dependencies = [
+ "kurbo 0.13.1",
+ "memmap2",
+ "scriptoria-font",
+ "skrifa 0.49.0",
 ]
 
 [[package]]

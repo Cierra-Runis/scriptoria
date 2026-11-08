@@ -251,10 +251,11 @@ fn the_project_exports_as_a_font(cx: &mut TestAppContext) {
     // At 900 the glyph is the strokes as written, placed as in the project: a contour per stroke
     // piece, in writing order, each starting where its stroke was put down.
     let g = glyph(&workspace, cx);
+    let pen = workspace.read_with(cx, |w, cx| w.document().read(cx).project.font.pen_scale());
     let pieces: Vec<(Point, f64)> = g
         .strokes
         .iter()
-        .flat_map(|s| s.skeleton.iter().map(move |p| (s.placement * p.circles[0].0, p.circles[0].1 * s.placement.determinant().abs().sqrt())))
+        .flat_map(|s| s.skeleton.iter().map(move |p| (s.placement * p.circles[0].0, p.circles[0].1 * pen)))
         .collect();
     let gid = font.charmap().map('世').expect("世 is in the font");
     let location = font.axes().location([("wght", 900.0)]);
@@ -291,4 +292,67 @@ fn the_weight_of_the_handwriting_is_set_with_a_slider(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert_eq!(written(cx), 900.0);
+}
+
+/// A reference font with one glyph, 世, its box `SHI_FRAME`, written to a file.
+const SHI_FRAME: Rect = Rect::new(100.0, -50.0, 900.0, 750.0);
+
+fn reference_font(dir: &std::path::Path) -> PathBuf {
+    use scriptoria_font::{Axis, FontSource, Glyph as FontGlyph, build};
+    let mut outline = scriptoria_ink::kurbo::BezPath::new();
+    let r = SHI_FRAME;
+    outline.move_to((r.x0, r.y0));
+    outline.line_to((r.x0, r.y1));
+    outline.line_to((r.x1, r.y1));
+    outline.line_to((r.x1, r.y0));
+    outline.close_path();
+    let glyph = FontGlyph { name: "uni4E16".into(), chars: vec!['世'], advance: 1000.0, masters: [100.0, 400.0, 900.0].map(|w| (w, outline.clone())).to_vec() };
+    let source = FontSource {
+        family: "Reference".into(),
+        units_per_em: 1000,
+        ascender: 880,
+        descender: -120,
+        axis: Axis { min: 100.0, default: 400.0, max: 900.0 },
+        instances: vec![],
+        glyphs: vec![glyph],
+        accuracy: 0.5,
+        tolerance: 0.0,
+    };
+    let file = dir.join("reference.ttf");
+    std::fs::write(&file, build(&source).unwrap()).unwrap();
+    file
+}
+
+#[gpui_kit::test]
+fn new_glyphs_take_the_reference_place(cx: &mut TestAppContext) {
+    let (workspace, cx) = open(vec![], cx);
+    let dir = std::env::temp_dir().join(format!("scriptoria-reference-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = reference_font(&dir);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    document.update(cx, |d, cx| {
+        d.set_reference(Some(scriptoria_project::Reference { file, face: 0 }), cx).unwrap();
+        d.add_chars("世", cx);
+        d.assign(0, "s1", 2, &shi_strokes(), cx);
+    });
+    let info = document.read_with(cx, |d, _| d.project.font.clone());
+    let placed = |g: &Glyph| g.ink_bounds(&info).unwrap();
+    let b = placed(&glyph(&workspace, cx));
+    assert!((b.center() - SHI_FRAME.center()).hypot() < 0.5, "{b:?}");
+    assert!((b.area() / SHI_FRAME.area() - 1.0).abs() < 0.01, "{b:?}");
+    assert_eq!(glyph(&workspace, cx).advance, 1000.0);
+
+    // Moved and shrunk, the glyph goes back with "place by reference", in one undo step.
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.double_click(("cell", 0usize), cx);
+    });
+    cx.run_until_parked();
+    let fitted = glyph(&workspace, cx);
+    document.update(cx, |d, cx| d.update_glyph(0, |g| g.transform_strokes(&[0, 1, 2, 3, 4], scriptoria_ink::kurbo::Affine::scale(0.5)), cx));
+    cx.update(|window, cx| window.click("fit-reference", cx));
+    assert!((placed(&glyph(&workspace, cx)).center() - SHI_FRAME.center()).hypot() < 0.5);
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_ne!(glyph(&workspace, cx), fitted);
+    std::fs::remove_dir_all(&dir).ok();
 }

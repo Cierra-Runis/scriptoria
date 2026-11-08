@@ -12,8 +12,9 @@ use std::sync::Arc;
 use gpui::TestSupportExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
+use gpui::component::notification::Notification;
 use gpui::component::slider::{Slider, SliderEvent, SliderState};
-use gpui::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClickEvent, ContentMask, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -31,7 +32,8 @@ use crate::font::{AXIS, Weights};
 
 /// Tessellation tolerance (pt, the strokes' own units): an em of 4.5 pt is some 600 px here.
 const TOLERANCE: f32 = 0.001;
-/// How closely regenerated outlines follow the strokes (pt), as in the font.
+/// How closely regenerated outlines follow the strokes (pt, made font units by the pen scale), as
+/// in the font.
 const PRECISION: f64 = 0.004;
 /// How near (px) the pointer must be to a stroke, a handle or the advance line to grab it.
 const HIT_PX: f64 = 4.0;
@@ -45,8 +47,9 @@ const ZOOM_PER_PX: f32 = 0.004;
 const NUDGE: f64 = 10.0;
 /// The color of selected strokes (as on the pages).
 const SELECTED: Hsla = Hsla { h: 0.75, s: 0.8, l: 0.5, a: 1.0 };
-/// A full-width character's larger side, as a fraction of the em.
-const FULL_WIDTH_FACE: f64 = 0.9;
+/// The face of a full-width character (its larger side), as a fraction of the em: shown as a
+/// guide, and what "full width" scales to.
+const FACE: f64 = 0.9;
 
 /// Font units (y up) → window: `origin + (x, −y) · scale`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -85,54 +88,86 @@ impl View {
     }
 }
 
-/// What a stroke looks like, made from what it is and not from where it is placed, so that it is
-/// kept while the stroke is moved. Page coordinates.
+/// The linear part of a placement (its scale and flip, not where it puts the stroke).
+fn linear(placement: Affine) -> [f64; 4] {
+    let [a, b, c, d, _, _] = placement.as_coeffs();
+    [a, b, c, d]
+}
+
+/// What a stroke looks like, made from what it is and the linear part of its placement, so that
+/// it is kept while the stroke is moved.
 struct Shapes {
     skeleton: Vec<SkeletonPiece>,
     outline: Outline,
+    /// The outline as written (page coordinates).
     original: Option<Rc<Mesh>>,
+    /// What the plan and the regenerated outline are for.
+    linear: [f64; 4],
     plan: Option<Arc<Plan>>,
-    /// The outline regenerated at a radius scale: (scale, outline, mesh).
+    /// The outline regenerated at a radius scale: (scale, outline, mesh), in font units before the
+    /// placement's translation. Its strokes keep the pen's width (see `FontInfo::pen_scale`).
     regenerated: Option<(f64, BezPath, Option<Rc<Mesh>>)>,
 }
 
 impl Shapes {
     fn new(s: &GlyphStroke) -> Self {
         let original = Mesh::from_path_with_tolerance(&s.outline.path, shape(s.outline.kind), true, TOLERANCE).map(Rc::new);
-        Shapes { skeleton: s.skeleton.clone(), outline: s.outline.clone(), original, plan: None, regenerated: None }
+        Shapes { skeleton: s.skeleton.clone(), outline: s.outline.clone(), original, linear: linear(s.placement), plan: None, regenerated: None }
     }
 
+    /// Whether these are the shapes of a stroke (wherever it is placed).
     fn is(&self, s: &GlyphStroke) -> bool {
         self.skeleton == s.skeleton && self.outline == s.outline
     }
 
-    /// The outline shown (regenerated if asked for and ready) and how far a line's ink reaches
-    /// beyond it.
-    fn shown(&self, regenerated: bool) -> (&BezPath, f64) {
-        match (&self.regenerated, regenerated) {
-            (Some((_, path, _)), true) => (path, 0.0),
-            _ => match self.outline.kind {
-                OutlineKind::Filled => (&self.outline.path, 0.0),
-                OutlineKind::Line { width } => (&self.outline.path, width / 2.0),
-            },
+    /// Follows a change of the placement's scale or flip: the regenerated outline is made again.
+    fn follow(&mut self, placement: Affine) {
+        let l = linear(placement);
+        if self.linear.iter().zip(&l).any(|(a, b)| (a - b).abs() > 1e-9) {
+            self.linear = l;
+            self.plan = None;
+            self.regenerated = None;
         }
     }
 
-    fn mesh(&self, regenerated: bool) -> Option<Rc<Mesh>> {
-        match (&self.regenerated, regenerated) {
-            (Some((_, _, mesh)), true) => mesh.clone(),
-            _ => self.original.clone(),
+    fn regenerated(&self, wanted: bool) -> Option<&(f64, BezPath, Option<Rc<Mesh>>)> {
+        self.regenerated.as_ref().filter(|_| wanted)
+    }
+
+    /// The mesh shown and what puts it into font units.
+    fn mesh(&self, placement: Affine, regenerated: bool) -> Option<(Rc<Mesh>, Affine)> {
+        match self.regenerated(regenerated) {
+            Some((_, _, mesh)) => Some((mesh.clone()?, Affine::translate(placement.translation()))),
+            None => Some((self.original.clone()?, placement)),
         }
     }
 
-    fn bounds(&self, regenerated: bool) -> kurbo::Rect {
-        let (path, reach) = self.shown(regenerated);
-        path.bounding_box().inflate(reach, reach)
+    /// The shown ink's box (font units).
+    fn bounds(&self, placement: Affine, regenerated: bool) -> kurbo::Rect {
+        match self.regenerated(regenerated) {
+            Some((_, path, _)) => path.bounding_box() + placement.translation(),
+            None => {
+                let reach = match self.outline.kind {
+                    OutlineKind::Filled => 0.0,
+                    OutlineKind::Line { width } => width / 2.0,
+                };
+                placement.transform_rect_bbox(self.outline.path.bounding_box().inflate(reach, reach))
+            }
+        }
     }
 
-    /// Whether ink of the shown outline is within `tolerance` of `p`.
-    fn hit(&self, p: kurbo::Point, tolerance: f64, regenerated: bool) -> bool {
-        let (path, reach) = self.shown(regenerated);
+    /// Whether ink shown is within `tolerance` of `q` (font units).
+    fn hit(&self, placement: Affine, q: kurbo::Point, tolerance: f64, regenerated: bool) -> bool {
+        let (path, p, reach, tolerance) = match self.regenerated(regenerated) {
+            Some((_, path, _)) => (path, q - placement.translation(), 0.0, tolerance),
+            None => {
+                let reach = match self.outline.kind {
+                    OutlineKind::Filled => 0.0,
+                    OutlineKind::Line { width } => width / 2.0,
+                };
+                (&self.outline.path, placement.inverse() * q, reach, tolerance / placement.determinant().abs().sqrt())
+            }
+        };
         let r = reach + tolerance;
         if !path.bounding_box().inflate(r, r).contains(p) {
             return false;
@@ -189,6 +224,8 @@ pub struct GlyphView {
     planning: Option<Task<()>>,
     /// The radius scales (thinnest, boldest) the plans in `shapes` serve.
     planned_for: (f64, f64),
+    /// The pen scale (font units per page unit) the plans are for.
+    planned_pen: f64,
     /// The weight shown (`wght`).
     weight: Entity<SliderState>,
     /// Show the strokes as written instead of regenerated from their skeletons.
@@ -237,6 +274,7 @@ impl GlyphView {
             shapes: Vec::new(),
             planning: None,
             planned_for: (0.0, 0.0),
+            planned_pen: 0.0,
             weight,
             original: false,
             selection: BTreeSet::new(),
@@ -316,7 +354,11 @@ impl GlyphView {
                     .strokes
                     .iter()
                     .map(|s| match old.iter().position(|o| o.is(s)) {
-                        Some(i) => old.swap_remove(i),
+                        Some(i) => {
+                            let mut shapes = old.swap_remove(i);
+                            shapes.follow(s.placement);
+                            shapes
+                        }
                         None => Shapes::new(s),
                     })
                     .collect();
@@ -337,11 +379,13 @@ impl GlyphView {
     /// Makes the outline plans strokes lack, on a background thread (again when done, for strokes
     /// added meanwhile).
     fn ensure_plans(&mut self, cx: &mut Context<Self>) {
-        // Plans serve the radius scales from the thinnest weight to the boldest; new ones when
-        // those change.
+        // Plans serve the radius scales from the thinnest weight to the boldest, at the pen's
+        // width; new ones when those change.
         let (thinnest, _, boldest) = self.weights(cx).scales();
-        if self.planned_for != (thinnest, boldest) {
+        let pen = self.pen(cx);
+        if self.planned_for != (thinnest, boldest) || self.planned_pen != pen {
             self.planned_for = (thinnest, boldest);
+            self.planned_pen = pen;
             for s in &mut self.shapes {
                 s.plan = None;
                 s.regenerated = None;
@@ -350,28 +394,29 @@ impl GlyphView {
         if self.planning.is_some() {
             return;
         }
-        let jobs: Vec<Vec<SkeletonPiece>> =
-            self.shapes.iter().filter(|s| s.plan.is_none() && !s.skeleton.is_empty()).map(|s| s.skeleton.clone()).collect();
+        let jobs: Vec<(Vec<SkeletonPiece>, [f64; 4])> =
+            self.shapes.iter().filter(|s| s.plan.is_none() && !s.skeleton.is_empty()).map(|s| (s.skeleton.clone(), s.linear)).collect();
         if jobs.is_empty() {
             return;
         }
-        let params = PlanParams { precision: PRECISION, weights: self.planned_for };
+        let params = PlanParams { precision: PRECISION * pen, weights: self.planned_for };
         let background = cx.background_executor().clone();
         self.planning = Some(cx.spawn(async move |this, cx| {
             let plans = background
                 .spawn(async move {
-                    let plans = crate::par_map(&jobs, |sk| {
-                        Arc::new(scriptoria_outline::plan(&crate::assign::skeleton_of(sk, Affine::IDENTITY), &params))
+                    let plans = crate::par_map(&jobs, |(sk, [a, b, c, d])| {
+                        let shape = Affine::new([*a, *b, *c, *d, 0.0, 0.0]);
+                        Arc::new(scriptoria_outline::plan(&crate::assign::skeleton_of(sk, shape, pen), &params))
                     });
                     jobs.into_iter().zip(plans).collect::<Vec<_>>()
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.planning = None;
-                // Plans for weights since changed are dropped.
-                let current = this.planned_for == params.weights;
-                for (skeleton, plan) in plans.into_iter().filter(|_| current) {
-                    for s in this.shapes.iter_mut().filter(|s| s.plan.is_none() && s.skeleton == skeleton) {
+                // Plans for weights or a pen since changed are dropped.
+                let current = this.planned_for == params.weights && this.planned_pen == pen;
+                for ((skeleton, linear), plan) in plans.into_iter().filter(|_| current) {
+                    for s in this.shapes.iter_mut().filter(|s| s.plan.is_none() && s.skeleton == skeleton && s.linear == linear) {
                         s.plan = Some(plan.clone());
                     }
                 }
@@ -387,15 +432,22 @@ impl GlyphView {
     fn regenerate(&mut self, cx: &mut Context<Self>) {
         let scale = self.scale(cx);
         let weight = WeightParams::scaled(scale);
+        // Regenerated outlines are in font units.
+        let tolerance = (TOLERANCE as f64 * self.pen(cx)) as f32;
         for s in &mut self.shapes {
             let Some(plan) = &s.plan else { continue };
             if s.regenerated.as_ref().is_some_and(|r| (r.0 - scale).abs() < 1e-9) {
                 continue;
             }
             let path = scriptoria_outline::expand(plan, &weight);
-            let mesh = Mesh::from_path_with_tolerance(&path, StrokeShape::Outline { non_zero: true }, true, TOLERANCE).map(Rc::new);
+            let mesh = Mesh::from_path_with_tolerance(&path, StrokeShape::Outline { non_zero: true }, true, tolerance).map(Rc::new);
             s.regenerated = Some((scale, path, mesh));
         }
+    }
+
+    /// Font units per page unit for stroke widths.
+    fn pen(&self, cx: &App) -> f64 {
+        self.document.read(cx).project.font.pen_scale()
     }
 
     // ---- Edits ----
@@ -452,7 +504,7 @@ impl GlyphView {
 
     /// The placed bounds of a stroke as shown (font units).
     fn stroke_bounds(&self, glyph: &Glyph, i: usize) -> Option<kurbo::Rect> {
-        Some(glyph.strokes.get(i)?.placement.transform_rect_bbox(self.shapes.get(i)?.bounds(self.regenerated())))
+        Some(self.shapes.get(i)?.bounds(glyph.strokes.get(i)?.placement, self.regenerated()))
     }
 
     fn selection_bounds(&self, glyph: &Glyph) -> Option<kurbo::Rect> {
@@ -464,11 +516,9 @@ impl GlyphView {
         let view = self.view()?;
         let glyph = self.glyph(cx)?;
         let q = view.to_font(pos);
-        (0..glyph.strokes.len().min(self.shapes.len())).rev().find(|&i| {
-            let t = glyph.strokes[i].placement;
-            let k = t.determinant().abs().sqrt();
-            self.shapes[i].hit(t.inverse() * q, HIT_PX / (view.scale as f64 * k), self.regenerated())
-        })
+        (0..glyph.strokes.len().min(self.shapes.len()))
+            .rev()
+            .find(|&i| self.shapes[i].hit(glyph.strokes[i].placement, q, HIT_PX / view.scale as f64, self.regenerated()))
     }
 
     /// What a drag does to the selection so far.
@@ -688,6 +738,9 @@ impl GlyphView {
         let (ink, accent, muted, line, paper) = (theme.foreground, SELECTED, theme.muted_foreground, theme.border, theme.background);
         let advance_color: Hsla = gpui::hsla(0.58, 0.85, 0.5, 1.0);
         let order_color: Hsla = gpui::hsla(0.0, 0.75, 0.52, 1.0);
+        // The reference glyph and the guides, faint.
+        let reference_color = muted.opacity(0.18);
+        let guide = gpui::hsla(0.33, 0.6, 0.45, 0.35);
         let doc = self.document.read(cx);
         let font = &doc.project.font;
         let (ascender, descender, upm) = (font.ascender as f64, font.descender as f64, font.units_per_em as f64);
@@ -696,19 +749,19 @@ impl GlyphView {
         let advance = self.drag_advance().unwrap_or(glyph.advance);
         let preview = self.drag_transform();
         let regenerated = self.regenerated();
-        // Per stroke: mesh, placement (with the drag so far), start, color.
-        let strokes: Vec<(Option<Rc<Mesh>>, Affine, Option<kurbo::Point>, Hsla)> = glyph
+        // Per stroke: mesh and what puts it into the em (with the drag so far), start, color.
+        let strokes: Vec<(Option<(Rc<Mesh>, Affine)>, Option<kurbo::Point>, Hsla)> = glyph
             .strokes
             .iter()
             .zip(&self.shapes)
             .enumerate()
             .map(|(i, (s, shapes))| {
                 let selected = self.selection.contains(&i);
-                let t = match preview {
-                    Some(p) if selected => p * s.placement,
-                    _ => s.placement,
+                let moved = match preview {
+                    Some(p) if selected => p,
+                    _ => Affine::IDENTITY,
                 };
-                let start = s.skeleton.first().and_then(|p| p.circles.first()).map(|&(c, _)| t * c);
+                let start = s.skeleton.first().and_then(|p| p.circles.first()).map(|&(c, _)| moved * s.placement * c);
                 let color = if selected {
                     accent
                 } else if self.hovered == Some(i) {
@@ -716,9 +769,15 @@ impl GlyphView {
                 } else {
                     ink
                 };
-                (shapes.mesh(regenerated), t, start, color)
+                (shapes.mesh(s.placement, regenerated).map(|(mesh, t)| (mesh, moved * t)), start, color)
             })
             .collect();
+        // The reference font's glyph, underneath.
+        let reference = doc
+            .reference()
+            .and_then(|r| glyph.chars.first().and_then(|&c| r.glyph(c, upm)))
+            .and_then(|g| Mesh::from_path_with_tolerance(&g.outline, StrokeShape::Outline { non_zero: true }, false, 1.0))
+            .map(Rc::new);
         let selection_box = self.selection_bounds(glyph).map(|b| match preview {
             Some(p) => p.transform_rect_bbox(b),
             None => b,
@@ -762,13 +821,25 @@ impl GlyphView {
                     label(window, cx, &format!("字宽 {}", units(advance)), top, advance_color, px(11.0));
 
                     let to_window = view.affine();
-                    for (mesh, t, _, color) in &strokes {
-                        if let Some(mesh) = mesh {
+                    if let Some(mesh) = &reference {
+                        window.paint_path(mesh.to_path_affine(to_window), reference_color);
+                    }
+                    // The face (of a full-width character) and the em's middle lines.
+                    let face = em.inflate(-(1.0 - FACE) / 2.0 * em.width(), -(1.0 - FACE) / 2.0 * em.height());
+                    window.paint_quad(quad(view.rect(face), px(0.0), gpui::transparent_black(), px(1.0), guide, Default::default()));
+                    let middle = em.center();
+                    for (a, b) in [((em.x0, middle.y), (em.x1, middle.y)), ((middle.x, em.y0), (middle.x, em.y1))] {
+                        let r = view.rect(kurbo::Rect::from_points(a, b));
+                        let line = Bounds::new(r.origin - point(px(0.5), px(0.5)), size(r.size.width.max(px(1.0)), r.size.height.max(px(1.0))));
+                        window.paint_quad(quad(line, px(0.0), guide, px(0.0), gpui::transparent_black(), Default::default()));
+                    }
+                    for (mesh, _, color) in &strokes {
+                        if let Some((mesh, t)) = mesh {
                             window.paint_path(mesh.to_path_affine(to_window * *t), *color);
                         }
                     }
                     // The writing order, at each stroke's start.
-                    for (i, (_, _, start, _)) in strokes.iter().enumerate() {
+                    for (i, (_, start, _)) in strokes.iter().enumerate() {
                         let Some(start) = start else { continue };
                         let c = view.to_window(*start);
                         let dot = Bounds::new(c - point(px(3.0), px(3.0)), size(px(6.0), px(6.0)));
@@ -912,10 +983,11 @@ impl Render for GlyphView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let doc = self.document.read(cx);
         let font = doc.project.font.clone();
+        let has_reference = doc.reference().is_some();
         let (title, name, count, bearings) = match doc.project.glyphs.get(self.glyph) {
             Some(g) => {
                 let code = g.chars.iter().map(|c| format!("U+{:04X}", *c as u32)).collect::<Vec<_>>().join(" ");
-                let bearings = g.bounds().map(|b| (b.x0, g.advance - b.x1));
+                let bearings = g.ink_bounds(&doc.project.font).map(|b| (b.x0, g.advance - b.x1));
                 (g.chars.iter().collect::<String>(), format!("{} · {code}", g.name), g.strokes.len(), bearings)
             }
             None => (String::new(), "字形已不存在".into(), 0, None),
@@ -941,11 +1013,25 @@ impl Render for GlyphView {
                 Some((l, r)) => format!("左边距 {} · 右边距 {}", units(l), units(r)),
                 None => String::new(),
             }))
-            .child(Button::new("center").small().label("左右居中").on_click(cx.listener(|this, _, _, cx| this.edit(cx, Glyph::center))))
+            .child(Button::new("fit-reference").small().label("按参考摆放").disabled(!has_reference).tooltip("照参考字体里这个字的位置和大小摆放（强度见左侧设置）").on_click(cx.listener(
+                |this, _, window, cx| {
+                    let glyph = this.glyph;
+                    if this.document.update(cx, |d, cx| d.fit_to_reference(&[glyph], cx)) == 0 {
+                        window.push_notification(Notification::warning("参考字体里没有这个字"), cx);
+                    }
+                },
+            )))
+            .child(Button::new("center").small().label("左右居中").on_click(cx.listener({
+                let font = font.clone();
+                move |this, _, _, cx| {
+                    let font = font.clone();
+                    this.edit(cx, |g| g.center(&font));
+                }
+            })))
             .child(Button::new("full-width").small().label("全角放置").tooltip("缩放到字面占字身框的 90%，居中，字宽 1 em").on_click(cx.listener(
                 move |this, _, _, cx| {
                     let font = font.clone();
-                    this.edit(cx, |g| g.fit_full_width(&font, FULL_WIDTH_FACE));
+                    this.edit(cx, |g| g.fit_full_width(&font, FACE));
                 },
             )));
 

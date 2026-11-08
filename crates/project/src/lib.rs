@@ -18,7 +18,10 @@
 //!
 //! The glyph files open in a browser, the glyph upright. See [`svg`] for their details.
 
+mod skeleton;
 mod svg;
+
+pub use skeleton::Node;
 
 use std::path::{Path, PathBuf};
 

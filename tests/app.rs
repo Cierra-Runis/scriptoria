@@ -733,3 +733,75 @@ fn sets_of_characters_are_added_at_once(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert_eq!(count(cx), 0);
 }
+
+#[gpui_kit::test]
+fn skeletons_are_edited_circle_by_circle(cx: &mut TestAppContext) {
+    use scriptoria::app::glyph_view::Mode;
+    let (workspace, view, cx) = open_shi(cx);
+    let before = glyph(&workspace, cx);
+    let circles = |g: &Glyph| g.strokes[0].skeleton[0].circles.clone();
+    cx.update(|window, cx| {
+        window.click("mode-skeleton", cx);
+        window.render_frame(cx);
+    });
+    assert_eq!(view.read_with(cx, |v, _| v.mode()), Mode::Skeleton);
+
+    // A circle dragged: it moves (in the page's units), the others stay, the pen stays.
+    let at = view.read_with(cx, |v, cx| v.circle_to_window((0, 0, 1), cx)).expect("laid out");
+    cx.update(|window, cx| window.drag(at, at + point(px(30.0), px(0.0)), cx));
+    let dragged = glyph(&workspace, cx);
+    let (a, b) = (circles(&before), circles(&dragged));
+    assert!((b[1].0 - a[1].0).hypot() > 0.0 && b[0] == a[0] && b[2] == a[2] && b[1].1 == a[1].1);
+    assert_eq!(dragged.strokes[0].pen, before.strokes[0].pen);
+    assert_eq!(view.read_with(cx, |v, _| v.selected_circles()), [(0, 0, 1)]);
+
+    // Its radius made larger; then it is removed.
+    cx.update(|window, cx| window.press("]", cx));
+    let larger = glyph(&workspace, cx);
+    assert!((circles(&larger)[1].1 / a[1].1 - 1.1).abs() < 1e-9);
+    cx.update(|window, cx| window.press("delete", cx));
+    assert_eq!(circles(&glyph(&workspace, cx)).len(), a.len() - 1);
+    // Each one step back.
+    cx.update(|window, cx| {
+        window.press("ctrl-z", cx);
+        window.press("ctrl-z", cx);
+        window.press("ctrl-z", cx);
+    });
+    assert_eq!(glyph(&workspace, cx), before);
+
+    // A double click on the centerline between the first two circles adds one there.
+    let middle = {
+        let s = &before.strokes[0];
+        s.placement * scriptoria_ink::kurbo::ParamCurve::eval(&s.skeleton[0].spine[0], 0.5)
+    };
+    let at = view.read_with(cx, |v, _| v.font_to_window(middle)).unwrap();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let canvas = window.find("glyph-canvas").bounds();
+        window.click_with_options("glyph-canvas", gpui_kit::test::ClickOptions::new().with_offset(at - canvas.origin).with_count(2), cx);
+    });
+    assert_eq!(circles(&glyph(&workspace, cx)).len(), a.len() + 1);
+    assert_eq!(view.read_with(cx, |v, _| v.selected_circles()), [(0, 0, 1)]);
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+
+    // Smoothing evens the skeleton out (the ends stay).
+    cx.update(|window, cx| {
+        window.press("escape", cx);
+        window.click("smooth-skeleton", cx);
+    });
+    let smooth = glyph(&workspace, cx);
+    assert_ne!(smooth.strokes, before.strokes);
+    assert_eq!(circles(&smooth)[0], a[0]);
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+
+    // A whole stroke made thicker: its pen, nothing else.
+    cx.update(|window, cx| {
+        window.click("mode-strokes", cx);
+        window.click(("stroke", 1usize), cx);
+        window.click("pen-thicker", cx);
+    });
+    let thicker = glyph(&workspace, cx);
+    assert!((thicker.strokes[1].pen / before.strokes[1].pen - 1.1).abs() < 1e-9);
+    assert_eq!(thicker.strokes[1].skeleton, before.strokes[1].skeleton);
+    assert_eq!(thicker.strokes[0], before.strokes[0]);
+}

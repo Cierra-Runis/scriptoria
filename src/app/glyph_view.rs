@@ -4,8 +4,10 @@
 //! as the font's quadratic splines. Strokes are selected (click, box, the list beside) and moved
 //! (drag, arrow keys), scaled (the selection box's corners), stretched (its edges), turned (the
 //! handle above it), turned, flipped, stretched and slanted by the numbers (the panel beside),
-//! deleted and reordered; their widths stay the pen's through all of it. The advance is dragged or
-//! typed. Every change is one step to undo.
+//! deleted and reordered; their widths stay the pen's through all of it. In the skeleton mode, the
+//! circles of their skeletons are moved, made larger or smaller, removed and added (a double click
+//! on a centerline), and skeletons smoothed and thinned out; a stroke as a whole is made thinner or
+//! thicker by its pen. The advance is dragged or typed. Every change is one step to undo.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -27,7 +29,7 @@ use gpui::{
 use scriptoria_ink::StrokeShape;
 use scriptoria_ink::kurbo::{self, Affine, BezPath, ParamCurveNearest as _, Shape as _};
 use scriptoria_outline::{Plan, PlanParams, WeightParams};
-use scriptoria_project::{Glyph, GlyphStroke, Outline, OutlineKind, SkeletonPiece};
+use scriptoria_project::{Glyph, GlyphStroke, Node as SkeletonNode, Outline, OutlineKind, SkeletonPiece};
 
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::mesh::Mesh;
@@ -51,6 +53,8 @@ const ZOOM_RANGE: (f32, f32) = (0.2, 40.0);
 const ZOOM_PER_PX: f32 = 0.004;
 /// Arrow keys move the selection this far (font units); ten times as far with Shift.
 const NUDGE: f64 = 10.0;
+/// What `]` multiplies the selected circles' radii by (`[` divides).
+const RADIUS_STEP: f64 = 1.1;
 /// The face of a full-width character (its larger side), as a fraction of the em: shown as a
 /// guide, and what "full width" scales to.
 const FACE: f64 = 0.9;
@@ -196,6 +200,18 @@ impl Shapes {
     }
 }
 
+/// What the mouse and keys edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Whole strokes: selected, moved, scaled, turned.
+    Strokes,
+    /// The circles of the strokes' skeletons: moved, made larger or smaller, removed, added.
+    Skeleton,
+}
+
+/// A circle of the glyph's skeletons: (stroke, piece, place in the piece).
+pub type GlyphNode = (usize, usize, usize);
+
 /// Which points of the outlines are shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nodes {
@@ -335,6 +351,8 @@ enum DragKind {
     Stretch { anchor: kurbo::Point, edge: kurbo::Point, across: bool },
     /// Turning the selection about `center` (font units).
     Rotate { center: kurbo::Point },
+    /// Moving the selected skeleton circles.
+    Circles,
     /// Moving the advance line, from `from`.
     Advance { from: f64 },
     /// A selection box; with `add`, added to the selection.
@@ -385,6 +403,10 @@ pub struct GlyphView {
     original: bool,
     /// Whether the outline's points and handles are shown, and as what curves.
     nodes: Nodes,
+    /// What the mouse and keys edit: whole strokes, or their skeletons' circles.
+    mode: Mode,
+    /// The skeleton circles selected.
+    circles: BTreeSet<GlyphNode>,
     selection: BTreeSet<usize>,
     hovered: Option<usize>,
     zoom: f32,
@@ -442,6 +464,8 @@ impl GlyphView {
             weight,
             original: false,
             nodes: Nodes::Hidden,
+            mode: Mode::Strokes,
+            circles: BTreeSet::new(),
             selection: BTreeSet::new(),
             hovered: None,
             zoom: 1.0,
@@ -556,6 +580,9 @@ impl GlyphView {
         self.shapes = shapes;
         self.selection.retain(|&i| i < n);
         self.hovered = self.hovered.filter(|&h| h < n);
+        if let Some(glyph) = self.document.read(cx).project.glyphs.get(self.glyph) {
+            self.circles.retain(|&(s, p, i)| glyph.strokes.get(s).is_some_and(|st| st.has_node((p, i))));
+        }
         self.advance.update(cx, |s, cx| s.set_value(units(advance), window, cx));
         self.regenerate(cx);
         self.ensure_plans(cx);
@@ -720,6 +747,185 @@ impl GlyphView {
         self.advance.update(cx, |s, cx| s.set_value(units(advance), window, cx));
     }
 
+    // ---- Skeletons ----
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Edits whole strokes or their skeletons from now on.
+    pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        self.circles.clear();
+        self.drag = None;
+        cx.notify();
+    }
+
+    /// The skeleton circles selected.
+    pub fn selected_circles(&self) -> Vec<GlyphNode> {
+        self.circles.iter().copied().collect()
+    }
+
+    /// Where a skeleton circle's center is in the window.
+    pub fn circle_to_window(&self, (s, p, i): GlyphNode, cx: &App) -> Option<Point<Pixels>> {
+        let stroke = self.glyph(cx)?.strokes.get(s)?;
+        let (c, _) = *stroke.skeleton.get(p)?.circles.get(i)?;
+        Some(self.view()?.to_window(stroke.placement * c))
+    }
+
+    /// The selected circles of each stroke that has some.
+    fn circles_by_stroke(&self) -> std::collections::BTreeMap<usize, Vec<SkeletonNode>> {
+        let mut by = std::collections::BTreeMap::<usize, Vec<SkeletonNode>>::new();
+        for &(s, p, i) in &self.circles {
+            by.entry(s).or_default().push((p, i));
+        }
+        by
+    }
+
+    /// The circle whose center is under a window point, the last written first.
+    fn circle_hit(&self, pos: Point<Pixels>, cx: &App) -> Option<GlyphNode> {
+        let (view, glyph) = (self.view()?, self.glyph(cx)?);
+        let r = HANDLE_PX + 2.0;
+        glyph.strokes.iter().enumerate().rev().find_map(|(s, stroke)| {
+            stroke.skeleton.iter().enumerate().find_map(|(p, piece)| {
+                piece.circles.iter().position(|&(c, _)| {
+                    let d = view.to_window(stroke.placement * c) - pos;
+                    f32::from(d.x).abs() <= r && f32::from(d.y).abs() <= r
+                })
+                .map(|i| (s, p, i))
+            })
+        })
+    }
+
+    /// The place on a centerline under a window point: (stroke, piece, segment, along it).
+    fn spine_hit(&self, pos: Point<Pixels>, cx: &App) -> Option<(usize, usize, usize, f64)> {
+        let (view, glyph) = (self.view()?, self.glyph(cx)?);
+        let q = view.to_font(pos);
+        let reach = HIT_PX / view.scale as f64;
+        let mut best: Option<((usize, usize, usize, f64), f64)> = None;
+        for (s, stroke) in glyph.strokes.iter().enumerate() {
+            for (p, piece) in stroke.skeleton.iter().enumerate() {
+                for (k, seg) in piece.spine.iter().enumerate() {
+                    let near = (stroke.placement * *seg).nearest(q, 1e-6);
+                    if near.distance_sq <= reach * reach && best.is_none_or(|b| near.distance_sq < b.1) {
+                        best = Some(((s, p, k, near.t), near.distance_sq));
+                    }
+                }
+            }
+        }
+        best.map(|b| b.0)
+    }
+
+    /// A move in font units as the same move in a stroke's page units.
+    fn page_delta(stroke: &GlyphStroke, d: kurbo::Vec2) -> kurbo::Vec2 {
+        let [a, b, c, e, _, _] = stroke.placement.as_coeffs();
+        (Affine::new([a, b, c, e, 0.0, 0.0]).inverse() * kurbo::Point::new(d.x, d.y)).to_vec2()
+    }
+
+    /// Moves the selected circles by `d` (font units), as one step to undo.
+    fn move_circles(&mut self, d: kurbo::Vec2, cx: &mut Context<Self>) {
+        let by = self.circles_by_stroke();
+        self.edit(cx, |g| {
+            for (&s, nodes) in &by {
+                if let Some(stroke) = g.strokes.get_mut(s) {
+                    let delta = Self::page_delta(stroke, d);
+                    stroke.move_nodes(nodes, delta);
+                }
+            }
+        });
+    }
+
+    /// Multiplies the selected circles' radii by `k`, as one step to undo.
+    fn scale_circles(&mut self, k: f64, cx: &mut Context<Self>) {
+        let by = self.circles_by_stroke();
+        self.edit(cx, |g| {
+            for (&s, nodes) in &by {
+                if let Some(stroke) = g.strokes.get_mut(s) {
+                    stroke.scale_radii(nodes, k);
+                }
+            }
+        });
+    }
+
+    /// Removes the selected circles (not a stroke's last ones), as one step to undo.
+    fn remove_circles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let by = self.circles_by_stroke();
+        let mut kept_last = false;
+        self.edit(cx, |g| {
+            for (&s, nodes) in &by {
+                if let Some(stroke) = g.strokes.get_mut(s) {
+                    kept_last |= !stroke.remove_nodes(nodes);
+                }
+            }
+        });
+        self.circles.clear();
+        if kept_last {
+            window.push_notification(Notification::warning("每一笔至少要留一个圆：要去掉整笔，在“选笔画”里删除"), cx);
+        }
+        cx.notify();
+    }
+
+    /// Adds a circle where a centerline is under a window point (and selects it); false if none is.
+    fn insert_circle(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some((s, p, k, t)) = self.spine_hit(pos, cx) else { return false };
+        let mut added = None;
+        self.edit(cx, |g| added = g.strokes.get_mut(s).and_then(|stroke| stroke.insert_node(p, k, t)));
+        if let Some((p, i)) = added {
+            self.circles = BTreeSet::from([(s, p, i)]);
+        }
+        cx.notify();
+        true
+    }
+
+    /// The strokes a skeleton-wide edit acts on: those with circles selected, else those selected,
+    /// else all of them.
+    fn skeleton_targets(&self) -> Vec<usize> {
+        let by: Vec<usize> = self.circles_by_stroke().into_keys().collect();
+        if !by.is_empty() { by } else { self.targets() }
+    }
+
+    /// Evens out the skeletons acted on, as one step to undo.
+    fn smooth_skeletons(&mut self, cx: &mut Context<Self>) {
+        let which = self.skeleton_targets();
+        self.circles.clear();
+        self.edit(cx, |g| {
+            for &s in &which {
+                if let Some(stroke) = g.strokes.get_mut(s) {
+                    stroke.smooth_skeleton();
+                }
+            }
+        });
+    }
+
+    /// Thins out the circles of the skeletons acted on (those within a tenth of the stroke's mean
+    /// radius of the line between the ones kept), as one step to undo; returns how many went.
+    fn simplify_skeletons(&mut self, cx: &mut Context<Self>) -> usize {
+        let which = self.skeleton_targets();
+        self.circles.clear();
+        let mut removed = 0;
+        self.edit(cx, |g| {
+            for &s in &which {
+                let Some(stroke) = g.strokes.get_mut(s) else { continue };
+                let radii: Vec<f64> = stroke.skeleton.iter().flat_map(|p| p.circles.iter().map(|c| c.1)).collect();
+                let mean = radii.iter().sum::<f64>() / radii.len().max(1) as f64;
+                removed += stroke.simplify_skeleton(0.1 * mean);
+            }
+        });
+        removed
+    }
+
+    /// Makes the strokes acted on thicker or thinner (their pen times `k`), as one step to undo.
+    fn scale_pens(&mut self, k: f64, cx: &mut Context<Self>) {
+        let which = self.targets();
+        self.edit(cx, |g| {
+            for &s in &which {
+                if let Some(stroke) = g.strokes.get_mut(s) {
+                    stroke.pen *= k;
+                }
+            }
+        });
+    }
+
     // ---- Geometry ----
 
     /// The placed bounds of a stroke as shown (font units).
@@ -774,6 +980,13 @@ impl GlyphView {
         }
     }
 
+    /// How far the selected circles have been dragged (font units).
+    fn drag_circles(&self) -> Option<kurbo::Vec2> {
+        let d = self.drag.filter(|d| d.moved && d.kind == DragKind::Circles)?;
+        let view = self.view()?;
+        Some(view.to_font(d.last) - view.to_font(d.start))
+    }
+
     /// The advance being dragged to.
     fn drag_advance(&self) -> Option<f64> {
         let d = self.drag.filter(|d| d.moved)?;
@@ -798,6 +1011,10 @@ impl GlyphView {
         window.focus(&self.focus, cx);
         cx.stop_propagation();
         let add = ev.modifiers.shift || ev.modifiers.secondary(cx);
+        // A double click on a centerline adds a circle there.
+        if self.mode == Mode::Skeleton && ev.button == MouseButton::Left && ev.click_count >= 2 && self.insert_circle(ev.position, cx) {
+            return;
+        }
         let kind = match ev.button {
             MouseButton::Middle => DragKind::Pan,
             MouseButton::Left => self.grab(ev.position, add, cx),
@@ -807,8 +1024,36 @@ impl GlyphView {
         cx.notify();
     }
 
+    /// In the skeleton mode: on a circle, selects it (with Ctrl or Shift, adds or removes it) and
+    /// moves the selected ones; elsewhere, drags out a box selecting circles.
+    fn grab_circle(&mut self, pos: Point<Pixels>, add: bool, cx: &mut Context<Self>) -> DragKind {
+        match self.circle_hit(pos, cx) {
+            Some(n) if add => {
+                if !self.circles.remove(&n) {
+                    self.circles.insert(n);
+                }
+                DragKind::Select { add }
+            }
+            Some(n) => {
+                if !self.circles.contains(&n) {
+                    self.circles = BTreeSet::from([n]);
+                }
+                DragKind::Circles
+            }
+            None => {
+                if !add {
+                    self.circles.clear();
+                }
+                DragKind::Select { add }
+            }
+        }
+    }
+
     fn grab(&mut self, pos: Point<Pixels>, add: bool, cx: &mut Context<Self>) -> DragKind {
         let Some(view) = self.view() else { return DragKind::Select { add } };
+        if self.mode == Mode::Skeleton {
+            return self.grab_circle(pos, add, cx);
+        }
         let near = |p: kurbo::Point, r: f32| {
             let d = view.to_window(p) - pos;
             f32::from(d.x).abs() <= r && f32::from(d.y).abs() <= r
@@ -901,8 +1146,27 @@ impl GlyphView {
         if self.drag.is_none_or(|d| d.button != ev.button) {
             return;
         }
-        let (transform, advance, area) = (self.drag_transform(), self.drag_advance(), self.drag_box());
+        let (transform, advance, area, circles) = (self.drag_transform(), self.drag_advance(), self.drag_box(), self.drag_circles());
         let Some(drag) = self.drag.take() else { return };
+        if let Some(d) = circles {
+            self.move_circles(d, cx);
+        }
+        if let (Some(area), DragKind::Select { add }, Mode::Skeleton) = (area, drag.kind, self.mode) {
+            // The circles whose centers are in the box.
+            let inside: Vec<GlyphNode> = self.glyph(cx).map_or_else(Vec::new, |g| {
+                g.strokes.iter().enumerate().flat_map(|(s, stroke)| {
+                    stroke.skeleton.iter().enumerate().flat_map(move |(p, piece)| {
+                        piece.circles.iter().enumerate().filter(move |(_, c)| area.contains(stroke.placement * c.0)).map(move |(i, _)| (s, p, i))
+                    })
+                }).collect()
+            });
+            if !add {
+                self.circles.clear();
+            }
+            self.circles.extend(inside);
+            cx.notify();
+            return;
+        }
         if let Some(t) = transform {
             let which = self.selected();
             self.edit(cx, |g| g.transform_strokes(&which, t));
@@ -969,6 +1233,31 @@ impl GlyphView {
         }
         let m = ev.keystroke.modifiers;
         let step = if m.shift { NUDGE * 10.0 } else { NUDGE };
+        if self.mode == Mode::Skeleton {
+            let has = !self.circles.is_empty();
+            match ev.keystroke.key.as_str() {
+                "left" if has => return self.move_circles(kurbo::Vec2::new(-step, 0.0), cx),
+                "right" if has => return self.move_circles(kurbo::Vec2::new(step, 0.0), cx),
+                "up" if has => return self.move_circles(kurbo::Vec2::new(0.0, step), cx),
+                "down" if has => return self.move_circles(kurbo::Vec2::new(0.0, -step), cx),
+                "[" if has => return self.scale_circles(1.0 / RADIUS_STEP, cx),
+                "]" if has => return self.scale_circles(RADIUS_STEP, cx),
+                "delete" | "backspace" if has => return self.remove_circles(window, cx),
+                "a" if m.secondary(cx) => {
+                    let all: Vec<GlyphNode> = self.glyph(cx).map_or_else(Vec::new, |g| {
+                        g.strokes.iter().enumerate().flat_map(|(s, st)| st.skeleton.iter().enumerate().flat_map(move |(p, piece)| (0..piece.circles.len()).map(move |i| (s, p, i)))).collect()
+                    });
+                    self.circles = all.into_iter().collect();
+                    return cx.notify();
+                }
+                "escape" => {
+                    self.circles.clear();
+                    return cx.notify();
+                }
+                "delete" | "backspace" | "left" | "right" | "up" | "down" => return,
+                _ => {}
+            }
+        }
         match ev.keystroke.key.as_str() {
             "up" if m.alt => self.reorder(true, cx),
             "down" if m.alt => self.reorder(false, cx),
@@ -1007,6 +1296,33 @@ impl GlyphView {
         let preview = self.drag_transform();
         let regenerated = self.regenerated();
         let scale = self.scale(cx);
+        // Circles being dragged: how far (font units), and which, by stroke.
+        let circle_drag = self.drag_circles().map(|d| (d, self.circles_by_stroke()));
+        // In the skeleton mode: each centerline (font units, as a polyline) and circle (center, radius,
+        // selected), as dragged so far.
+        let (spines, rings): (Vec<Vec<kurbo::Point>>, Vec<(kurbo::Point, f64, bool)>) = if self.mode == Mode::Skeleton {
+            let mut spines = Vec::new();
+            let mut rings = Vec::new();
+            for (i, s) in glyph.strokes.iter().enumerate() {
+                let mut s = s.clone();
+                if let Some((d, by)) = &circle_drag
+                    && let Some(moving) = by.get(&i)
+                {
+                    let delta = Self::page_delta(&s, *d);
+                    s.move_nodes(moving, delta);
+                }
+                for (p, piece) in s.skeleton.iter().enumerate() {
+                    spines.push(piece.spine.iter().flat_map(|seg| (0..=12).map(move |k| s.placement * kurbo::ParamCurve::eval(seg, k as f64 / 12.0))).collect());
+                    for (k, &(c, r)) in piece.circles.iter().enumerate() {
+                        rings.push((s.placement * c, r * s.pen * scale, self.circles.contains(&(i, p, k))));
+                    }
+                }
+            }
+            (spines, rings)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let (spine_color, circle_color) = (p.sky.hsla(), p.blue.hsla());
         // Per stroke: mesh and what puts it into the em (with the drag so far), start, color.
         let strokes: Vec<(Option<(Rc<Mesh>, Affine)>, Option<kurbo::Point>, Hsla)> = glyph
             .strokes
@@ -1020,7 +1336,9 @@ impl GlyphView {
                     _ => Affine::IDENTITY,
                 };
                 let start = s.skeleton.first().and_then(|p| p.circles.first()).map(|&(c, _)| moved * s.placement * c);
-                let color = if selected {
+                let color = if self.mode == Mode::Skeleton {
+                    ink.opacity(0.35)
+                } else if selected {
                     accent
                 } else if self.hovered == Some(i) {
                     advance_color
@@ -1030,7 +1348,13 @@ impl GlyphView {
                 // Turned, stretched or scaled by the drag: drawn from the skeleton at its new shape, so that
                 // its width stays the pen's (as it will be).
                 let reshaped = regenerated && !is_translation(moved) && !s.skeleton.is_empty();
-                let mesh = if reshaped {
+                let mesh = if let Some(moving) = circle_drag.as_ref().and_then(|(_, by)| by.get(&i)) {
+                    // Its circles being dragged: drawn from the skeleton as it will be.
+                    let mut s = s.clone();
+                    s.move_nodes(moving, Self::page_delta(&s, circle_drag.as_ref().expect("dragging").0));
+                    let [a, b, c, d, _, _] = s.placement.as_coeffs();
+                    capsules(&s.skeleton, Affine::new([a, b, c, d, 0.0, 0.0]), s.pen * scale).map(|m| (m, Affine::translate(s.placement.translation())))
+                } else if reshaped {
                     let placed = moved * s.placement;
                     let linear = Affine::new([placed.as_coeffs()[0], placed.as_coeffs()[1], placed.as_coeffs()[2], placed.as_coeffs()[3], 0.0, 0.0]);
                     capsules(&s.skeleton, linear, s.pen * scale).map(|m| (m, Affine::translate(placed.translation())))
@@ -1046,7 +1370,7 @@ impl GlyphView {
             .and_then(|r| glyph.chars.first().and_then(|&c| r.glyph(c, upm)))
             .and_then(|g| Mesh::from_path_with_tolerance(&g.outline, StrokeShape::Outline { non_zero: true }, false, 1.0))
             .map(Rc::new);
-        let selection_box = self.selection_bounds(glyph).map(|b| match preview {
+        let selection_box = self.selection_bounds(glyph).filter(|_| self.mode == Mode::Strokes).map(|b| match preview {
             Some(p) => p.transform_rect_bbox(b),
             None => b,
         });
@@ -1128,6 +1452,27 @@ impl GlyphView {
                         let badge = Bounds::new(c - point(px(22.0), px(22.0)), size(px(16.0), px(16.0)));
                         window.paint_quad(quad(badge, px(8.0), order_color, px(0.0), gpui::transparent_black(), Default::default()));
                         label_centered(window, cx, &(i + 1).to_string(), badge.center(), on_badge, px(10.0));
+                    }
+                    // The skeletons: centerlines, then circles (hollow; selected ones filled, with their radius).
+                    for line in &spines {
+                        let mut builder = PathBuilder::stroke(px(1.5));
+                        for (k, q) in line.iter().enumerate() {
+                            if k == 0 { builder.move_to(view.to_window(*q)) } else { builder.line_to(view.to_window(*q)) }
+                        }
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, spine_color);
+                        }
+                    }
+                    for &(c, r, selected) in &rings {
+                        let w = view.to_window(c);
+                        if selected {
+                            let rr = px((r as f32 * view.scale).max(4.0));
+                            let ring = Bounds::new(w - point(rr, rr), size(rr * 2.0, rr * 2.0));
+                            window.paint_quad(quad(ring, rr, gpui::transparent_black(), px(1.0), accent, Default::default()));
+                        }
+                        let dot = Bounds::new(w - point(px(3.5), px(3.5)), size(px(7.0), px(7.0)));
+                        let (fill, edge) = if selected { (accent, accent) } else { (paper, circle_color) };
+                        window.paint_quad(quad(dot, px(3.5), fill, px(1.5), edge, Default::default()));
                     }
                     // Points and handles: handles first, then off-curve points (round), then on-curve ones (square).
                     for node in &nodes {
@@ -1236,7 +1581,10 @@ impl GlyphView {
             .border_color(border)
             .child(div().px_2().py_1().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("笔画（按笔顺）"))
             .child(div().id("stroke-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
-            .child(self.render_transforms(cx))
+            .child(match self.mode {
+                Mode::Strokes => self.render_transforms(cx).into_any_element(),
+                Mode::Skeleton => self.render_skeleton_panel(cx).into_any_element(),
+            })
             .child(
                 h_flex()
                     .gap_1()
@@ -1254,6 +1602,40 @@ impl GlyphView {
                             .on_click(cx.listener(|this, _, _, cx| this.delete_selection(cx))),
                     ),
             )
+    }
+
+    /// The skeleton mode's tools: the selected circles' radii, removing them, smoothing and
+    /// thinning out the skeletons (of the strokes with circles selected, or else of those
+    /// selected, or else of all).
+    fn render_skeleton_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (border, muted) = (theme.border, theme.muted_foreground);
+        let n = self.circles.len();
+        let none = n == 0;
+        v_flex()
+            .gap_1()
+            .p_2()
+            .border_t_1()
+            .border_color(border)
+            .child(h_flex().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("骨架").child(div().ml_2().text_xs().text_color(muted).child(format!("已选 {n} 个圆"))))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(Button::new("radius-smaller").xsmall().label("半径 −").tooltip("选中的圆变小（[）").disabled(none).on_click(cx.listener(|this, _, _, cx| this.scale_circles(1.0 / RADIUS_STEP, cx))))
+                    .child(Button::new("radius-larger").xsmall().label("半径 ＋").tooltip("选中的圆变大（]）").disabled(none).on_click(cx.listener(|this, _, _, cx| this.scale_circles(RADIUS_STEP, cx))))
+                    .child(Button::new("remove-circles").xsmall().danger().label("删除圆").disabled(none).on_click(cx.listener(|this, _, window, cx| this.remove_circles(window, cx)))),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Button::new("smooth-skeleton").xsmall().label("平滑").tooltip("让圆心和半径与相邻的更连贯").on_click(cx.listener(|this, _, _, cx| this.smooth_skeletons(cx))))
+                    .child(Button::new("simplify-skeleton").xsmall().label("精简").tooltip("去掉几乎在相邻圆连线上的圆").on_click(cx.listener(|this, _, window, cx| {
+                        let removed = this.simplify_skeletons(cx);
+                        window.push_notification(Notification::info(format!("去掉了 {removed} 个圆")), cx);
+                    }))),
+            )
+            .child(div().text_xs().text_color(muted).child("拖动圆心移动；双击中心线加圆；方向键微调，[ ] 调半径，Delete 删除"))
     }
 
     /// A button showing the outlines' points as `nodes` (again: hiding them).
@@ -1297,6 +1679,14 @@ impl GlyphView {
                     .child(quick("flip-across", "⇋ 翻转", "左右翻转", Affine::scale_non_uniform(-1.0, 1.0)))
                     .child(quick("flip-up", "⇅ 翻转", "上下翻转", Affine::scale_non_uniform(1.0, -1.0))),
             )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .text_xs()
+                    .child(div().w(px(28.0)).child("粗细"))
+                    .child(Button::new("pen-thinner").xsmall().label("变细").tooltip("笔宽 ÷1.1：这一笔（或整个字）更细").on_click(cx.listener(|this, _, _, cx| this.scale_pens(1.0 / RADIUS_STEP, cx))))
+                    .child(Button::new("pen-thicker").xsmall().label("变粗").tooltip("笔宽 ×1.1").on_click(cx.listener(|this, _, _, cx| this.scale_pens(RADIUS_STEP, cx)))),
+            )
             .child(field("旋转", &self.turn, "turn", "°（逆时针）"))
             .child(field("横向", &self.scale_x, "scale-x", "%"))
             .child(field("纵向", &self.scale_y, "scale-y", "%"))
@@ -1311,6 +1701,9 @@ impl GlyphView {
     }
 
     fn status_text(&self, cx: &App) -> String {
+        if self.mode == Mode::Skeleton {
+            return "改骨架：点选或框选圆（Ctrl/Shift 加选，Ctrl+A 全选）· 拖动圆心移动 · 双击中心线加圆 · 方向键微调（Shift 加大）· [ ] 调半径 · Delete 删除圆 · 改的是骨架，原稿笔迹不变".into();
+        }
         let hints = "点选或框选笔画（Ctrl/Shift 加选，Ctrl+A 全选）· 拖动移动 · 选框四角等比缩放，边中点单向拉伸，上方圆点旋转（Shift 按 15°）· 方向键微调（Shift 加大）· Delete 删除 · Alt+↑/↓ 调整笔顺 · 拖蓝线改字宽 · 滚轮或中键拖动平移，Ctrl+滚轮缩放";
         let (Some(i), Some(glyph)) = (self.hovered, self.glyph(cx)) else { return hints.into() };
         let Some(s) = glyph.strokes.get(i) else { return hints.into() };
@@ -1395,7 +1788,9 @@ impl Render for GlyphView {
 
         // Below the canvas: the weight shown, the zoom, and what the mouse and keys do.
         let view_bar = h_flex()
-            .gap_3()
+            .flex_wrap()
+            .gap_x_3()
+            .gap_y_1()
             .px_3()
             .py_1()
             .border_t_1()
@@ -1403,6 +1798,12 @@ impl Render for GlyphView {
             .child(div().text_sm().child("字重"))
             .child(div().flex_shrink_0().w(px(200.0)).child(Slider::new(&self.weight)))
             .child(div().flex_shrink_0().w(px(120.0)).text_xs().child(format!("wght {wght:.0} · ×{scale:.2}")))
+            .child(
+                Button::new("mode-strokes").small().label("选笔画").selected(self.mode == Mode::Strokes).tooltip("选择、移动、缩放、旋转整笔").on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Strokes, cx))),
+            )
+            .child(
+                Button::new("mode-skeleton").small().label("改骨架").selected(self.mode == Mode::Skeleton).tooltip("编辑笔画骨架上的圆：位置和半径").on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Skeleton, cx))),
+            )
             .child(
                 Button::new("original")
                     .small()

@@ -7,4 +7,5 @@ description = "A handwriting font project: font settings, glyphs and their strok
 [dependencies]
 kurbo = "0.13"
 serde = { version = "1", features = ["derive"] }
+scriptoria-template = { path = "../template" }
 toml = "1"

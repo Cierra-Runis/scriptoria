@@ -44,6 +44,9 @@ fn sample() -> Project {
     ];
     p.glyphs[1].strokes = vec![stroke(3.0, Some(StrokeOrigin { source, page: 0, index: 7 }), OutlineKind::Filled)];
     p.glyphs[1].advance = 612.5;
+    // A practice sheet: its id and grid come back too.
+    let first = p.new_template(&['世', 'A']).id;
+    assert_eq!(p.new_template(&['a']).id, first + 1);
     p
 }
 

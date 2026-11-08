@@ -383,7 +383,8 @@ impl Viewer {
             self.selection.clear();
         }
         for (i, s) in self.page.ink.strokes.iter().enumerate().take(self.visible) {
-            if contains(s.bbox.center()) {
+            // A practice sheet's own drawing is not handwriting.
+            if contains(s.bbox.center()) && !crate::template::is_sheet_stroke(s) {
                 self.selection.insert(i);
             }
         }
@@ -687,6 +688,7 @@ impl Viewer {
             .then(|| {
                 let p = layout.to_page(pos);
                 self.page.ink.hit_test(p, HIT_TOLERANCE_PX / layout.scale as f64, self.visible)
+                    .filter(|&i| !crate::template::is_sheet_stroke(&self.page.ink.strokes[i]))
             })
             .flatten();
         if hit != self.hovered {
@@ -713,6 +715,10 @@ impl Viewer {
 
     fn stroke_color(&self, i: usize) -> Hsla {
         let n = self.total().max(2);
+        // A practice sheet's own drawing keeps its colors.
+        if crate::template::is_sheet_stroke(&self.page.ink.strokes[i]) {
+            return rgba_to_hsla(self.page.ink.strokes[i].rgba);
+        }
         match self.mode {
             ColorMode::Original => rgba_to_hsla(self.page.ink.strokes[i].rgba),
             ColorMode::Distinct => hsla((i as f32 * 0.618_034) % 1.0, 0.75, 0.45, 1.0),

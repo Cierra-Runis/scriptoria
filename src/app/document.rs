@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
-use scriptoria_project::{FontInfo, Glyph, Project, Reference, StrokeOrigin};
+use scriptoria_project::{FontInfo, Glyph, Project, Reference, StrokeOrigin, Template};
 use scriptoria_reference::ReferenceFont;
 
 /// How many changes can be undone.
@@ -234,6 +234,48 @@ impl Document {
             self.changed(glyph, cx);
             self.record(Change::Glyphs(vec![(glyph, before)]));
         }
+    }
+
+    /// A new practice sheet for characters, kept with the project.
+    pub fn new_template(&mut self, chars: &[char], cx: &mut Context<Self>) -> Template {
+        let template = self.project.new_template(chars).clone();
+        self.touch(cx);
+        template
+    }
+
+    /// Forgets a practice sheet (one that could not be written out).
+    pub fn remove_template(&mut self, id: u32, cx: &mut Context<Self>) {
+        self.project.templates.retain(|t| t.id != id);
+        self.touch(cx);
+    }
+
+    /// Puts characters written on practice sheets into their glyphs (added if new), replacing the
+    /// strokes they had, as one step to undo; returns how many glyphs had strokes before.
+    pub fn write_cells(&mut self, written: Vec<crate::template::Written>, cx: &mut Context<Self>) -> usize {
+        let text: String = written.iter().map(|w| w.c).collect();
+        self.add_chars(&text, cx);
+        // Each glyph once (a character written twice: the later one).
+        let mut by_glyph: std::collections::BTreeMap<usize, crate::template::Written> = std::collections::BTreeMap::new();
+        for w in written {
+            if let Some(g) = self.project.glyph_for(w.c) {
+                by_glyph.insert(g, w);
+            }
+        }
+        let glyphs: Vec<usize> = by_glyph.keys().copied().collect();
+        let replaced = glyphs.iter().filter(|&&g| !self.project.glyphs[g].strokes.is_empty()).count();
+        // `update_glyphs` goes through the glyphs in the order given.
+        let mut cells = by_glyph.into_values();
+        self.update_glyphs(
+            &glyphs,
+            |g| {
+                if let Some(w) = cells.next() {
+                    g.strokes = w.strokes;
+                    g.advance = w.advance;
+                }
+            },
+            cx,
+        );
+        replaced
     }
 
     /// The strokes of a source some glyph uses: (page, index).

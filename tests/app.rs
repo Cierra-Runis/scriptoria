@@ -35,6 +35,9 @@ fn open(start: Vec<PathBuf>, cx: &mut TestAppContext) -> (Entity<Workspace>, &mu
     let (_, cx) = cx.add_window_view(|window, cx| {
         let view = cx.new(|cx| Workspace::new(start, window, cx));
         workspace = Some(view.clone());
+        // As the app does: keys go to the main window until something else takes them.
+        let focus = view.read(cx).focus_handle().clone();
+        window.focus(&focus, cx);
         Root::new(view, window, cx)
     });
     cx.update(|window, cx| window.render_frame(cx));
@@ -413,4 +416,98 @@ fn the_grid_and_the_sample_show_the_font(cx: &mut TestAppContext) {
     let center = boxes[1].0.center();
     cx.update(|window, cx| window.drag(center, center, cx));
     assert!(workspace.read_with(cx, |w, _| w.glyph_view(1)).is_some());
+}
+
+/// A practice sheet "written on": its first page drawn as the sheet does, with `strokes` filled in
+/// black on top, each set of strokes moved into the square of the cell given.
+fn written_sheet(template: &scriptoria_project::Template, strokes: &[(usize, Vec<Stroke>)]) -> Vec<u8> {
+    use scriptoria_ink::kurbo::{Affine, PathEl};
+    use scriptoria_template::pdf_writer::{Content, Pdf, Rect as PdfRect, Ref};
+    let grid = &template.grid;
+    let chars: Vec<char> = template.chars.chars().collect();
+    let mut c = Content::new();
+    scriptoria_template::draw_page(&mut c, grid, template.id, &chars, 0, &|_| None);
+    c.set_fill_rgb(0.1, 0.1, 0.1);
+    for (cell, strokes) in strokes {
+        let square = grid.cell(*cell).square;
+        let bounds = strokes.iter().map(|s| s.bbox).reduce(|a, b| a.union(b)).unwrap();
+        // Written at three quarters of the square, in its middle; then y up for the PDF.
+        let k = 0.75 * square.height() / bounds.width().max(bounds.height());
+        let place = Affine::translate((0.0, grid.height))
+            * Affine::scale_non_uniform(1.0, -1.0)
+            * Affine::translate(square.center().to_vec2())
+            * Affine::scale(k)
+            * Affine::translate(-bounds.center().to_vec2());
+        for s in strokes {
+            for el in (place * s.path.clone()).elements() {
+                match *el {
+                    PathEl::MoveTo(p) => {
+                        c.move_to(p.x as f32, p.y as f32);
+                    }
+                    PathEl::LineTo(p) => {
+                        c.line_to(p.x as f32, p.y as f32);
+                    }
+                    PathEl::QuadTo(q, p) => {
+                        c.cubic_to(q.x as f32, q.y as f32, q.x as f32, q.y as f32, p.x as f32, p.y as f32);
+                    }
+                    PathEl::CurveTo(a, b, p) => {
+                        c.cubic_to(a.x as f32, a.y as f32, b.x as f32, b.y as f32, p.x as f32, p.y as f32);
+                    }
+                    PathEl::ClosePath => {
+                        c.close_path();
+                    }
+                }
+            }
+            c.fill_nonzero();
+        }
+    }
+    let (catalog, tree, page, contents) = (Ref::new(1), Ref::new(2), Ref::new(3), Ref::new(4));
+    let mut pdf = Pdf::new();
+    pdf.catalog(catalog).pages(tree);
+    pdf.pages(tree).kids([page]).count(1);
+    pdf.page(page).parent(tree).media_box(PdfRect::new(0.0, 0.0, grid.width as f32, grid.height as f32)).contents(contents).resources();
+    pdf.stream(contents, &c.finish());
+    pdf.finish()
+}
+
+#[gpui_kit::test]
+fn written_sheets_fill_their_glyphs(cx: &mut TestAppContext) {
+    let (workspace, cx) = open(vec![], cx);
+    let dir = std::env::temp_dir().join(format!("scriptoria-sheet-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    document.update(cx, |d, cx| d.add_chars("世丗", cx));
+
+    // A sheet for both characters, kept with the project.
+    let sheet = dir.join("sheet.pdf");
+    workspace.update_in(cx, |w, window, cx| w.make_template_to(sheet.clone(), &['世', '丗'], false, window, cx));
+    assert!(sheet.is_file());
+    let template = document.read_with(cx, |d, _| d.project.templates[0].clone());
+
+    // 世 written in its cell, 丗 left blank; the page imported.
+    let written = dir.join("written.pdf");
+    std::fs::write(&written, written_sheet(&template, &[(0, shi_strokes())])).unwrap();
+    workspace.update_in(cx, |w, window, cx| w.import_pdf(&written, window, cx));
+    cx.run_until_parked();
+    assert!(!workspace.read_with(cx, |w, _| w.reading_sheets()));
+    let gs = glyphs(&workspace, cx);
+    assert_eq!(gs[0].strokes.len(), shi_strokes().len(), "世 is filled from its cell");
+    assert!(gs[1].strokes.is_empty(), "丗 was left blank");
+    // The cell is the em: written at three quarters of the square, 世 is three quarters of the em,
+    // in its middle; and its strokes keep the cell's pen.
+    let b = gs[0].ink_bounds().unwrap();
+    let em = scriptoria_ink::kurbo::Rect::new(0.0, -120.0, 1000.0, 880.0);
+    assert!((b.width().max(b.height()) - 750.0).abs() < 30.0, "{b:?}");
+    assert!((b.center() - em.center()).hypot() < 30.0, "{b:?}");
+    // (The page size went through the PDF as f32.)
+    assert!(gs[0].strokes.iter().all(|s| (s.pen * template.grid.cell / 1000.0 - 1.0).abs() < 1e-6));
+    assert_eq!(gs[0].advance, 1000.0);
+    // The sheet's own drawing is not handwriting: only 世's strokes count as used.
+    let viewer = workspace.read_with(cx, |w, _| w.pdf_view(0)).unwrap();
+    assert_eq!(viewer.read_with(cx, |v, _| v.assigned().len()), shi_strokes().len());
+
+    // One undo takes the sheet's writing back.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert!(glyphs(&workspace, cx)[0].strokes.is_empty());
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -13,7 +13,7 @@ use gpui::{
     App, Context, Entity, FocusHandle, KeyBinding, Menu, MenuItem, PathPromptOptions, SharedString, Subscription, Task, Window,
     actions, div, px,
 };
-use scriptoria_ink::InkDocument;
+use scriptoria_ink::{InkDocument, InkPage};
 use scriptoria_project::Project;
 
 use crate::app::document::{Document, DocumentEvent};
@@ -23,7 +23,7 @@ use crate::app::outlines::Outlines;
 use crate::app::sample_view::{SampleEvent, SampleView};
 use crate::app::viewer::{Viewer, ViewerEvent};
 
-actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, ExportFont, Quit, Undo, Redo, ShowSample]);
+actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, ExportFont, MakeTemplate, Quit, Undo, Redo, ShowSample]);
 
 /// Key bindings and menus, once at startup.
 pub fn init(cx: &mut App) {
@@ -59,6 +59,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("导入 PDF…", ImportPdf),
                 MenuItem::action("导出字体…", ExportFont),
+                MenuItem::separator(),
+                MenuItem::action("生成格子模板…", MakeTemplate),
                 MenuItem::separator(),
                 MenuItem::action("退出", Quit),
             ],
@@ -103,6 +105,8 @@ pub struct Workspace {
     menu_bar: Entity<AppMenuBar>,
     /// The font being exported, on a background thread.
     exporting: Option<Task<()>>,
+    /// Written practice sheets being read, on a background thread.
+    reading: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -139,6 +143,7 @@ impl Workspace {
             active: 0,
             menu_bar: AppMenuBar::new(cx),
             exporting: None,
+            reading: None,
             _subscriptions: subscriptions,
         };
         let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) = start.into_iter().partition(|p| p.join("project.toml").is_file());
@@ -275,13 +280,16 @@ impl Workspace {
         }
     }
 
-    fn import_pdf(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a handwritten PDF in a tab, as a source of the project. Pages written on the
+    /// project's practice sheets are read at once: their cells' handwriting goes into the glyphs.
+    pub fn import_pdf(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         // Sources are kept by absolute path, so the same file is the same source however it was named.
         let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let path = absolute.as_path();
         let opened = std::fs::read(path).map_err(anyhow::Error::from).and_then(|data| InkDocument::open(data).map_err(Into::into));
         match opened {
             Ok(ink) => {
+                let sheets = self.sheet_pages(&ink, cx);
                 let title: SharedString = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default().into();
                 let view = cx.new(|cx| Viewer::new(ink, title.clone(), cx));
                 let source = self.document.update(cx, |d, cx| {
@@ -292,12 +300,118 @@ impl Workspace {
                 self._subscriptions.push(cx.subscribe_in(&view, window, move |this, _, event: &ViewerEvent, window, cx| match event {
                     ViewerEvent::Assign { page, strokes } => this.assign(&id, *page, strokes, window, cx),
                 }));
-                self.pages.push(Page::Pdf { title, source, view });
+                self.pages.push(Page::Pdf { title, source: source.clone(), view });
                 self.active = self.pages.len() - 1;
                 self.refresh_pages(cx);
+                if !sheets.is_empty() {
+                    self.read_sheets(source, sheets, window, cx);
+                }
                 cx.notify();
             }
             Err(e) => window.push_notification(Notification::error(format!("导入 {} 失败：{e}", path.display())), cx),
+        }
+    }
+
+    /// The pages of a document written on the project's practice sheets: (page, its strokes, the
+    /// sheet's index in the project, the sheet's page).
+    fn sheet_pages(&self, ink: &InkDocument, cx: &App) -> Vec<(usize, InkPage, usize, usize)> {
+        let project = &self.document.read(cx).project;
+        if project.templates.is_empty() {
+            return Vec::new();
+        }
+        (0..ink.page_count())
+            .filter_map(|i| {
+                let page = ink.page(i)?;
+                let (template, sheet_page) = crate::template::recognize(project, &page)?;
+                Some((i, page, template, sheet_page))
+            })
+            .collect()
+    }
+
+    /// Whether written sheets are being read.
+    pub fn reading_sheets(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    /// Reads written sheet pages on a background thread (skeletons take a while), then puts what
+    /// was written into the glyphs, as one step to undo.
+    fn read_sheets(&mut self, source: String, sheets: Vec<(usize, InkPage, usize, usize)>, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        let (info, templates, reference) = (doc.project.font.clone(), doc.project.templates.clone(), doc.reference().cloned());
+        window.push_notification(Notification::info(format!("认出 {} 页格子模板，正在读取…", sheets.len())), cx);
+        let background = cx.background_executor().clone();
+        self.reading = Some(cx.spawn_in(window, async move |this, cx| {
+            let written = background
+                .spawn(async move {
+                    sheets
+                        .iter()
+                        .flat_map(|(page, ink, t, sheet_page)| {
+                            crate::template::read_sheet_page(&info, &templates[*t], *sheet_page, &source, *page, ink, reference.as_deref())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.reading = None;
+                let n = written.len();
+                let replaced = this.document.update(cx, |d, cx| d.write_cells(written, cx));
+                let mut text = format!("从格子模板写入了 {n} 个字");
+                if replaced > 0 {
+                    text += &format!("，其中 {replaced} 个替换了原有的笔画（可撤销）");
+                }
+                window.push_notification(Notification::success(text), cx);
+                this.refresh_pages(cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn make_template(&mut self, _: &MakeTemplate, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        let selection = self.font_view.read(cx).selection();
+        // The glyphs selected, or else those still without strokes.
+        let glyphs: Vec<usize> = if selection.is_empty() {
+            (0..doc.project.glyphs.len()).filter(|&g| doc.project.glyphs[g].strokes.is_empty()).collect()
+        } else {
+            selection
+        };
+        let chars: Vec<char> = glyphs.iter().filter_map(|&g| doc.project.glyphs[g].chars.first().copied()).collect();
+        if chars.is_empty() {
+            window.push_notification(Notification::warning("没有要写的字：先在左边加字，或选中要重写的字"), cx);
+            return;
+        }
+        let start = doc.folder.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        let name = format!("{} 格子模板.pdf", doc.project.font.family);
+        let path = cx.prompt_for_new_path(&start, Some(&name));
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(path))) = path.await {
+                this.update_in(cx, |this, window, cx| this.make_template_to(path, &chars, true, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Writes a practice sheet for characters to `path` (a PDF) and keeps it with the project;
+    /// then opens it, if asked.
+    pub fn make_template_to(&mut self, path: PathBuf, chars: &[char], open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let template = self.document.update(cx, |d, cx| d.new_template(chars, cx));
+        let reference = self.document.read(cx).reference().cloned();
+        let pdf = crate::template::sheet_pdf(&template, reference.as_deref());
+        match std::fs::write(&path, pdf) {
+            Ok(()) => {
+                let pages = template.grid.pages(chars.len());
+                window.push_notification(
+                    Notification::success(format!("已生成格子模板：{} 个字，{pages} 页。写好后导入这个 PDF，字会自动归位", chars.len())),
+                    cx,
+                );
+                if open {
+                    cx.open_with_system(&path);
+                }
+            }
+            Err(e) => {
+                self.document.update(cx, |d, cx| d.remove_template(template.id, cx));
+                window.push_notification(Notification::error(format!("写不出 {}：{e}", path.display())), cx);
+            }
         }
     }
 
@@ -513,6 +627,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_project_as))
             .on_action(cx.listener(Self::import))
             .on_action(cx.listener(Self::export_font))
+            .on_action(cx.listener(Self::make_template))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(|this, _: &ShowSample, window, cx| this.open_sample(window, cx)))

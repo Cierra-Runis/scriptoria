@@ -1,0 +1,13 @@
+[package]
+name = "scriptoria-template"
+version = "0.1.0"
+edition = "2024"
+description = "Practice sheets to write characters on, a cell each, as PDF; and finding sheets, cells and the sheet's own drawing again on the pages written"
+
+[dependencies]
+kurbo = "0.13"
+pdf-writer = "0.15"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+scriptoria-ink = { path = "../ink" }

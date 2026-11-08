@@ -38,6 +38,8 @@ pub struct Project {
     pub sources: Vec<Source>,
     /// The glyphs, in font order.
     pub glyphs: Vec<Glyph>,
+    /// The practice sheets made for it, to find their pages again when written.
+    pub templates: Vec<Template>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -108,6 +110,27 @@ impl FontInfo {
     /// strokes is set at this scale, for every glyph alike.
     pub fn pen_scale(&self) -> f64 {
         self.units_per_em as f64 / self.pt_per_em
+    }
+}
+
+/// A practice sheet made for the project: its characters, a cell each, laid out by its grid (see
+/// the template crate). Its id is on each page, so that written pages can be found again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Template {
+    pub id: u32,
+    pub chars: String,
+    pub grid: scriptoria_template::Grid,
+}
+
+impl Project {
+    /// A new practice sheet for characters, kept with the project: its grid's baseline is the
+    /// font's.
+    pub fn new_template(&mut self, chars: &[char]) -> &Template {
+        let id = self.templates.iter().map(|t| t.id + 1).max().unwrap_or(1);
+        let em = (self.font.ascender - self.font.descender) as f64;
+        let grid = scriptoria_template::Grid { baseline: -self.font.descender as f64 / em, ..Default::default() };
+        self.templates.push(Template { id, chars: chars.iter().collect(), grid });
+        self.templates.last().expect("just added")
     }
 }
 
@@ -195,6 +218,15 @@ impl Glyph {
 
     fn all(&self) -> Vec<usize> {
         (0..self.strokes.len()).collect()
+    }
+
+    /// Moves all strokes sideways to have `left` before their ink, and makes the advance leave
+    /// `right` after it.
+    pub fn set_side_bearings(&mut self, left: f64, right: f64) {
+        if let Some(b) = self.ink_bounds() {
+            self.transform_strokes(&self.all(), Affine::translate((left - b.x0, 0.0)));
+            self.advance = (left + b.width() + right).round();
+        }
     }
 
     /// Moves all strokes sideways so that the left and right side bearings are equal.
@@ -370,7 +402,7 @@ pub fn initial_placement(bounds: Rect, info: &FontInfo) -> Affine {
 
 impl Project {
     pub fn new(family: impl Into<String>) -> Self {
-        Project { font: FontInfo { family: family.into(), ..FontInfo::default() }, sources: Vec::new(), glyphs: Vec::new() }
+        Project { font: FontInfo { family: family.into(), ..FontInfo::default() }, sources: Vec::new(), glyphs: Vec::new(), templates: Vec::new() }
     }
 
     /// The glyph mapped to a character.
@@ -419,7 +451,7 @@ impl Project {
             };
             glyphs.push(Glyph { name: g.name, chars: g.chars.chars().collect(), advance: g.advance, strokes });
         }
-        Ok(Project { font: file.font, sources: file.source, glyphs })
+        Ok(Project { font: file.font, sources: file.source, glyphs, templates: file.template })
     }
 
     /// Writes the project into `dir` (created if needed): `project.toml` and a file per glyph
@@ -437,7 +469,7 @@ impl Project {
             }
             entries.push(GlyphEntry { name: g.name.clone(), chars: g.chars.iter().collect(), advance: g.advance, file });
         }
-        let file = ProjectFile { format: FORMAT, font: self.font.clone(), source: self.sources.clone(), glyph: entries };
+        let file = ProjectFile { format: FORMAT, font: self.font.clone(), source: self.sources.clone(), glyph: entries, template: self.templates.clone() };
         write(&dir.join(PROJECT_FILE), &toml::to_string_pretty(&file).map_err(|e| Error::Toml(e.to_string()))?)?;
         for entry in std::fs::read_dir(&glyph_dir).map_err(|e| Error::Io(glyph_dir.clone(), e))?.flatten() {
             let path = entry.path();
@@ -489,6 +521,8 @@ struct ProjectFile {
     source: Vec<Source>,
     #[serde(default)]
     glyph: Vec<GlyphEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    template: Vec<Template>,
 }
 
 #[derive(Serialize, Deserialize)]

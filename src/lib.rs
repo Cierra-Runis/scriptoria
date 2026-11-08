@@ -9,6 +9,7 @@ extern crate gpui_kit as gpui;
 pub mod app;
 pub mod assign;
 pub mod font;
+pub mod template;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -17,6 +17,7 @@ scriptoria-skeleton = { path = "crates/skeleton" }
 scriptoria-font = { path = "crates/font" }
 scriptoria-project = { path = "crates/project" }
 scriptoria-reference = { path = "crates/reference" }
+scriptoria-template = { path = "crates/template" }
 
 # The tools in `examples/` and the pipeline test in `tests/` (they read `test/test.pdf`).
 [dev-dependencies]

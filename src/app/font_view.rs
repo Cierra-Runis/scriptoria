@@ -148,7 +148,7 @@ impl FontView {
                             this.group = Group::All;
                         }
                     }
-                    DocumentEvent::Font => {}
+                    DocumentEvent::Font | DocumentEvent::Parts => {}
                 }
                 cx.notify();
             }),

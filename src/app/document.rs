@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
-use scriptoria_project::{FontInfo, Glyph, Project, Reference, Template};
+use scriptoria_project::{FontInfo, Glyph, GlyphStroke, Part, Project, Reference, Template};
 use scriptoria_reference::ReferenceFont;
 
 /// How many changes can be undone.
@@ -26,6 +26,8 @@ enum Change {
     Added(Vec<usize>),
     /// The practice sheets, as they were.
     Templates(Vec<Template>),
+    /// The parts, as they were.
+    Parts(Vec<Part>),
 }
 
 pub struct Document {
@@ -61,6 +63,8 @@ pub enum DocumentEvent {
     /// Glyphs were added or removed: where each glyph that was at an index is now (none if it was
     /// removed). Followed by [`DocumentEvent::GlyphList`].
     Reindexed(Arc<[Option<usize>]>),
+    /// The parts kept changed.
+    Parts,
 }
 
 impl EventEmitter<DocumentEvent> for Document {}
@@ -291,6 +295,12 @@ impl Document {
                 Change::Font(replaced)
             }
             Change::Removed(glyphs) => Change::Added(self.put_glyphs(glyphs, cx)),
+            Change::Parts(parts) => {
+                let replaced = std::mem::replace(&mut self.project.parts, parts);
+                self.touch(cx);
+                cx.emit(DocumentEvent::Parts);
+                Change::Parts(replaced)
+            }
             Change::Templates(templates) => {
                 let replaced = std::mem::replace(&mut self.project.templates, templates);
                 self.touch(cx);
@@ -327,6 +337,32 @@ impl Document {
         let template = self.project.new_template(chars).clone();
         self.touch(cx);
         template
+    }
+
+    /// Keeps strokes as a part named `name` (in place of a part of that name), as a step to undo.
+    pub fn save_part(&mut self, name: &str, strokes: Vec<GlyphStroke>, cx: &mut Context<Self>) {
+        let before = self.project.parts.clone();
+        let part = Part { name: name.to_string(), strokes };
+        match self.project.parts.iter_mut().find(|p| p.name == name) {
+            Some(p) => *p = part,
+            None => self.project.parts.push(part),
+        }
+        self.parts_changed(before, cx);
+    }
+
+    /// Forgets a part, as a step to undo.
+    pub fn remove_part(&mut self, name: &str, cx: &mut Context<Self>) {
+        let before = self.project.parts.clone();
+        self.project.parts.retain(|p| p.name != name);
+        self.parts_changed(before, cx);
+    }
+
+    fn parts_changed(&mut self, before: Vec<Part>, cx: &mut Context<Self>) {
+        if self.project.parts != before {
+            self.record(Change::Parts(before));
+            self.touch(cx);
+            cx.emit(DocumentEvent::Parts);
+        }
     }
 
     /// Drops a practice sheet that could not be written out (not a step to undo).

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use kurbo::{Affine, BezPath, CubicBez, Point, Rect};
 use scriptoria_project::{
-    Error, FORMAT, Glyph, GlyphStroke, Outline, OutlineKind, Project, SkeletonPiece, fingerprint, initial_placement,
+    Error, FORMAT, Glyph, GlyphStroke, Outline, OutlineKind, Part, Project, SkeletonPiece, fingerprint, initial_placement,
 };
 
 /// A fresh, empty folder under the system's temporary directory.
@@ -42,6 +42,9 @@ fn sample() -> Project {
     ];
     p.glyphs[1].strokes = vec![stroke(3.0, OutlineKind::Filled)];
     p.glyphs[1].advance = 612.5;
+    // Parts, whatever their names.
+    p.parts.push(Part { name: "氵".into(), strokes: vec![stroke(4.0, OutlineKind::Filled), stroke(5.0, OutlineKind::Filled)] });
+    p.parts.push(Part { name: "left / 左".into(), strokes: vec![stroke(6.0, OutlineKind::Line { width: 0.3 })] });
     // A practice sheet: its id and grid come back too.
     let first = p.new_template(&['世', 'A']).id;
     assert_eq!(p.new_template(&['a']).id, first + 1);
@@ -149,5 +152,21 @@ fn strokes_are_known_by_their_outlines() {
     sample().save(&dir).unwrap();
     let back = Project::load(&dir).unwrap();
     assert_eq!(fingerprint(&back.glyphs[0].strokes[0].outline.path), fingerprint(&sample().glyphs[0].strokes[0].outline.path));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn parts_come_back_and_go() {
+    let dir = folder("parts");
+    let mut p = sample();
+    p.save(&dir).unwrap();
+    assert_eq!(Project::load(&dir).unwrap().parts, p.parts);
+    let files = |dir: &PathBuf| std::fs::read_dir(dir.join("parts")).map_or(0, |d| d.count());
+    assert_eq!(files(&dir), 2);
+    // A part no longer kept loses its file.
+    p.parts.remove(0);
+    p.save(&dir).unwrap();
+    assert_eq!(files(&dir), 1);
+    assert_eq!(Project::load(&dir).unwrap().parts, p.parts);
     std::fs::remove_dir_all(&dir).unwrap();
 }

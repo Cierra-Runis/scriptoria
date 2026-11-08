@@ -805,3 +805,60 @@ fn skeletons_are_edited_circle_by_circle(cx: &mut TestAppContext) {
     assert_eq!(thicker.strokes[1].skeleton, before.strokes[1].skeleton);
     assert_eq!(thicker.strokes[0], before.strokes[0]);
 }
+
+#[gpui_kit::test]
+fn strokes_are_copied_and_kept_as_parts(cx: &mut TestAppContext) {
+    let (workspace, view, cx) = open_shi(cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    document.update(cx, |d, cx| d.add_chars("丗", cx));
+    let shi = glyph(&workspace, cx);
+
+    // Two strokes of 世 copied, pasted into 丗 where they were.
+    cx.update(|window, cx| {
+        window.click(("stroke", 0usize), cx);
+        window.click_with_modifiers(("stroke", 2usize), gpui_kit::Modifiers::control(), cx);
+        window.press("ctrl-c", cx);
+    });
+    workspace.update_in(cx, |w, window, cx| w.open_glyph(1, window, cx));
+    let other = workspace.read_with(cx, |w, _| w.glyph_view(1)).expect("丗 opens");
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.press("ctrl-v", cx);
+    });
+    let pasted = glyphs(&workspace, cx)[1].clone();
+    assert_eq!(pasted.strokes, [shi.strokes[0].clone(), shi.strokes[2].clone()]);
+    assert_eq!(other.read_with(cx, |v, _| v.selection()), [0, 1], "the pasted strokes are selected");
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert!(glyphs(&workspace, cx)[1].strokes.is_empty());
+
+    // In 世, its second stroke kept as a part, named.
+    workspace.update_in(cx, |w, window, cx| w.open_glyph(0, window, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("stroke", 1usize), cx);
+    });
+    view.update(cx, |v, cx| v.show_parts(true, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("part-name", cx);
+        window.input("竖", cx);
+        window.click("save-part", cx);
+    });
+    let parts = document.read_with(cx, |d, _| d.project.parts.clone());
+    assert_eq!(parts.len(), 1);
+    assert_eq!((parts[0].name.as_str(), parts[0].strokes.clone()), ("竖", vec![shi.strokes[1].clone()]));
+
+    // Put into 丗 with a click.
+    workspace.update_in(cx, |w, window, cx| w.open_glyph(1, window, cx));
+    other.update(cx, |v, cx| v.show_parts(true, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("part", 0usize), cx);
+    });
+    assert_eq!(glyphs(&workspace, cx)[1].strokes, [shi.strokes[1].clone()]);
+    // Undo takes the insertion back, then the part.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert!(glyphs(&workspace, cx)[1].strokes.is_empty());
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert!(document.read_with(cx, |d, _| d.project.parts.is_empty()));
+}

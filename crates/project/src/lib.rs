@@ -14,6 +14,7 @@
 //!                      file), the practice sheets made
 //! glyphs/<file>.svg    one per glyph with strokes: each stroke a <g class="stroke"> whose
 //!                      transform is its placement, holding its outline and its skeleton
+//! parts/<file>.svg     one per part (strokes kept to put into glyphs), as a glyph's
 //! ```
 //!
 //! The glyph files open in a browser, the glyph upright. See [`svg`] for their details.
@@ -42,6 +43,16 @@ pub struct Project {
     pub glyphs: Vec<Glyph>,
     /// The practice sheets made for it, to find their pages again when written.
     pub templates: Vec<Template>,
+    /// Strokes kept to be put into glyphs again (radicals, components), by name.
+    pub parts: Vec<Part>,
+}
+
+/// Strokes kept to be put into other glyphs (a radical, a component), placed as they were in the
+/// glyph they were taken from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Part {
+    pub name: String,
+    pub strokes: Vec<GlyphStroke>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -433,7 +444,7 @@ pub fn initial_placement(bounds: Rect, info: &FontInfo) -> Affine {
 
 impl Project {
     pub fn new(family: impl Into<String>) -> Self {
-        Project { font: FontInfo { family: family.into(), ..FontInfo::default() }, glyphs: Vec::new(), templates: Vec::new() }
+        Project { font: FontInfo { family: family.into(), ..FontInfo::default() }, glyphs: Vec::new(), templates: Vec::new(), parts: Vec::new() }
     }
 
     /// The glyph mapped to a character.
@@ -472,7 +483,14 @@ impl Project {
             };
             glyphs.push(Glyph { name: g.name, chars: g.chars.chars().collect(), advance: g.advance, strokes });
         }
-        Ok(Project { font: file.font, glyphs, templates: file.template })
+        let mut parts = Vec::with_capacity(file.part.len());
+        for p in file.part {
+            let path = dir.join(&p.file);
+            let text = std::fs::read_to_string(&path).map_err(|e| Error::Io(path.clone(), e))?;
+            let strokes = svg::read_strokes(&text, file.font.pen_scale()).map_err(|e| Error::Svg(path, e))?;
+            parts.push(Part { name: p.name, strokes });
+        }
+        Ok(Project { font: file.font, glyphs, templates: file.template, parts })
     }
 
     /// Writes the project into `dir` (created if needed): `project.toml` and a file per glyph
@@ -490,12 +508,26 @@ impl Project {
             }
             entries.push(GlyphEntry { name: g.name.clone(), chars: g.chars.iter().collect(), advance: g.advance, file });
         }
-        let file = ProjectFile { format: FORMAT, font: self.font.clone(), glyph: entries, template: self.templates.clone() };
+        let part_dir = dir.join(PART_DIR);
+        let mut parts = Vec::with_capacity(self.parts.len());
+        if !self.parts.is_empty() {
+            std::fs::create_dir_all(&part_dir).map_err(|e| Error::Io(part_dir.clone(), e))?;
+        }
+        for (i, part) in self.parts.iter().enumerate() {
+            let f = format!("{PART_DIR}/{}.svg", part_file_name(i, &part.name));
+            let glyph = Glyph { name: part.name.clone(), chars: Vec::new(), advance: self.font.units_per_em as f64, strokes: part.strokes.clone() };
+            write(&dir.join(&f), &svg::write_strokes(&glyph, &self.font))?;
+            used.push(dir.join(&f));
+            parts.push(PartEntry { name: part.name.clone(), file: f });
+        }
+        let file = ProjectFile { format: FORMAT, font: self.font.clone(), glyph: entries, template: self.templates.clone(), part: parts };
         write(&dir.join(PROJECT_FILE), &toml::to_string_pretty(&file).map_err(|e| Error::Toml(e.to_string()))?)?;
-        for entry in std::fs::read_dir(&glyph_dir).map_err(|e| Error::Io(glyph_dir.clone(), e))?.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "svg") && !used.contains(&path) {
-                std::fs::remove_file(&path).map_err(|e| Error::Io(path, e))?;
+        for folder in [glyph_dir, part_dir].into_iter().filter(|d| d.is_dir()) {
+            for entry in std::fs::read_dir(&folder).map_err(|e| Error::Io(folder.clone(), e))?.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "svg") && !used.contains(&path) {
+                    std::fs::remove_file(&path).map_err(|e| Error::Io(path, e))?;
+                }
             }
         }
         Ok(())
@@ -504,6 +536,14 @@ impl Project {
 
 const PROJECT_FILE: &str = "project.toml";
 const GLYPH_DIR: &str = "glyphs";
+const PART_DIR: &str = "parts";
+
+/// A part's file name: its place in the list, then its name's letters and digits (others as code
+/// points), so that any name makes a file name and no two parts share one.
+fn part_file_name(index: usize, name: &str) -> String {
+    let readable: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_string() } else { format!("u{:04X}", c as u32) }).collect();
+    format!("{index:03}-{readable}")
+}
 
 /// Writes through a temporary file, so a failed write leaves the old file whole.
 fn write(path: &Path, text: &str) -> Result<(), Error> {
@@ -543,6 +583,14 @@ struct ProjectFile {
     glyph: Vec<GlyphEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     template: Vec<Template>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    part: Vec<PartEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PartEntry {
+    name: String,
+    file: String,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -7,7 +7,9 @@
 //! deleted and reordered; their widths stay the pen's through all of it. In the skeleton mode, the
 //! circles of their skeletons are moved, made larger or smaller, removed and added (a double click
 //! on a centerline), and skeletons smoothed and thinned out; a stroke as a whole is made thinner or
-//! thicker by its pen. The advance is dragged or typed. Every change is one step to undo.
+//! thicker by its pen. Strokes are copied, cut and pasted (between glyphs too), and kept as named
+//! parts (a radical, a component) to put into other glyphs. The advance is dragged or typed. Every
+//! change is one step to undo.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -19,6 +21,7 @@ use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::notification::Notification;
 use gpui::component::slider::{Slider, SliderEvent, SliderState};
+use gpui::component::tab::{Tab, TabBar};
 use gpui::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::{
@@ -199,6 +202,11 @@ impl Shapes {
         (reach == 0.0 && path.contains(p)) || path.segments().any(|s| s.nearest(p, 1e-9).distance_sq <= r * r)
     }
 }
+
+/// The strokes copied last (in this run), to paste into any glyph.
+struct StrokeClipboard(Vec<GlyphStroke>);
+
+impl gpui::Global for StrokeClipboard {}
 
 /// What the mouse and keys edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -407,6 +415,10 @@ pub struct GlyphView {
     mode: Mode,
     /// The skeleton circles selected.
     circles: BTreeSet<GlyphNode>,
+    /// What the column beside shows: the strokes (false) or the parts kept (true).
+    showing_parts: bool,
+    /// The name to keep the selected strokes as a part under.
+    part_name: Entity<InputState>,
     selection: BTreeSet<usize>,
     hovered: Option<usize>,
     zoom: f32,
@@ -429,12 +441,14 @@ impl GlyphView {
         let advance = cx.new(|cx| InputState::new(window, cx));
         let typed = |value: &'static str, window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx).default_value(value));
         let (turn, scale_x, scale_y, slant) = (typed("0", window, cx), typed("100", window, cx), typed("100", window, cx), typed("0", window, cx));
+        let part_name = cx.new(|cx| InputState::new(window, cx).placeholder("部件名，如 氵"));
         let subscriptions = vec![
             cx.subscribe_in(&document, window, move |this, _, event: &DocumentEvent, window, cx| match event {
                 DocumentEvent::Glyph(g) if *g == this.glyph => this.sync(window, cx),
                 DocumentEvent::GlyphList | DocumentEvent::Saved => this.sync(window, cx),
                 // The glyph moved (or went: then there is none to show; the tab closes).
                 DocumentEvent::Reindexed(map) => this.glyph = map.get(this.glyph).copied().flatten().unwrap_or(usize::MAX),
+                DocumentEvent::Parts => cx.notify(),
                 DocumentEvent::Font => {
                     this.ensure_plans(cx);
                     this.regenerate(cx);
@@ -466,6 +480,8 @@ impl GlyphView {
             nodes: Nodes::Hidden,
             mode: Mode::Strokes,
             circles: BTreeSet::new(),
+            showing_parts: false,
+            part_name,
             selection: BTreeSet::new(),
             hovered: None,
             zoom: 1.0,
@@ -745,6 +761,130 @@ impl GlyphView {
         // Shows the advance as it is (also after a typo).
         let advance = self.glyph(cx).map_or(0.0, |g| g.advance);
         self.advance.update(cx, |s, cx| s.set_value(units(advance), window, cx));
+    }
+
+    // ---- Copying and parts ----
+
+    /// Copies the selected strokes (and with `cut`, takes them out), to paste into this glyph or
+    /// another.
+    fn copy(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(glyph) = self.glyph(cx) else { return };
+        let strokes: Vec<GlyphStroke> = self.selection.iter().filter_map(|&i| glyph.strokes.get(i).cloned()).collect();
+        if strokes.is_empty() {
+            return;
+        }
+        cx.set_global(StrokeClipboard(strokes));
+        if cut {
+            self.delete_selection(cx);
+        }
+    }
+
+    /// Shows the parts kept beside the glyph (or its strokes).
+    pub fn show_parts(&mut self, parts: bool, cx: &mut Context<Self>) {
+        self.showing_parts = parts;
+        cx.notify();
+    }
+
+    /// Pastes the strokes copied last, where they were.
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        let strokes = cx.try_global::<StrokeClipboard>().map(|c| c.0.clone()).unwrap_or_default();
+        self.append_strokes(strokes, cx);
+    }
+
+    /// Adds strokes after the glyph's last (one step to undo), and selects them.
+    fn append_strokes(&mut self, strokes: Vec<GlyphStroke>, cx: &mut Context<Self>) {
+        if strokes.is_empty() {
+            return;
+        }
+        let first = self.glyph(cx).map_or(0, |g| g.strokes.len());
+        let n = strokes.len();
+        self.edit(cx, |g| g.strokes.extend(strokes));
+        self.selection = (first..first + n).collect();
+        cx.notify();
+    }
+
+    /// Puts a part's strokes into the glyph, where they were in the glyph they came from.
+    pub fn insert_part(&mut self, name: &str, cx: &mut Context<Self>) {
+        let strokes = self.document.read(cx).project.parts.iter().find(|p| p.name == name).map(|p| p.strokes.clone()).unwrap_or_default();
+        self.append_strokes(strokes, cx);
+    }
+
+    /// Keeps the selected strokes as a part, under the name typed (or the glyph's character).
+    fn save_part(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(glyph) = self.glyph(cx) else { return };
+        let strokes: Vec<GlyphStroke> = self.selection.iter().filter_map(|&i| glyph.strokes.get(i).cloned()).collect();
+        if strokes.is_empty() {
+            window.push_notification(Notification::warning("先选中要存为部件的笔画"), cx);
+            return;
+        }
+        let typed = self.part_name.read(cx).value().trim().to_string();
+        let name = if typed.is_empty() { glyph.chars.iter().collect() } else { typed };
+        let n = strokes.len();
+        self.document.update(cx, |d, cx| d.save_part(&name, strokes, cx));
+        self.part_name.update(cx, |s, cx| s.set_value("", window, cx));
+        window.push_notification(Notification::success(format!("已存为部件「{name}」（{n} 笔）")), cx);
+    }
+
+    /// The parts kept: each inserted with a click, or forgotten; and the selected strokes kept as
+    /// one.
+    fn render_parts(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (muted, hover) = (theme.muted_foreground, theme.secondary_hover);
+        let rows: Vec<_> = self
+            .document
+            .read(cx)
+            .project
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let name = part.name.clone();
+                let forget = part.name.clone();
+                h_flex()
+                    .id(("part", i))
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(move |d| d.bg(hover))
+                    .child(div().flex_1().min_w_0().truncate().child(part.name.clone()))
+                    .child(div().text_xs().text_color(muted).child(format!("{} 笔", part.strokes.len())))
+                    .child(Button::new(("remove-part", i)).xsmall().ghost().label("×").tooltip("不再保留这个部件").on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.document.update(cx, |d, cx| d.remove_part(&forget, cx));
+                    })))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        window.focus(&this.focus, cx);
+                        this.insert_part(&name, cx);
+                    }))
+                    .test_support()
+            })
+            .collect();
+        let none = self.selection.is_empty();
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(div().id("part-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .child(div().text_xs().text_color(muted).child("点一个部件把它加进这个字（原来的位置），再移动缩放"))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(div().flex_1().child(Input::new(&self.part_name).xsmall().id("part-name")))
+                            .child(
+                                Button::new("save-part")
+                                    .xsmall()
+                                    .label("存为部件")
+                                    .tooltip("把选中的笔画存起来，以后加进别的字（不填名字就用这个字）")
+                                    .disabled(none)
+                                    .on_click(cx.listener(|this, _, window, cx| this.save_part(window, cx))),
+                            ),
+                    ),
+            )
     }
 
     // ---- Skeletons ----
@@ -1267,6 +1407,9 @@ impl GlyphView {
             "down" => self.nudge(0.0, -step, cx),
             "delete" | "backspace" => self.delete_selection(cx),
             "a" if m.secondary(cx) => self.select_all(cx),
+            "c" if m.secondary(cx) => self.copy(false, cx),
+            "x" if m.secondary(cx) => self.copy(true, cx),
+            "v" if m.secondary(cx) => self.paste(cx),
             "escape" => self.clear_selection(cx),
             "=" | "+" => self.zoom_at_center(1.25, cx),
             "-" => self.zoom_at_center(0.8, cx),
@@ -1574,13 +1717,28 @@ impl GlyphView {
             })
             .collect();
         let none = self.selection.is_empty();
+        let parts = self.document.read(cx).project.parts.len();
         v_flex()
             .w(px(220.0))
             .h_full()
             .border_l_1()
             .border_color(border)
-            .child(div().px_2().py_1().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("笔画（按笔顺）"))
-            .child(div().id("stroke-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
+            .child(
+                TabBar::new("side")
+                    .small()
+                    .child(Tab::new().label("笔画（按笔顺）"))
+                    .child(Tab::new().label(format!("部件（{parts}）")))
+                    .selected_index(usize::from(self.showing_parts))
+                    .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        this.showing_parts = *index == 1;
+                        cx.notify();
+                    })),
+            )
+            .child(if self.showing_parts {
+                self.render_parts(cx).into_any_element()
+            } else {
+                div().id("stroke-list").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element()
+            })
             .child(match self.mode {
                 Mode::Strokes => self.render_transforms(cx).into_any_element(),
                 Mode::Skeleton => self.render_skeleton_panel(cx).into_any_element(),

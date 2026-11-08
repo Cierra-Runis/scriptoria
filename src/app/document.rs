@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
@@ -26,6 +27,8 @@ pub struct Document {
     /// The project's folder, once opened or saved.
     pub folder: Option<PathBuf>,
     pub modified: bool,
+    /// Different for every document made, for caches.
+    id: u64,
     /// The font characters are placed after, if any.
     reference: Option<Arc<ReferenceFont>>,
     /// Per glyph, bumped whenever it changes.
@@ -61,7 +64,14 @@ impl Document {
             }),
         };
         let revisions = vec![0; project.glyphs.len()];
-        Document { project, folder, modified: false, reference: reference.map(Arc::new), revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        Document { project, folder, modified: false, id, reference: reference.map(Arc::new), revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
+    }
+
+    /// Different for every document made (a project opened twice is two documents).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The glyph's revision: changes whenever the glyph does.

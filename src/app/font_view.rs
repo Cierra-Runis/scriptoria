@@ -1,19 +1,21 @@
-//! The glyph grid, as in FontForge's main window: every glyph of the project in a cell, drawn
-//! from its strokes as written, with its character. Characters typed or pasted into the box above
-//! become new glyphs; a click selects a glyph, a double click opens it.
+//! The glyph grid, as in FontForge's main window: every glyph of the project in a cell, drawn as
+//! the font draws it at the default weight (from its strokes as written until that is ready),
+//! with its character. Characters typed or pasted into the box above become new glyphs; a click
+//! selects a glyph (Ctrl adds or removes, Shift selects a range), a double click opens it. Selected
+//! glyphs are placed after the reference font, made full width or centered all at once.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use gpui::TestSupportExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::slider::{Slider, SliderEvent, SliderState};
-use gpui::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, ClickEvent, Context, Entity, EventEmitter, Pixels, SharedString, Subscription, Window, canvas, div, point,
+    App, Bounds, ClickEvent, Context, Entity, EventEmitter, Pixels, SharedString, Subscription, Window, canvas, div,
     px, uniform_list,
 };
 use scriptoria_ink::StrokeShape;
@@ -22,6 +24,7 @@ use scriptoria_project::{Glyph, OutlineKind};
 
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::mesh::Mesh;
+use crate::app::outlines::Outlines;
 use crate::font::{AXIS, WRITTEN_MIN, Weights};
 
 /// A cell's drawing area (px, square), the margin inside it, and the label under it.
@@ -30,31 +33,39 @@ const MARGIN: f32 = 6.0;
 const LABEL: f32 = 20.0;
 /// Tessellation tolerance (font units): far below a pixel at cell size.
 const TOLERANCE: f32 = 2.0;
+/// What a full-width glyph's larger side becomes, as a fraction of the em.
+const FACE: f64 = 0.9;
 
 pub enum FontViewEvent {
     /// The selected glyph changed.
     Selected(Option<usize>),
     /// Open the glyph (double click).
     Open(usize),
+    /// Show the sample text.
+    OpenSample,
 }
 
 impl EventEmitter<FontViewEvent> for FontView {}
 
 pub struct FontView {
     document: Entity<Document>,
+    outlines: Entity<Outlines>,
     input: Entity<InputState>,
+    /// The glyph strokes go to, and where a Shift range starts.
     selected: Option<usize>,
+    /// All glyphs selected (with `selected`).
+    selection: BTreeSet<usize>,
     /// The grid's width at the last paint, for the number of columns.
     width: Rc<Cell<Pixels>>,
-    /// Per glyph: its meshes (font units, y down from the ascender) at a revision.
-    meshes: Rc<RefCell<HashMap<usize, (u64, Rc<Vec<Mesh>>)>>>,
+    /// Per glyph: its strokes as written (font units, y down from the ascender) at a revision.
+    meshes: Rc<RefCell<HashMap<usize, (u64, Rc<Vec<Rc<Mesh>>>)>>>,
     /// The weight the strokes as written are (`wght`), set when the slider is let go.
     written: Entity<SliderState>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl FontView {
-    pub fn new(document: Entity<Document>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(document: Entity<Document>, outlines: Entity<Outlines>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("输入或粘贴要做的字，回车加入"));
         let written_weight = document.read(cx).project.font.written_weight;
         let written = cx.new(|_| SliderState::new().max(AXIS.max as f32).min(WRITTEN_MIN as f32).step(10.0).default_value(written_weight as f32));
@@ -85,17 +96,21 @@ impl FontView {
                     if this.selected.is_some_and(|s| s >= n) {
                         this.select(None, cx);
                     }
+                    this.selection.retain(|&i| i < n);
                     if matches!(event, DocumentEvent::Saved) && document.read(cx).folder.is_some() {
                         this.meshes.borrow_mut().retain(|&i, _| i < n);
                     }
                     cx.notify();
                 }
             }),
+            cx.observe(&outlines, |_, _, cx| cx.notify()),
         ];
         FontView {
             document,
+            outlines,
             input,
             selected: None,
+            selection: BTreeSet::new(),
             width: Rc::new(Cell::new(px(600.0))),
             meshes: Rc::default(),
             written,
@@ -113,12 +128,53 @@ impl FontView {
         self.selected
     }
 
+    /// All selected glyphs, in font order.
+    pub fn selection(&self) -> Vec<usize> {
+        self.selection.iter().copied().collect()
+    }
+
+    /// Selects one glyph (or none).
     pub fn select(&mut self, glyph: Option<usize>, cx: &mut Context<Self>) {
+        self.selection = glyph.into_iter().collect();
+        self.set_selected(glyph, cx);
+        cx.notify();
+    }
+
+    fn set_selected(&mut self, glyph: Option<usize>, cx: &mut Context<Self>) {
         if self.selected != glyph {
             self.selected = glyph;
             cx.emit(FontViewEvent::Selected(glyph));
-            cx.notify();
         }
+    }
+
+    /// A click on a glyph: selects it alone; with Ctrl adds or removes it; with Shift adds the
+    /// glyphs from the last one clicked.
+    fn click(&mut self, glyph: usize, ctrl: bool, shift: bool, cx: &mut Context<Self>) {
+        match (ctrl, shift, self.selected) {
+            (_, true, Some(from)) => {
+                self.selection.extend(from.min(glyph)..=from.max(glyph));
+                self.set_selected(Some(glyph), cx);
+            }
+            (true, _, _) => {
+                if !self.selection.remove(&glyph) {
+                    self.selection.insert(glyph);
+                }
+                self.set_selected(Some(glyph), cx);
+            }
+            _ => self.select(Some(glyph), cx),
+        }
+        cx.notify();
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selection = (0..self.document.read(cx).project.glyphs.len()).collect();
+        cx.notify();
+    }
+
+    /// Changes every selected glyph, as one step to undo.
+    fn edit_selection(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Glyph)) {
+        let glyphs = self.selection();
+        self.document.update(cx, |d, cx| d.update_glyphs(&glyphs, f, cx));
     }
 
     /// Selects the first glyph without strokes after the selected one (wrapping around), if any.
@@ -148,7 +204,7 @@ impl FontView {
     }
 
     /// The glyph's meshes, made again when it has changed.
-    fn meshes_for(&self, index: usize, glyph: &Glyph, revision: u64, ascender: f64) -> Rc<Vec<Mesh>> {
+    fn meshes_for(&self, index: usize, glyph: &Glyph, revision: u64, ascender: f64) -> Rc<Vec<Rc<Mesh>>> {
         if let Some((rev, meshes)) = self.meshes.borrow().get(&index)
             && *rev == revision
         {
@@ -160,15 +216,21 @@ impl FontView {
     }
 
     fn render_cell(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        // As the font draws it at the default weight, once planned; the strokes as written until then.
+        let outline = self.outlines.update(cx, |o, cx| o.mesh(index, AXIS.default, cx));
         let doc = self.document.read(cx);
         let font = &doc.project.font;
         let glyph = &doc.project.glyphs[index];
-        let meshes = self.meshes_for(index, glyph, doc.revision(index), font.ascender as f64);
+        let ascender = font.ascender as f64;
+        let meshes: Rc<Vec<(Rc<Mesh>, Affine)>> = match outline {
+            Some(mesh) => Rc::new(vec![(mesh, Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, ascender]))]),
+            None => Rc::new(self.meshes_for(index, glyph, doc.revision(index), ascender).iter().map(|m| (m.clone(), Affine::IDENTITY)).collect()),
+        };
         let em = (font.ascender - font.descender) as f32;
         let advance = glyph.advance as f32;
         let label: SharedString = glyph.chars.iter().collect::<String>().into();
         let empty = glyph.strokes.is_empty();
-        let selected = self.selected == Some(index);
+        let selected = self.selection.contains(&index);
         let theme = cx.theme();
         let (ink, border, accent, muted, background) = (theme.foreground, theme.border, theme.primary, theme.muted_foreground, theme.background);
         v_flex()
@@ -186,9 +248,11 @@ impl FontView {
                         // The em (ascender to descender) fills the area inside the margin, the advance centered.
                         let scale = (f32::from(bounds.size.height) - 2.0 * MARGIN) / em;
                         let x = f32::from(bounds.origin.x) + (f32::from(bounds.size.width) - advance * scale) / 2.0;
-                        let origin = point(px(x), bounds.origin.y + px(MARGIN));
-                        for mesh in meshes.iter() {
-                            window.paint_path(mesh.to_path(origin, scale), ink);
+                        let y = f32::from(bounds.origin.y) + MARGIN;
+                        // Font units (y down from the ascender) to the cell.
+                        let to_cell = Affine::new([scale as f64, 0.0, 0.0, scale as f64, x as f64, y as f64]);
+                        for (mesh, t) in meshes.iter() {
+                            window.paint_path(mesh.to_path_affine(to_cell * *t), ink);
                         }
                     },
                 )
@@ -207,9 +271,12 @@ impl FontView {
                     .child(label),
             )
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                this.select(Some(index), cx);
+                let m = event.modifiers();
                 if event.click_count() >= 2 {
+                    this.select(Some(index), cx);
                     cx.emit(FontViewEvent::Open(index));
+                } else {
+                    this.click(index, m.secondary(cx), m.shift, cx);
                 }
             }))
             .test_support()
@@ -217,7 +284,7 @@ impl FontView {
 }
 
 /// A glyph's strokes as written, placed in the em, y down from the ascender (font units).
-pub fn glyph_meshes(glyph: &Glyph, ascender: f64) -> Vec<Mesh> {
+pub fn glyph_meshes(glyph: &Glyph, ascender: f64) -> Vec<Rc<Mesh>> {
     let flip = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, ascender]);
     glyph
         .strokes
@@ -229,7 +296,7 @@ pub fn glyph_meshes(glyph: &Glyph, ascender: f64) -> Vec<Mesh> {
                 OutlineKind::Filled => StrokeShape::Outline { non_zero: true },
                 OutlineKind::Line { width } => StrokeShape::Line { width: width * t.determinant().abs().sqrt() },
             };
-            Mesh::from_path_with_tolerance(&path, shape, true, TOLERANCE)
+            Mesh::from_path_with_tolerance(&path, shape, true, TOLERANCE).map(Rc::new)
         })
         .collect()
 }
@@ -276,13 +343,59 @@ impl Render for FontView {
                     ))),
             )
             .child(
-                div()
+                h_flex()
                     .px_2()
                     .py_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{count} 个字形 · 单击选中，双击打开")),
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{count} 个字形 · 单击选中（Ctrl/Shift 多选），双击打开")),
+                    )
+                    .child(Button::new("select-all").xsmall().ghost().label("全选").on_click(cx.listener(|this, _, _, cx| this.select_all(cx))))
+                    .child(
+                        Button::new("open-sample")
+                            .xsmall()
+                            .label("样张")
+                            .tooltip("把一段文字按现在的摆放排出来看")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(FontViewEvent::OpenSample))),
+                    ),
             )
+            .when(!self.selection.is_empty(), |d| {
+                let n = self.selection.len();
+                let font = self.document.read(cx).project.font.clone();
+                let has_reference = self.document.read(cx).reference().is_some();
+                d.child(
+                    h_flex()
+                        .px_2()
+                        .pb_1()
+                        .gap_1()
+                        .text_xs()
+                        .child(div().flex_1().child(format!("已选 {n} 个字：")))
+                        .child(
+                            Button::new("fit-selection")
+                                .xsmall()
+                                .label("按参考摆放")
+                                .disabled(!has_reference)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let glyphs = this.selection();
+                                    this.document.update(cx, |d, cx| d.fit_to_reference(&glyphs, cx));
+                                })),
+                        )
+                        .child(Button::new("full-width-selection").xsmall().label("全角").on_click(cx.listener({
+                            let font = font.clone();
+                            move |this, _, _, cx| this.edit_selection(cx, |g| g.fit_full_width(&font, FACE))
+                        })))
+                        .child(
+                            Button::new("center-selection")
+                                .xsmall()
+                                .label("居中")
+                                .on_click(cx.listener(move |this, _, _, cx| this.edit_selection(cx, |g| g.center(&font)))),
+                        ),
+                )
+            })
             .child(
                 div()
                     .relative()

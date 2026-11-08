@@ -356,3 +356,62 @@ fn new_glyphs_take_the_reference_place(cx: &mut TestAppContext) {
     assert_ne!(glyph(&workspace, cx), fitted);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The main window with 世 written into two glyphs (世 and 丗, the same strokes).
+fn two_glyphs(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    let (workspace, cx) = open(vec![], cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    document.update(cx, |d, cx| {
+        d.add_chars("世丗", cx);
+        d.assign(0, "s1", 2, &shi_strokes(), cx);
+        d.assign(1, "s1", 2, &shi_strokes(), cx);
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    (workspace, cx)
+}
+
+fn glyphs(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<Glyph> {
+    workspace.read_with(cx, |w, cx| w.document().read(cx).project.glyphs.clone())
+}
+
+#[gpui_kit::test]
+fn selected_glyphs_change_together(cx: &mut TestAppContext) {
+    let (workspace, cx) = two_glyphs(cx);
+    let before = glyphs(&workspace, cx);
+    cx.update(|window, cx| {
+        window.click(("cell", 0usize), cx);
+        window.click_with_modifiers(("cell", 1usize), gpui_kit::Modifiers::control(), cx);
+    });
+    assert_eq!(workspace.read_with(cx, |w, cx| w.font_view().read(cx).selection()), [0, 1]);
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("full-width-selection", cx);
+    });
+    let after = glyphs(&workspace, cx);
+    assert!(after.iter().zip(&before).all(|(a, b)| a != b && a.advance == 1000.0));
+    // One undo takes both back.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(glyphs(&workspace, cx), before);
+}
+
+#[gpui_kit::test]
+fn the_grid_and_the_sample_show_the_font(cx: &mut TestAppContext) {
+    let (workspace, cx) = two_glyphs(cx);
+    // The grid asks for the outlines; once planned they are there.
+    cx.run_until_parked();
+    let outlines = workspace.read_with(cx, |w, _| w.outlines().clone());
+    assert!(outlines.read_with(cx, |o, _| o.idle()));
+    assert!(outlines.update(cx, |o, cx| o.mesh(0, 400.0, cx)).is_some());
+
+    // The sample text sets both glyphs; a click on the second opens it.
+    cx.update(|window, cx| window.click("open-sample", cx));
+    let sample = workspace.read_with(cx, |w, _| w.sample_view()).expect("the sample text opens");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.render_frame(cx));
+    let boxes = sample.read_with(cx, |s, _| s.glyph_boxes());
+    assert_eq!(boxes.iter().map(|b| b.1).collect::<Vec<_>>(), [0, 1]);
+    assert!(boxes[0].0.right() <= boxes[1].0.left() + px(0.5), "set one after another: {boxes:?}");
+    let center = boxes[1].0.center();
+    cx.update(|window, cx| window.drag(center, center, cx));
+    assert!(workspace.read_with(cx, |w, _| w.glyph_view(1)).is_some());
+}

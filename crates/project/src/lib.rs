@@ -27,6 +27,10 @@ use serde::{Deserialize, Serialize};
 /// The format version this crate writes and reads.
 pub const FORMAT: u32 = 1;
 
+/// The largest side a full-width glyph placed after a reference may have, as a fraction of the em:
+/// neighbors do not touch.
+pub const FULL_WIDTH_LIMIT: f64 = 0.96;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     pub font: FontInfo,
@@ -237,8 +241,8 @@ impl Glyph {
     ///   characters (一, 丨) the long side, keeping the hand's proportions; `strength` (0 to 1) goes
     ///   from the size written to the reference's;
     /// - across: a full-width reference (an em wide) has the box centered on the reference's, and
-    ///   the advance an em; otherwise the reference's side bearings around the box make the
-    ///   advance;
+    ///   the advance an em, and it stays within [`FULL_WIDTH_LIMIT`] of the em; otherwise the
+    ///   reference's side bearings around the box make the advance;
     /// - up and down: a reference sitting on the baseline (letters, digits) has the box sit there
     ///   too; otherwise the box is centered on the reference's.
     pub fn fit(&mut self, frame: &Frame, info: &FontInfo, strength: f64) {
@@ -255,8 +259,14 @@ impl Glyph {
         // From the size written towards the reference's, as far as `strength` goes.
         let (now, wanted) = (measure(b), measure(r));
         self.scale_ink_to(info, measure, now * (wanted / now.max(1e-9)).max(1e-3).powf(strength.clamp(0.0, 1.0)));
-        let b = self.ink_bounds(info).expect("strokes");
         let full_width = (frame.advance - em).abs() <= 0.02 * em;
+        // A wide hand kept in proportion may outgrow the em: full-width characters stay inside it,
+        // clear of their neighbors.
+        let longest = |b: Rect| b.width().max(b.height());
+        if full_width && longest(self.ink_bounds(info).expect("strokes")) > FULL_WIDTH_LIMIT * em {
+            self.scale_ink_to(info, longest, FULL_WIDTH_LIMIT * em);
+        }
+        let b = self.ink_bounds(info).expect("strokes");
         let on_baseline = r.y0.abs() <= 0.02 * em;
         let dx = if full_width { r.center().x - b.center().x } else { r.x0 - b.x0 };
         let dy = if on_baseline { r.y0 - b.y0 } else { r.center().y - b.center().y };
@@ -619,6 +629,11 @@ mod tests {
         g.fit(&Frame { bounds: Rect::new(40.0, 0.0, 540.0, 700.0), advance: 600.0 }, &info, 1.0);
         assert!(close(g.bounds().unwrap(), Rect::new(40.0, 0.0, 540.0, 700.0)), "{:?}", g.bounds());
         assert_eq!(g.advance, 600.0);
+        // A wide hand with the reference's area would outgrow the em: it is kept inside.
+        let mut g = boxed(1000.0, 450.0);
+        g.fit(&Frame { bounds: Rect::new(100.0, -50.0, 900.0, 750.0), advance: 1000.0 }, &info, 1.0);
+        let b = g.bounds().unwrap();
+        assert!((b.width() - FULL_WIDTH_LIMIT * 1000.0).abs() < 0.01 && (b.center().x - 500.0).abs() < 1e-6, "{b:?}");
         // At strength 0 the size stays, only the place changes.
         let mut g = boxed(400.0, 350.0);
         g.fit(&Frame { bounds: Rect::new(100.0, -50.0, 900.0, 650.0), advance: 1000.0 }, &info, 0.0);

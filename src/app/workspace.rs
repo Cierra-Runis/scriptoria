@@ -19,9 +19,11 @@ use scriptoria_project::Project;
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::font_view::{FontView, FontViewEvent};
 use crate::app::glyph_view::GlyphView;
+use crate::app::outlines::Outlines;
+use crate::app::sample_view::{SampleEvent, SampleView};
 use crate::app::viewer::{Viewer, ViewerEvent};
 
-actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, ExportFont, Quit, Undo, Redo]);
+actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, ExportFont, Quit, Undo, Redo, ShowSample]);
 
 /// Key bindings and menus, once at startup.
 pub fn init(cx: &mut App) {
@@ -37,6 +39,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, None),
         KeyBinding::new("ctrl-y", Redo, None),
         KeyBinding::new("ctrl-shift-z", Redo, None),
+        KeyBinding::new("ctrl-t", ShowSample, None),
     ]);
     GlobalState::global_mut(cx).set_app_menus(menus().into_iter().map(Menu::owned).collect());
     cx.set_menus(menus());
@@ -66,6 +69,7 @@ fn menus() -> Vec<Menu> {
             items: vec![MenuItem::action("撤销", Undo), MenuItem::action("重做", Redo)],
             disabled: false,
         },
+        Menu { name: "视图".into(), items: vec![MenuItem::action("样张", ShowSample)], disabled: false },
     ]
 }
 
@@ -75,12 +79,15 @@ enum Page {
     Pdf { title: SharedString, source: String, view: Entity<Viewer> },
     /// A glyph, by its index in the project.
     Glyph { title: SharedString, glyph: usize, view: Entity<GlyphView> },
+    /// The sample text.
+    Sample { view: Entity<SampleView> },
 }
 
 impl Page {
     fn title(&self) -> SharedString {
         match self {
             Page::Pdf { title, .. } | Page::Glyph { title, .. } => title.clone(),
+            Page::Sample { .. } => "样张".into(),
         }
     }
 }
@@ -88,6 +95,8 @@ impl Page {
 pub struct Workspace {
     focus: FocusHandle,
     document: Entity<Document>,
+    /// The glyphs' outlines, for the grid and the sample text.
+    outlines: Entity<Outlines>,
     font_view: Entity<FontView>,
     pages: Vec<Page>,
     active: usize,
@@ -101,7 +110,8 @@ impl Workspace {
     /// `start`: a project folder to open and PDFs to import, in any order.
     pub fn new(start: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let document = cx.new(|_| Document::new(Project::new("我的手写体"), None));
-        let font_view = cx.new(|cx| FontView::new(document.clone(), window, cx));
+        let outlines = cx.new(|cx| Outlines::new(document.clone(), cx));
+        let font_view = cx.new(|cx| FontView::new(document.clone(), outlines.clone(), window, cx));
         let subscriptions = vec![
             cx.observe_in(&document, window, |this, _, window, cx| this.update_title(window, cx)),
             cx.subscribe_in(&document, window, |this, _, event: &DocumentEvent, window, cx| {
@@ -117,11 +127,13 @@ impl Workspace {
             cx.subscribe_in(&font_view, window, |this, _, event: &FontViewEvent, window, cx| match event {
                 FontViewEvent::Selected(_) => this.refresh_pages(cx),
                 FontViewEvent::Open(glyph) => this.open_glyph(*glyph, window, cx),
+                FontViewEvent::OpenSample => this.open_sample(window, cx),
             }),
         ];
         let mut this = Workspace {
             focus: cx.focus_handle(),
             document,
+            outlines,
             font_view,
             pages: Vec::new(),
             active: 0,
@@ -156,12 +168,40 @@ impl Workspace {
         &self.font_view
     }
 
+    pub fn outlines(&self) -> &Entity<Outlines> {
+        &self.outlines
+    }
+
     /// The viewer of the PDF in tab `index`.
     pub fn pdf_view(&self, index: usize) -> Option<Entity<Viewer>> {
         match self.pages.get(index)? {
             Page::Pdf { view, .. } => Some(view.clone()),
-            Page::Glyph { .. } => None,
+            _ => None,
         }
+    }
+
+    /// The sample text, if open in a tab.
+    pub fn sample_view(&self) -> Option<Entity<SampleView>> {
+        self.pages.iter().find_map(|p| match p {
+            Page::Sample { view } => Some(view.clone()),
+            _ => None,
+        })
+    }
+
+    /// Shows the sample text in its tab, opened if needed.
+    pub fn open_sample(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = match self.pages.iter().position(|p| matches!(p, Page::Sample { .. })) {
+            Some(i) => i,
+            None => {
+                let view = cx.new(|cx| SampleView::new(self.document.clone(), self.outlines.clone(), window, cx));
+                self._subscriptions.push(cx.subscribe_in(&view, window, |this, _, event: &SampleEvent, window, cx| match event {
+                    SampleEvent::Open(glyph) => this.open_glyph(*glyph, window, cx),
+                }));
+                self.pages.push(Page::Sample { view });
+                self.pages.len() - 1
+            }
+        };
+        cx.notify();
     }
 
     /// The view of a glyph, if open in a tab.
@@ -282,7 +322,7 @@ impl Workspace {
             .iter()
             .filter_map(|p| match p {
                 Page::Pdf { source, view, .. } => Some((view.clone(), doc.used_strokes(source))),
-                Page::Glyph { .. } => None,
+                _ => None,
             })
             .collect();
         for (view, used) in updates {
@@ -455,6 +495,7 @@ impl Workspace {
         let content = match &self.pages[self.active.min(self.pages.len() - 1)] {
             Page::Pdf { view, .. } => view.clone().into_any_element(),
             Page::Glyph { view, .. } => view.clone().into_any_element(),
+            Page::Sample { view } => view.clone().into_any_element(),
         };
         v_flex().size_full().child(tabs).child(div().flex_1().min_h_0().child(content)).into_any_element()
     }
@@ -474,6 +515,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::export_font))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(|this, _: &ShowSample, window, cx| this.open_sample(window, cx)))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)

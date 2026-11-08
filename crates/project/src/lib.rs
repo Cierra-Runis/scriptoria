@@ -118,9 +118,9 @@ impl FontInfo {
 /// as the reference font's characters at about 3.1 pt per em (`examples/handwriting-size.rs`).
 pub const DEFAULT_PT_PER_EM: f64 = 3.1;
 
-/// The cells across and down a practice sheet's page.
-pub const TEMPLATE_COLUMNS: usize = 8;
-pub const TEMPLATE_ROWS: usize = 10;
+/// The cells across a practice sheet's page (as many rows as an A4-shaped page holds): each cell
+/// a small part of the page, as handwriting is in a notebook.
+pub const TEMPLATE_COLUMNS: usize = 24;
 
 /// A practice sheet made for the project: its characters, a cell each, laid out by its grid (see
 /// the template crate). Its id is on each page, so that written pages can be found again.
@@ -139,7 +139,7 @@ impl Project {
         let id = self.templates.iter().map(|t| t.id + 1).max().unwrap_or(1);
         let em = (self.font.ascender - self.font.descender) as f64;
         let cell = em / self.font.pen_scale();
-        let grid = scriptoria_template::Grid::new(cell, TEMPLATE_COLUMNS, TEMPLATE_ROWS, -self.font.descender as f64 / em);
+        let grid = scriptoria_template::Grid::portrait(cell, TEMPLATE_COLUMNS, -self.font.descender as f64 / em);
         self.templates.push(Template { id, chars: chars.iter().collect(), grid });
         self.templates.last().expect("just added")
     }
@@ -733,6 +733,7 @@ mod tests {
         let grid = p.new_template(&['世']).grid;
         // The em of 1000 units at the project's points per em, the baseline 120 units up.
         assert!((grid.cell - DEFAULT_PT_PER_EM).abs() < 1e-9 && (grid.baseline - 0.12).abs() < 1e-9, "{grid:?}");
-        assert_eq!((grid.columns(), grid.rows()), (TEMPLATE_COLUMNS, TEMPLATE_ROWS));
+        assert_eq!(grid.columns(), TEMPLATE_COLUMNS);
+        assert!(grid.rows() > TEMPLATE_COLUMNS, "a page standing up: {grid:?}");
     }
 }

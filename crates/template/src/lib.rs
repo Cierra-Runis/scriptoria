@@ -11,8 +11,8 @@
 //! they lie in.
 //!
 //! A sheet is sized by its squares, made as large as the handwriting is written (the em in page
-//! points), everything else in proportion: the page holds a set number of cells, so that it is
-//! seen whole at the zoom the hand writes at.
+//! points), everything else in proportion; a page holds many squares across, each a small part of
+//! it as handwriting is of a notebook's page, and is shaped as A4 ([`Grid::portrait`]).
 //!
 //! Pages are vector drawings in colors of their own ([`is_sheet_color`]), which nothing written on
 //! them is expected to use: a reader tells the sheet's drawing from the handwriting by its color.
@@ -100,6 +100,15 @@ pub struct Cell {
 }
 
 impl Grid {
+    /// Pages `columns` squares of side `cell` wide (the rest in proportion), with as many rows as
+    /// fit in the shape of an ISO page (A4) standing up.
+    pub fn portrait(cell: f64, columns: usize, baseline: f64) -> Grid {
+        let width = Grid::new(cell, columns, 1, baseline).width;
+        let (margin, row) = (MARGIN_SHARE * cell, (LABEL_SHARE + 1.0 + GAP_SHARE) * cell);
+        let rows = ((width * std::f64::consts::SQRT_2 - 2.0 * margin + GAP_SHARE * cell) / row).floor() as usize;
+        Grid::new(cell, columns, rows.max(1), baseline)
+    }
+
     /// Pages of `columns` × `rows` squares of side `cell`, the rest in proportion (a page is made
     /// wide enough for its code, which may give it more columns).
     pub fn new(cell: f64, columns: usize, rows: usize, baseline: f64) -> Grid {
@@ -445,6 +454,11 @@ mod tests {
         // Too narrow for the code: wider, so more columns.
         let narrow = Grid::new(10.0, 2, 3, 0.12);
         assert!(narrow.columns() > 2 && narrow.code_squares().last().unwrap().x1 <= narrow.width - narrow.margin + 1e-9);
+        // Many squares to a row, on a page shaped as A4: within a row of it.
+        let page = Grid::portrait(3.1, 24, 0.12);
+        assert_eq!(page.columns(), 24);
+        let row = page.label + page.cell + page.gap;
+        assert!(page.height <= page.width * std::f64::consts::SQRT_2 + 1e-9 && page.height > page.width * std::f64::consts::SQRT_2 - row, "{page:?}");
     }
 
     #[test]

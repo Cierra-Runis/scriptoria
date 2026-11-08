@@ -107,6 +107,25 @@ impl ReferenceFont {
         FontRef::from_index(&self.data, self.face.index).expect("checked when opened")
     }
 
+    /// The ideographic character face (the box ideographs keep within), from the font's BASE
+    /// table: its bottom and top (`icfb`, `icft` of the Han script), scaled to `units_per_em`;
+    /// none if the font does not say.
+    pub fn ideographic_face(&self, units_per_em: f64) -> Option<(f64, f64)> {
+        use skrifa::raw::types::Tag;
+        let font = self.font();
+        let axis = font.base().ok()?.horiz_axis()?.ok()?;
+        let tags: Vec<Tag> = axis.base_tag_list()?.ok()?.baseline_tags().iter().map(|t| t.get()).collect();
+        let scripts = axis.base_script_list().ok()?;
+        let record = scripts.base_script_records().iter().find(|r| r.base_script_tag() == Tag::new(b"hani"))?;
+        let values = record.base_script(scripts.offset_data()).ok()?.base_values()?.ok()?;
+        let k = units_per_em / self.units_per_em;
+        let coord = |tag: &[u8; 4]| {
+            let i = tags.iter().position(|t| *t == Tag::new(tag))?;
+            values.base_coords().get(i).ok().map(|c| c.coordinate() as f64 * k)
+        };
+        Some((coord(b"icfb")?, coord(b"icft")?))
+    }
+
     /// Whether the font maps a character to a glyph.
     pub fn has(&self, c: char) -> bool {
         self.font().charmap().map(c).is_some()

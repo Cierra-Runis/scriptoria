@@ -6,7 +6,9 @@
 //! adds a range); a block is filled in with the characters the reference font has. A click
 //! selects a glyph (Ctrl adds or removes, Shift selects a range), a double click opens it.
 //! Selected glyphs are placed after the reference font, made full width, centered, given a
-//! practice sheet or removed all at once; a sheet is written out again or forgotten.
+//! practice sheet or removed all at once; a sheet is written out again or forgotten. Above the grid:
+//! the weight the handwriting is, and how large the hand writes (points per em, typed or measured
+//! against the reference font).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
@@ -16,7 +18,8 @@ use gpui::TestSupportExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::slider::{Slider, SliderEvent, SliderState};
-use gpui::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui::component::notification::Notification;
+use gpui::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClickEvent, Context, Entity, EventEmitter, Pixels, SharedString, Subscription, Window, canvas, div,
@@ -86,6 +89,8 @@ pub struct FontView {
     meshes: Rc<RefCell<HashMap<usize, (u64, Rc<Vec<Rc<Mesh>>>)>>>,
     /// The weight the strokes as written are (`wght`), set when the slider is let go.
     written: Entity<SliderState>,
+    /// How large the hand writes (points per em), set on Enter.
+    scale: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -94,6 +99,8 @@ impl FontView {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("输入要做的字或 U+4E00-U+4E2F，回车加入"));
         let written_weight = document.read(cx).project.font.written_weight;
         let written = cx.new(|_| SliderState::new().max(AXIS.max as f32).min(WRITTEN_MIN as f32).step(10.0).default_value(written_weight as f32));
+        let pt_per_em = document.read(cx).project.font.pt_per_em;
+        let scale = cx.new(|cx| InputState::new(window, cx).default_value(format_scale(pt_per_em)));
         let subscriptions = vec![
             cx.subscribe(&written, |this, _, event: &SliderEvent, cx| match event {
                 SliderEvent::Change(_) => cx.notify(),
@@ -107,6 +114,14 @@ impl FontView {
                 if matches!(event, DocumentEvent::Font | DocumentEvent::Saved) {
                     let w = document.read(cx).project.font.written_weight as f32;
                     this.written.update(cx, |s, cx| s.set_value(w, window, cx));
+                    let pt = format_scale(document.read(cx).project.font.pt_per_em);
+                    this.scale.update(cx, |s, cx| s.set_value(pt, window, cx));
+                }
+            }),
+            cx.subscribe_in(&scale, window, |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    let text = input.read(cx).value().to_string();
+                    this.set_scale(&text, window, cx);
                 }
             }),
             cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| {
@@ -151,6 +166,7 @@ impl FontView {
             width: Rc::new(Cell::new(px(600.0))),
             meshes: Rc::default(),
             written,
+            scale,
             _subscriptions: subscriptions,
         }
     }
@@ -314,6 +330,43 @@ impl FontView {
         let Some(reference) = doc.reference().cloned() else { return 0 };
         let missing = groups::missing_in_block(&doc.project, start, |c| reference.has(c));
         self.add_chars(&missing, cx)
+    }
+
+    /// Sets how large the hand writes (points per em) from what was typed; puts the value back if
+    /// it is no size.
+    fn set_scale(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = text.trim().trim_end_matches("pt").trim().parse::<f64>().ok().filter(|v| (0.5..=500.0).contains(v));
+        match typed {
+            Some(pt) => self.document.update(cx, |d, cx| d.update_font(|f| f.pt_per_em = pt, cx)),
+            None => {
+                let pt = format_scale(self.document.read(cx).project.font.pt_per_em);
+                self.scale.update(cx, |s, cx| s.set_value(pt, window, cx));
+                if !text.trim().is_empty() {
+                    window.push_notification(Notification::warning("手写字号要填 0.5 到 500 之间的磅数"), cx);
+                }
+            }
+        }
+    }
+
+    /// Sets how large the hand writes from the glyphs written so far, as the reference font
+    /// measures them (see [`crate::assign::estimate_pt_per_em`]).
+    fn estimate_scale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        let Some(reference) = doc.reference().cloned() else {
+            window.push_notification(Notification::warning("没有参考字体，没法估计"), cx);
+            return;
+        };
+        match crate::assign::estimate_pt_per_em(&doc.project, &reference) {
+            Some((pt, n)) => {
+                let pt = (pt * 100.0).round() / 100.0;
+                self.document.update(cx, |d, cx| d.update_font(|f| f.pt_per_em = pt, cx));
+                window.push_notification(
+                    Notification::success(format!("按 {n} 个已写的字估计：每 em {pt} pt。之后分配的笔画和新生成的模板按这个大小（可撤销）")),
+                    cx,
+                );
+            }
+            None => window.push_notification(Notification::warning("还没有可以量的字：先写几个参考字体里有的字"), cx),
+        }
     }
 
     fn columns(&self) -> usize {
@@ -540,6 +593,12 @@ impl FontView {
     }
 }
 
+/// A size in points per em as shown.
+fn format_scale(pt: f64) -> String {
+    let text = format!("{pt:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// A glyph's strokes as written, placed in the em, y down from the ascender (font units).
 pub fn glyph_meshes(glyph: &Glyph, ascender: f64) -> Vec<Rc<Mesh>> {
     let flip = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, ascender]);
@@ -650,6 +709,26 @@ impl Render for FontView {
                                 weights.scale(AXIS.min),
                                 weights.scale(AXIS.max)
                             ))),
+                    )
+                    .child(
+                        // How large the hand writes: new strokes are placed at it, sheets' squares are its em.
+                        h_flex()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .text_xs()
+                            .child(div().flex_shrink_0().child("手写字号"))
+                            .child(div().w(px(64.0)).flex_shrink_0().child(Input::new(&self.scale).xsmall().id("pt-per-em")))
+                            .child(div().flex_shrink_0().child("pt / em"))
+                            .child(
+                                Button::new("estimate-scale")
+                                    .xsmall()
+                                    .label("按已写的字估计")
+                                    .tooltip("量已写的字和参考字体比有多大。之后分配的笔画、新生成的格子模板的方格都按这个大小")
+                                    .on_click(cx.listener(|this, _, window, cx| this.estimate_scale(window, cx))),
+                            )
                     )
                     .child(
                         h_flex()

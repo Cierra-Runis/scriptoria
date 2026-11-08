@@ -425,11 +425,11 @@ fn the_grid_and_the_sample_show_the_font(cx: &mut TestAppContext) {
 fn written_sheet(template: &scriptoria_project::Template, strokes: &[(usize, Vec<Stroke>)]) -> Vec<u8> {
     use scriptoria_ink::kurbo::{Affine, PathEl, Shape as _};
     use scriptoria_template::pdf_writer::{Content, Pdf, Rect as PdfRect, Ref};
-    use scriptoria_template::{FAINT, Heights, Model, Sheet};
+    use scriptoria_template::{FAINT, Lines, Model, Sheet};
     let grid = &template.grid;
     let chars: Vec<char> = template.chars.chars().collect();
     let model = |_| Some(Model { outline: scriptoria_ink::kurbo::Rect::new(100.0, -50.0, 900.0, 800.0).to_path(0.1), advance: 1000.0 });
-    let sheet = Sheet { grid: *grid, id: template.id, chars: &chars, models: &model, heights: Heights::default() };
+    let sheet = Sheet { grid: *grid, id: template.id, chars: &chars, models: &model, lines: Lines::default() };
     let mut c = Content::new();
     sheet.draw_page(&mut c, 0);
     c.set_fill_rgb(0.1, 0.1, 0.1);
@@ -589,5 +589,36 @@ fn glyphs_are_grouped_and_removed_together(cx: &mut TestAppContext) {
     assert_eq!(templates(cx), 0);
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert_eq!(templates(cx), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui_kit::test]
+fn the_hands_size_is_typed_and_sheets_follow_it(cx: &mut TestAppContext) {
+    let (workspace, cx) = open(vec![], cx);
+    let font = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, cx| w.document().read(cx).project.font.clone());
+    assert_eq!(font(cx).pt_per_em, scriptoria_project::DEFAULT_PT_PER_EM);
+    cx.update(|window, cx| {
+        window.click("pt-per-em", cx);
+        window.press("ctrl-a", cx);
+        window.input("2.8", cx);
+        window.press("enter", cx);
+    });
+    assert_eq!(font(cx).pt_per_em, 2.8);
+    // Not a size: the value stays.
+    cx.update(|window, cx| {
+        window.press("ctrl-a", cx);
+        window.input("big", cx);
+        window.press("enter", cx);
+    });
+    assert_eq!(font(cx).pt_per_em, 2.8);
+    // A sheet's squares are the em at that size.
+    let dir = std::env::temp_dir().join(format!("scriptoria-scale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    workspace.update_in(cx, |w, window, cx| w.make_template_to(dir.join("sheet.pdf"), &['口'], false, window, cx));
+    let cell = workspace.read_with(cx, |w, cx| w.document().read(cx).project.templates[0].grid.cell);
+    assert!((cell - 2.8).abs() < 1e-9, "{cell}");
+    // Undo takes the size back (after the sheet).
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(font(cx).pt_per_em, scriptoria_project::DEFAULT_PT_PER_EM);
     std::fs::remove_dir_all(&dir).ok();
 }

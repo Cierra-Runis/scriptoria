@@ -31,7 +31,7 @@ use crate::app::mesh::Mesh;
 use crate::app::theme::palette;
 use crate::font::{AXIS, Weights};
 
-/// Tessellation tolerance (pt, the strokes' own units): an em of 4.5 pt is some 600 px here.
+/// Tessellation tolerance (pt, the strokes' own units): an em of a few pt is some 600 px here.
 const TOLERANCE: f32 = 0.001;
 /// How closely regenerated outlines follow the strokes (pt, made font units by the pen scale), as
 /// in the font.

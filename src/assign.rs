@@ -103,3 +103,89 @@ pub fn skeleton_of(pieces: &[SkeletonPiece], t: Affine, radius: f64) -> Skeleton
         quality: Default::default(),
     }
 }
+
+/// How large a project's hand writes, as the reference font measures it: the points per em (see
+/// [`FontInfo::pt_per_em`]) at which its written glyphs are as large as the reference's
+/// characters, by the square root of their ink boxes' areas, the median over the glyphs (those
+/// written in one place, that the reference has); with how many glyphs that is. None without any.
+pub fn estimate_pt_per_em(project: &Project, reference: &ReferenceFont) -> Option<(f64, usize)> {
+    use scriptoria_ink::kurbo::Shape as _;
+    let upm = project.font.units_per_em as f64;
+    let mut sizes: Vec<f64> = project
+        .glyphs
+        .iter()
+        .filter_map(|g| {
+            let c = *g.chars.first()?;
+            // Outlines are in their page's coordinates: all from one page, or the box means nothing.
+            let page = |s: &GlyphStroke| s.origin.as_ref().map(|o| (o.source.clone(), o.page));
+            let first = page(g.strokes.first()?);
+            if g.strokes.iter().any(|s| page(s) != first) {
+                return None;
+            }
+            let hand = g.strokes.iter().map(|s| s.outline.path.bounding_box()).reduce(|a, b| a.union(b))?;
+            let model = reference.glyph(c, upm)?.bounds;
+            (hand.area() > 0.0 && model.area() > 0.0).then(|| (hand.area() / model.area()).sqrt() * upm)
+        })
+        .collect();
+    if sizes.is_empty() {
+        return None;
+    }
+    sizes.sort_by(f64::total_cmp);
+    Some((sizes[sizes.len() / 2], sizes.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptoria_font::{Axis, FontSource, build};
+    use scriptoria_ink::kurbo::Shape as _;
+
+    /// A reference font with 口 an 800 × 800 square.
+    fn reference() -> ReferenceFont {
+        let square = Rect::new(100.0, -50.0, 900.0, 750.0).to_path(0.1);
+        let glyph = scriptoria_font::Glyph {
+            name: "uni53E3".into(),
+            chars: vec!['口'],
+            advance: 1000.0,
+            masters: vec![(100.0, square.clone()), (400.0, square.clone()), (900.0, square)],
+        };
+        let source = FontSource {
+            family: "Measure".into(),
+            units_per_em: 1000,
+            ascender: 880,
+            descender: -120,
+            axis: Axis { min: 100.0, default: 400.0, max: 900.0 },
+            instances: vec![("Regular".into(), 400.0)],
+            glyphs: vec![glyph],
+            accuracy: 0.5,
+            tolerance: 0.0,
+        };
+        ReferenceFont::from_bytes(build(&source).unwrap(), None).unwrap()
+    }
+
+    fn stroke(page: usize, r: Rect) -> GlyphStroke {
+        GlyphStroke {
+            origin: Some(StrokeOrigin { source: "s1".into(), page, index: 0 }),
+            outline: Outline { kind: OutlineKind::Filled, path: r.to_path(0.1) },
+            skeleton: Vec::new(),
+            placement: Affine::IDENTITY,
+            pen: 1.0,
+        }
+    }
+
+    #[test]
+    fn the_hands_size_is_measured_by_the_reference() {
+        let mut p = Project::new("x");
+        assert_eq!(estimate_pt_per_em(&p, &reference()), None);
+        p.add_chars("口一");
+        // 口 written 2.4 pt square (two strokes), as large as the reference's 800 units at 3 pt per em.
+        p.glyphs[0].strokes = vec![stroke(0, Rect::new(10.0, 10.0, 12.4, 11.0)), stroke(0, Rect::new(10.0, 11.0, 11.0, 12.4))];
+        // 一 is not in the reference.
+        p.glyphs[1].strokes = vec![stroke(0, Rect::new(0.0, 0.0, 3.0, 0.3))];
+        let (pt, n) = estimate_pt_per_em(&p, &reference()).unwrap();
+        assert!((pt - 3.0).abs() < 1e-6 && n == 1, "{pt}");
+        // Strokes from two pages do not make one box.
+        p.glyphs[0].strokes[1] = stroke(1, Rect::new(10.0, 11.0, 11.0, 12.4));
+        assert_eq!(estimate_pt_per_em(&p, &reference()), None);
+    }
+}

@@ -58,3 +58,27 @@ fn a_single_font_has_one_face() {
     assert!(ReferenceFont::from_bytes(font(), Some(1)).is_err());
     assert!(ReferenceFont::from_bytes(b"not a font".to_vec(), None).is_err());
 }
+
+/// The font with a BASE table giving the Han script's ideographic face: −80 to 840.
+fn font_with_face() -> Vec<u8> {
+    use write_fonts::FontBuilder;
+    use write_fonts::read::FontRef;
+    use write_fonts::tables::base::{Axis, Base, BaseCoord, BaseScript, BaseScriptList, BaseScriptRecord, BaseTagList, BaseValues};
+    use write_fonts::types::Tag;
+    let plain = font();
+    let tags = vec![Tag::new(b"icfb"), Tag::new(b"icft"), Tag::new(b"romn")];
+    let values = BaseValues::new(2, vec![BaseCoord::format_1(-80), BaseCoord::format_1(840), BaseCoord::format_1(0)]);
+    let script = BaseScriptRecord::new(Tag::new(b"hani"), BaseScript::new(Some(values), None, Vec::new()));
+    let base = Base::new(Some(Axis::new(Some(BaseTagList::new(tags)), BaseScriptList::new(vec![script]))), None);
+    let mut builder = FontBuilder::new();
+    builder.add_table(&base).expect("BASE");
+    builder.copy_missing_tables(FontRef::new(&plain).expect("the font")).build()
+}
+
+#[test]
+fn the_ideographic_face_comes_from_the_base_table() {
+    let reference = ReferenceFont::from_bytes(font_with_face(), None).expect("a font");
+    assert_eq!(reference.ideographic_face(2000.0), Some((-160.0, 1680.0)));
+    // A font that does not say.
+    assert_eq!(ReferenceFont::from_bytes(font(), None).unwrap().ideographic_face(1000.0), None);
+}

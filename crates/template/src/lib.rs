@@ -3,11 +3,12 @@
 //!
 //! A cell is a writing square (the em, descender to ascender) under a strip showing the character
 //! to write. In the square, the reference font's character is drawn faintly ([`MODEL_ALPHA`]) to
-//! write over, with lines at its edges, so that each character comes out as large as the
-//! reference's and where it is; and guides: for CJK characters the middle lines (田), for others
-//! the baseline and the reference's x-height and cap height. Each page carries a code at its foot,
-//! a row of small squares, saying which sheet and which page it is, so that the strokes written on
-//! it can be put into their characters' glyphs by the cells they lie in.
+//! write over, so that each character comes out as large as the reference's and where it is; and
+//! the reference font's design lines ([`Lines`]): for CJK characters the ideographic face and the
+//! middle lines (田), for others the baseline, ascender, cap height, x-height and descender. Each
+//! page carries a code at its foot, a row of small squares, saying which sheet and which page it
+//! is, so that the strokes written on it can be put into their characters' glyphs by the cells
+//! they lie in.
 //!
 //! A sheet is sized by its squares, made as large as the handwriting is written (the em in page
 //! points), everything else in proportion: the page holds a set number of cells, so that it is
@@ -17,7 +18,7 @@
 //! them is expected to use: a reader tells the sheet's drawing from the handwriting by its color.
 //! Page coordinates here are as in the ink crate: points, the origin at the top left, y down.
 
-use kurbo::{BezPath, PathEl, Point, Rect, Shape as _};
+use kurbo::{BezPath, PathEl, Point, Rect};
 pub use pdf_writer;
 use pdf_writer::{Content, Name, Pdf, Rect as PdfRect, Ref};
 use serde::{Deserialize, Serialize};
@@ -215,11 +216,17 @@ pub struct Model {
     pub advance: f64,
 }
 
-/// Heights of the reference font that letters are written against (units as [`Model`]).
+/// The reference font's design lines, drawn in the squares (heights as [`Model`]'s y): for letters
+/// and the like the ascender, cap height, x-height and descender (with the baseline); for CJK
+/// characters the ideographic face, the box they keep within (its bottom and top; its sides as far
+/// in from the square's).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Heights {
-    pub x_height: Option<f64>,
+pub struct Lines {
+    pub ascender: Option<f64>,
     pub cap_height: Option<f64>,
+    pub x_height: Option<f64>,
+    pub descender: Option<f64>,
+    pub face: Option<(f64, f64)>,
 }
 
 /// The name a page's resources give the faint drawing state (see [`write_faint_state`]).
@@ -238,7 +245,7 @@ pub struct Sheet<'a> {
     pub chars: &'a [char],
     /// How the reference font draws a character; characters without one get an empty square.
     pub models: &'a dyn Fn(char) -> Option<Model>,
-    pub heights: Heights,
+    pub lines: Lines,
 }
 
 impl Sheet<'_> {
@@ -305,37 +312,44 @@ impl Sheet<'_> {
                 }
                 c.restore_state();
             }
-            // The guides, dashed: the middle lines, or the baseline and the letters' heights.
+            // The reference font's lines. CJK: the ideographic face (solid), the middle lines
+            // (dashed). Others: the baseline (solid); the ascender, cap height, x-height and
+            // descender (dashed; a descender may reach into the gap below the square).
             let (r, g, b) = rgb(GUIDE);
             c.set_stroke_rgb(r, g, b);
+            let across = |c: &mut Content, height: f64| {
+                let y = base - height * unit;
+                line(c, Point::new(sq.x0, y), Point::new(sq.x1, y));
+            };
             c.set_line_width(0.5 * k);
-            c.set_dash_pattern([2.0 * k, 2.0 * k], 0.0);
             if is_square(ch) {
+                if let Some((bottom, top)) = self.lines.face {
+                    // As far in from the square's sides as from its top and bottom.
+                    let side = (1000.0 - (top - bottom)) / 2.0;
+                    let (a, b) = (Point::new(sq.x0 + side * unit, base - top * unit), Point::new(sq.x1 - side * unit, base - bottom * unit));
+                    let (x, y) = at(Point::new(a.x, b.y));
+                    c.rect(x, y, (b.x - a.x) as f32, (b.y - a.y) as f32);
+                    c.stroke();
+                }
+                c.set_line_width(0.4 * k);
+                c.set_dash_pattern([2.0 * k, 2.0 * k], 0.0);
                 let m = sq.center();
                 line(c, Point::new(sq.x0, m.y), Point::new(sq.x1, m.y));
                 line(c, Point::new(m.x, sq.y0), Point::new(m.x, sq.y1));
             } else {
-                line(c, Point::new(sq.x0, base), Point::new(sq.x1, base));
-                // Without the reference's heights: about the lowercase letters' height.
-                let x_height = self.heights.x_height.unwrap_or(0.55 * (1.0 - grid.baseline) * 1000.0);
-                for height in [Some(x_height), self.heights.cap_height].into_iter().flatten() {
-                    let y = base - height * unit;
-                    line(c, Point::new(sq.x0, y), Point::new(sq.x1, y));
+                across(c, 0.0);
+                c.stroke();
+                c.set_line_width(0.4 * k);
+                c.set_dash_pattern([2.0 * k, 2.0 * k], 0.0);
+                let l = &self.lines;
+                // Without the reference's x-height: about the lowercase letters'.
+                let x_height = l.x_height.unwrap_or(0.55 * (1.0 - grid.baseline) * 1000.0);
+                for height in [l.ascender, l.cap_height, Some(x_height), l.descender].into_iter().flatten() {
+                    across(c, height);
                 }
             }
             c.stroke();
             c.set_dash_pattern([], 0.0);
-            // The reference character's edges, solid.
-            if let Some(m) = &model {
-                let edges = m.outline.bounding_box();
-                if edges.area() > 0.0 || edges.width() > 0.0 || edges.height() > 0.0 {
-                    let (a, b) = (in_square(Point::new(edges.x0, edges.y1)), in_square(Point::new(edges.x1, edges.y0)));
-                    let (x, y) = at(Point::new(a.x, b.y));
-                    c.rect(x, y, (b.x - a.x) as f32, (b.y - a.y) as f32);
-                    c.set_line_width(0.4 * k);
-                    c.stroke();
-                }
-            }
             // The square.
             let (r, g, b) = rgb(FRAME);
             c.set_stroke_rgb(r, g, b);

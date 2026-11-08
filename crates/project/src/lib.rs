@@ -55,8 +55,9 @@ pub struct FontInfo {
     /// linear in the weight, from `thinnest` at 100 to the strokes as written here, and beyond.
     #[serde(default = "default_written_weight")]
     pub written_weight: f64,
-    /// How new strokes are placed: page units (pt) per em. It also sets the strokes' width in the
-    /// font, which does not change with a glyph's size (see [`FontInfo::pen_scale`]).
+    /// How large the hand writes: page units (pt) per em. New strokes are placed at this scale, and
+    /// it sets their width in the font, which does not change with a glyph's size (see
+    /// [`FontInfo::pen_scale`]); practice sheets' squares are the em at this size.
     pub pt_per_em: f64,
     /// The installed font whose glyphs show where characters sit and how big they are (see
     /// [`Glyph::fit`]).
@@ -97,7 +98,7 @@ impl Default for FontInfo {
             descender: -120,
             thinnest: default_thinnest(),
             written_weight: default_written_weight(),
-            pt_per_em: 4.5,
+            pt_per_em: DEFAULT_PT_PER_EM,
             reference: None,
             fit_strength: default_fit_strength(),
         }
@@ -112,6 +113,10 @@ impl FontInfo {
         self.units_per_em as f64 / self.pt_per_em
     }
 }
+
+/// Points per em of a new project: the sample's handwriting (Goodnotes, `test/test.pdf`) is as large
+/// as the reference font's characters at about 3.1 pt per em (`examples/handwriting-size.rs`).
+pub const DEFAULT_PT_PER_EM: f64 = 3.1;
 
 /// The cells across and down a practice sheet's page.
 pub const TEMPLATE_COLUMNS: usize = 8;
@@ -715,8 +720,9 @@ mod tests {
     #[test]
     fn initial_placement_puts_the_box_on_the_descender() {
         let info = FontInfo::default();
-        let t = initial_placement(Rect::new(10.0, 20.0, 14.5, 24.5), &info);
-        let (bottom_left, top_right) = (t * Point::new(10.0, 24.5), t * Point::new(14.5, 20.0));
+        let e = info.pt_per_em;
+        let t = initial_placement(Rect::new(10.0, 20.0, 10.0 + e, 20.0 + e), &info);
+        let (bottom_left, top_right) = (t * Point::new(10.0, 20.0 + e), t * Point::new(10.0 + e, 20.0));
         assert!((bottom_left - Point::new(0.0, -120.0)).hypot() < 1e-9);
         assert!((top_right - Point::new(1000.0, 880.0)).hypot() < 1e-9);
     }
@@ -725,8 +731,8 @@ mod tests {
     fn practice_squares_are_the_em_as_handwriting_is_written() {
         let mut p = Project::new("x");
         let grid = p.new_template(&['世']).grid;
-        // 4.5 pt to the em of 1000 units, the baseline 120 units up.
-        assert!((grid.cell - 4.5).abs() < 1e-9 && (grid.baseline - 0.12).abs() < 1e-9, "{grid:?}");
+        // The em of 1000 units at the project's points per em, the baseline 120 units up.
+        assert!((grid.cell - DEFAULT_PT_PER_EM).abs() < 1e-9 && (grid.baseline - 0.12).abs() < 1e-9, "{grid:?}");
         assert_eq!((grid.columns(), grid.rows()), (TEMPLATE_COLUMNS, TEMPLATE_ROWS));
     }
 }

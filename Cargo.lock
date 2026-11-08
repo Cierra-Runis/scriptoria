@@ -6474,6 +6474,7 @@ dependencies = [
  "memmap2",
  "scriptoria-font",
  "skrifa 0.49.0",
+ "write-fonts",
 ]
 
 [[package]]

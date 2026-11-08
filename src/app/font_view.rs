@@ -384,15 +384,14 @@ impl Render for FontView {
                                     this.document.update(cx, |d, cx| d.fit_to_reference(&glyphs, cx));
                                 })),
                         )
-                        .child(Button::new("full-width-selection").xsmall().label("全角").on_click(cx.listener({
-                            let font = font.clone();
-                            move |this, _, _, cx| this.edit_selection(cx, |g| g.fit_full_width(&font, FACE))
-                        })))
+                        .child(Button::new("full-width-selection").xsmall().label("全角").on_click(cx.listener(
+                            move |this, _, _, cx| this.edit_selection(cx, |g| g.fit_full_width(&font, FACE)),
+                        )))
                         .child(
                             Button::new("center-selection")
                                 .xsmall()
                                 .label("居中")
-                                .on_click(cx.listener(move |this, _, _, cx| this.edit_selection(cx, |g| g.center(&font)))),
+                                .on_click(cx.listener(|this, _, _, cx| this.edit_selection(cx, Glyph::center))),
                         ),
                 )
             })

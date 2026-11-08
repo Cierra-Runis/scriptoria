@@ -335,8 +335,7 @@ fn new_glyphs_take_the_reference_place(cx: &mut TestAppContext) {
         d.add_chars("世", cx);
         d.assign(0, "s1", 2, &shi_strokes(), cx);
     });
-    let info = document.read_with(cx, |d, _| d.project.font.clone());
-    let placed = |g: &Glyph| g.ink_bounds(&info).unwrap();
+    let placed = |g: &Glyph| g.ink_bounds().unwrap();
     let b = placed(&glyph(&workspace, cx));
     assert!((b.center() - SHI_FRAME.center()).hypot() < 0.5, "{b:?}");
     assert!((b.area() / SHI_FRAME.area() - 1.0).abs() < 0.01, "{b:?}");

@@ -9,8 +9,8 @@ use scriptoria_reference::ReferenceFont;
 use scriptoria_skeleton::{Piece, Sample, Skeleton};
 
 /// A written stroke as a glyph's stroke: its outline, its skeleton (recovered now) and where it
-/// came from, placed by `placement`.
-pub fn glyph_stroke(stroke: &Stroke, origin: Option<StrokeOrigin>, placement: Affine) -> GlyphStroke {
+/// came from, placed by `placement`, its width at `pen` (see [`GlyphStroke::pen`]).
+pub fn glyph_stroke(stroke: &Stroke, origin: Option<StrokeOrigin>, placement: Affine, pen: f64) -> GlyphStroke {
     let kind = match stroke.shape {
         StrokeShape::Outline { .. } => OutlineKind::Filled,
         StrokeShape::Line { width } => OutlineKind::Line { width },
@@ -20,7 +20,7 @@ pub fn glyph_stroke(stroke: &Stroke, origin: Option<StrokeOrigin>, placement: Af
         .iter()
         .map(|p| SkeletonPiece { circles: p.samples.iter().map(|s| (s.p, s.r)).collect(), spine: p.spine.clone() })
         .collect();
-    GlyphStroke { origin, outline: Outline { kind, path: stroke.path.clone() }, skeleton, placement }
+    GlyphStroke { origin, outline: Outline { kind, path: stroke.path.clone() }, skeleton, placement, pen }
 }
 
 /// Adds strokes (with where they came from) to the end of a glyph, in the order given, all
@@ -39,10 +39,10 @@ pub fn assign(project: &mut Project, glyph: usize, strokes: &[(&Stroke, StrokeOr
         let (a, b) = (s.origin.as_ref(), strokes.first().map(|(_, o)| o));
         a.zip(b).is_some_and(|(a, b)| a.source == b.source && a.page == b.page)
     };
-    let joining = g.strokes.last().filter(|s| same_page(s)).map(|s| s.placement);
+    let joining = g.strokes.last().filter(|s| same_page(s)).map(|s| (s.placement, s.pen));
     let was_empty = g.strokes.is_empty();
-    let placement = joining.unwrap_or_else(|| initial_placement(bounds, &info));
-    g.strokes.extend(strokes.iter().map(|(s, origin)| glyph_stroke(s, Some(origin.clone()), placement)));
+    let (placement, pen) = joining.unwrap_or_else(|| (initial_placement(bounds, &info), info.pen_scale()));
+    g.strokes.extend(strokes.iter().map(|(s, origin)| glyph_stroke(s, Some(origin.clone()), placement, pen)));
     if was_empty {
         g.advance = (bounds.width() * info.pen_scale()).round();
         if let Some(reference) = reference {
@@ -84,10 +84,10 @@ pub fn fit(glyph: &mut Glyph, info: &FontInfo, reference: &ReferenceFont) -> boo
     }
 }
 
-/// A glyph stroke's skeleton in font units: moved by its placement, its radii at the pen's width
-/// (`pen`, see [`FontInfo::pen_scale`]).
-pub fn placed_skeleton(stroke: &GlyphStroke, pen: f64) -> Skeleton {
-    skeleton_of(&stroke.skeleton, stroke.placement, pen)
+/// A glyph stroke's skeleton in font units: moved by its placement, its radii at its pen's width
+/// (see [`GlyphStroke::pen`]).
+pub fn placed_skeleton(stroke: &GlyphStroke) -> Skeleton {
+    skeleton_of(&stroke.skeleton, stroke.placement, stroke.pen)
 }
 
 /// A stored skeleton moved by `t`, its radii scaled by `radius`.

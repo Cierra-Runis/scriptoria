@@ -3,9 +3,10 @@
 //! ```text
 //! <svg viewBox="…" …>                          the em (font units, y flipped for viewing)
 //!   <g transform="scale(1 -1)">                font units, y up
-//!     <g class="stroke" data-origin="s1 2 1617" transform="matrix(a b c d e f)">
+//!     <g class="stroke" data-origin="s1 2 1617" data-pen="222.2" transform="matrix(a b c d e f)">
 //!                                              one per stroke, in writing order; the matrix is its
-//!                                              placement, page coordinates to font units
+//!                                              placement, page coordinates to font units; data-pen
+//!                                              its pen scale (font units per page unit for widths)
 //!       <path class="outline" data-kind="filled" d="…"/>               the stroke as written
 //!       <path class="outline" data-kind="line" data-width="0.25" d="…"/>
 //!       <path class="piece" data-r="r₀ r₁ …" d="M … C …"/>            its skeleton, a piece each:
@@ -49,7 +50,7 @@ pub(crate) fn write_strokes(glyph: &Glyph, font: &FontInfo) -> String {
     for stroke in &glyph.strokes {
         let [a, b, c, d, e, f] = stroke.placement.as_coeffs();
         let origin = stroke.origin.as_ref().map_or(String::new(), |o| format!(" data-origin=\"{} {} {}\"", escape(&o.source), o.page, o.index));
-        let _ = writeln!(s, "<g class=\"stroke\"{origin} transform=\"matrix({a} {b} {c} {d} {e} {f})\">");
+        let _ = writeln!(s, "<g class=\"stroke\"{origin} data-pen=\"{}\" transform=\"matrix({a} {b} {c} {d} {e} {f})\">", stroke.pen);
         match stroke.outline.kind {
             OutlineKind::Filled => {
                 let _ = writeln!(s, "<path class=\"outline\" data-kind=\"filled\" fill=\"{INK}\" d=\"{}\"/>", stroke.outline.path.to_svg());
@@ -90,7 +91,8 @@ fn centerline(piece: &SkeletonPiece) -> BezPath {
     path
 }
 
-pub(crate) fn read_strokes(text: &str) -> Result<Vec<GlyphStroke>, String> {
+/// `pen`: the pen scale of strokes that do not give theirs (files from before it was kept).
+pub(crate) fn read_strokes(text: &str, pen: f64) -> Result<Vec<GlyphStroke>, String> {
     let mut strokes: Vec<GlyphStroke> = Vec::new();
     let mut in_stroke = false;
     for tag in tags(text)? {
@@ -105,7 +107,11 @@ pub(crate) fn read_strokes(text: &str) -> Result<Vec<GlyphStroke>, String> {
                     }
                     None => None,
                 };
-                strokes.push(GlyphStroke { origin, outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: Vec::new(), placement });
+                let pen = match tag.get("data-pen") {
+                    Some(p) => number(&p)?,
+                    None => pen,
+                };
+                strokes.push(GlyphStroke { origin, outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: Vec::new(), placement, pen });
                 in_stroke = true;
             }
             ("g", true) => in_stroke = false,

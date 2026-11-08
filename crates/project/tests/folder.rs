@@ -30,6 +30,7 @@ fn stroke(x: f64, origin: Option<StrokeOrigin>, kind: OutlineKind) -> GlyphStrok
         outline: Outline { kind, path },
         skeleton: vec![piece, dot],
         placement: initial_placement(Rect::new(x, 0.0, x + 4.5, 4.5), &Default::default()) * Affine::rotate(0.01),
+        pen: 222.25,
     }
 }
 

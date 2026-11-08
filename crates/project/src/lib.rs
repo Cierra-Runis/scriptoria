@@ -103,9 +103,9 @@ impl Default for FontInfo {
 }
 
 impl FontInfo {
-    /// Font units per page unit for stroke widths: every stroke keeps the width of the pen that
-    /// wrote it, however large its glyph is made, so that glyphs scaled to balance one another
-    /// still match in weight.
+    /// The scale strokes from freely written pages are placed at: font units per page unit, at
+    /// [`FontInfo::pt_per_em`] (their [`GlyphStroke::pen`]). Also how closely outlines follow the
+    /// strokes is set at this scale, for every glyph alike.
     pub fn pen_scale(&self) -> f64 {
         self.units_per_em as f64 / self.pt_per_em
     }
@@ -189,9 +189,8 @@ impl Glyph {
 
     /// The ink's box (font units) as the font draws it at the strokes' own weight: see
     /// [`GlyphStroke::ink_bounds`].
-    pub fn ink_bounds(&self, info: &FontInfo) -> Option<Rect> {
-        let pen = info.pen_scale();
-        self.strokes.iter().map(|s| s.ink_bounds(pen)).reduce(|a, b| a.union(b))
+    pub fn ink_bounds(&self) -> Option<Rect> {
+        self.strokes.iter().map(GlyphStroke::ink_bounds).reduce(|a, b| a.union(b))
     }
 
     fn all(&self) -> Vec<usize> {
@@ -199,8 +198,8 @@ impl Glyph {
     }
 
     /// Moves all strokes sideways so that the left and right side bearings are equal.
-    pub fn center(&mut self, info: &FontInfo) {
-        if let Some(b) = self.ink_bounds(info) {
+    pub fn center(&mut self) {
+        if let Some(b) = self.ink_bounds() {
             let dx = ((self.advance - b.width()) / 2.0 - b.x0).round();
             self.transform_strokes(&self.all(), Affine::translate((dx, 0.0)));
         }
@@ -213,10 +212,10 @@ impl Glyph {
         let em = info.units_per_em as f64;
         self.advance = em;
         let longest = |b: Rect| b.width().max(b.height());
-        if !self.scale_ink_to(info, longest, face * em) {
+        if !self.scale_ink_to(longest, face * em) {
             return;
         }
-        let b = self.ink_bounds(info).expect("strokes");
+        let b = self.ink_bounds().expect("strokes");
         let center = Point::new(em / 2.0, (info.ascender as f64 + info.descender as f64) / 2.0);
         self.transform_strokes(&self.all(), Affine::translate(center - b.center()));
     }
@@ -224,9 +223,9 @@ impl Glyph {
     /// Scales all strokes about their box's center until `measure` of the ink's box is `target`.
     /// The pen's width does not scale with the strokes, so a few rounds are taken. False without
     /// strokes.
-    fn scale_ink_to(&mut self, info: &FontInfo, measure: impl Fn(Rect) -> f64, target: f64) -> bool {
+    fn scale_ink_to(&mut self, measure: impl Fn(Rect) -> f64, target: f64) -> bool {
         for _ in 0..8 {
-            let Some(b) = self.ink_bounds(info) else { return false };
+            let Some(b) = self.ink_bounds() else { return false };
             let k = target / measure(b).max(1e-9);
             if (k - 1.0).abs() < 1e-6 {
                 break;
@@ -246,7 +245,7 @@ impl Glyph {
     /// - up and down: a reference sitting on the baseline (letters, digits) has the box sit there
     ///   too; otherwise the box is centered on the reference's.
     pub fn fit(&mut self, frame: &Frame, info: &FontInfo, strength: f64) {
-        let Some(b) = self.ink_bounds(info) else { return };
+        let Some(b) = self.ink_bounds() else { return };
         let r = frame.bounds;
         let em = info.units_per_em as f64;
         let long = |w: f64, h: f64| w.max(h) > 2.5 * w.min(h);
@@ -258,15 +257,15 @@ impl Glyph {
         };
         // From the size written towards the reference's, as far as `strength` goes.
         let (now, wanted) = (measure(b), measure(r));
-        self.scale_ink_to(info, measure, now * (wanted / now.max(1e-9)).max(1e-3).powf(strength.clamp(0.0, 1.0)));
+        self.scale_ink_to(measure, now * (wanted / now.max(1e-9)).max(1e-3).powf(strength.clamp(0.0, 1.0)));
         let full_width = (frame.advance - em).abs() <= 0.02 * em;
         // A wide hand kept in proportion may outgrow the em: full-width characters stay inside it,
         // clear of their neighbors.
         let longest = |b: Rect| b.width().max(b.height());
-        if full_width && longest(self.ink_bounds(info).expect("strokes")) > FULL_WIDTH_LIMIT * em {
-            self.scale_ink_to(info, longest, FULL_WIDTH_LIMIT * em);
+        if full_width && longest(self.ink_bounds().expect("strokes")) > FULL_WIDTH_LIMIT * em {
+            self.scale_ink_to(longest, FULL_WIDTH_LIMIT * em);
         }
-        let b = self.ink_bounds(info).expect("strokes");
+        let b = self.ink_bounds().expect("strokes");
         let on_baseline = r.y0.abs() <= 0.02 * em;
         let dx = if full_width { r.center().x - b.center().x } else { r.x0 - b.x0 };
         let dy = if on_baseline { r.y0 - b.y0 } else { r.center().y - b.center().y };
@@ -281,15 +280,14 @@ fn scale_about(center: Point, k: f64) -> Affine {
 
 impl GlyphStroke {
     /// The ink's box (font units) at the stroke's own weight: its skeleton's circles where placed,
-    /// their radii at the pen's width (`pen`, font units per page unit, see
-    /// [`FontInfo::pen_scale`]) rather than scaled with the placement. Strokes without a skeleton
-    /// give their outline's box.
-    pub fn ink_bounds(&self, pen: f64) -> Rect {
+    /// their radii at the stroke's pen scale rather than scaled with the placement. Strokes
+    /// without a skeleton give their outline's box.
+    pub fn ink_bounds(&self) -> Rect {
         let circles = self.skeleton.iter().flat_map(|p| &p.circles);
         circles
             .map(|&(c, r)| {
                 let c = self.placement * c;
-                Rect::from_center_size(c, (2.0 * r * pen, 2.0 * r * pen))
+                Rect::from_center_size(c, (2.0 * r * self.pen, 2.0 * r * self.pen))
             })
             .reduce(|a, b| a.union(b))
             .unwrap_or_else(|| self.bounds())
@@ -316,6 +314,10 @@ pub struct GlyphStroke {
     pub skeleton: Vec<SkeletonPiece>,
     /// Page coordinates to font units (y up).
     pub placement: Affine,
+    /// Font units per page unit for the stroke's width: the scale it was first placed at. It does
+    /// not change when the stroke is scaled later, so that strokes keep the width of the pen that
+    /// wrote them, and glyphs scaled to balance one another still match in weight.
+    pub pen: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -411,7 +413,7 @@ impl Project {
                 Some(f) => {
                     let path = dir.join(f);
                     let text = std::fs::read_to_string(&path).map_err(|e| Error::Io(path.clone(), e))?;
-                    svg::read_strokes(&text).map_err(|e| Error::Svg(path, e))?
+                    svg::read_strokes(&text, file.font.pen_scale()).map_err(|e| Error::Svg(path, e))?
                 }
                 None => Vec::new(),
             };
@@ -552,6 +554,7 @@ mod tests {
                 outline: Outline { kind: OutlineKind::Filled, path: Rect::new(i as f64, 0.0, i as f64 + 1.0, 1.0).to_path(1e-3) },
                 skeleton: Vec::new(),
                 placement: Affine::IDENTITY,
+                pen: FontInfo::default().pen_scale(),
             })
             .collect();
         Glyph { name: "x".into(), chars: vec!['x'], advance: 10.0, strokes }
@@ -594,7 +597,7 @@ mod tests {
         g.transform_strokes(&[0], Affine::scale(200.0));
         // The centers move with the placement, the radius is the pen's: 0.1 pt.
         let r = 0.1 * pen;
-        let b = g.ink_bounds(&info).unwrap();
+        let b = g.ink_bounds().unwrap();
         for (got, want) in [(b.x0, -r), (b.x1, 200.0 + r), (b.y0, -r), (b.y1, r)] {
             assert!((got - want).abs() < 1e-9, "{b:?}");
         }
@@ -649,7 +652,7 @@ mod tests {
         g.strokes[0].placement = Affine::scale(info.pen_scale());
         let frame = Frame { bounds: Rect::new(100.0, -50.0, 900.0, 750.0), advance: 1000.0 };
         g.fit(&frame, &info, 1.0);
-        let b = g.ink_bounds(&info).unwrap();
+        let b = g.ink_bounds().unwrap();
         assert!((b.area().sqrt() - frame.bounds.area().sqrt()).abs() < 0.01, "{b:?}");
         assert!((b.center() - frame.bounds.center()).hypot() < 1e-6, "{b:?}");
     }
@@ -657,7 +660,7 @@ mod tests {
     #[test]
     fn glyphs_are_centered_and_fitted() {
         let mut g = squares(2);
-        g.center(&FontInfo::default());
+        g.center();
         assert_eq!(g.bounds(), Some(Rect::new(4.0, 0.0, 6.0, 1.0)));
         let info = FontInfo::default();
         g.fit_full_width(&info, 0.9);

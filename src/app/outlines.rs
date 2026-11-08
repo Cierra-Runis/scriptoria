@@ -117,7 +117,7 @@ impl Outlines {
                             .strokes
                             .iter()
                             .filter(|s| !s.skeleton.is_empty())
-                            .map(|s| scriptoria_outline::plan(&crate::assign::placed_skeleton(s, key.pen), &params))
+                            .map(|s| scriptoria_outline::plan(&crate::assign::placed_skeleton(s), &params))
                             .collect();
                         (*g, *key, Arc::new(plans))
                     })

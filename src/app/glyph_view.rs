@@ -88,10 +88,11 @@ impl View {
     }
 }
 
-/// The linear part of a placement (its scale and flip, not where it puts the stroke).
-fn linear(placement: Affine) -> [f64; 4] {
-    let [a, b, c, d, _, _] = placement.as_coeffs();
-    [a, b, c, d]
+/// What a stroke's regenerated outline depends on besides the stroke itself: the linear part of
+/// its placement (its scale and flip, not where it puts the stroke) and its pen.
+fn form(s: &GlyphStroke) -> [f64; 5] {
+    let [a, b, c, d, _, _] = s.placement.as_coeffs();
+    [a, b, c, d, s.pen]
 }
 
 /// What a stroke looks like, made from what it is and the linear part of its placement, so that
@@ -102,7 +103,7 @@ struct Shapes {
     /// The outline as written (page coordinates).
     original: Option<Rc<Mesh>>,
     /// What the plan and the regenerated outline are for.
-    linear: [f64; 4],
+    linear: [f64; 5],
     plan: Option<Arc<Plan>>,
     /// The outline regenerated at a radius scale: (scale, outline, mesh), in font units before the
     /// placement's translation. Its strokes keep the pen's width (see `FontInfo::pen_scale`).
@@ -112,7 +113,7 @@ struct Shapes {
 impl Shapes {
     fn new(s: &GlyphStroke) -> Self {
         let original = Mesh::from_path_with_tolerance(&s.outline.path, shape(s.outline.kind), true, TOLERANCE).map(Rc::new);
-        Shapes { skeleton: s.skeleton.clone(), outline: s.outline.clone(), original, linear: linear(s.placement), plan: None, regenerated: None }
+        Shapes { skeleton: s.skeleton.clone(), outline: s.outline.clone(), original, linear: form(s), plan: None, regenerated: None }
     }
 
     /// Whether these are the shapes of a stroke (wherever it is placed).
@@ -120,9 +121,10 @@ impl Shapes {
         self.skeleton == s.skeleton && self.outline == s.outline
     }
 
-    /// Follows a change of the placement's scale or flip: the regenerated outline is made again.
-    fn follow(&mut self, placement: Affine) {
-        let l = linear(placement);
+    /// Follows a change of the placement's scale or flip, or of the pen: the regenerated outline is
+    /// made again.
+    fn follow(&mut self, s: &GlyphStroke) {
+        let l = form(s);
         if self.linear.iter().zip(&l).any(|(a, b)| (a - b).abs() > 1e-9) {
             self.linear = l;
             self.plan = None;
@@ -356,7 +358,7 @@ impl GlyphView {
                     .map(|s| match old.iter().position(|o| o.is(s)) {
                         Some(i) => {
                             let mut shapes = old.swap_remove(i);
-                            shapes.follow(s.placement);
+                            shapes.follow(s);
                             shapes
                         }
                         None => Shapes::new(s),
@@ -394,7 +396,7 @@ impl GlyphView {
         if self.planning.is_some() {
             return;
         }
-        let jobs: Vec<(Vec<SkeletonPiece>, [f64; 4])> =
+        let jobs: Vec<(Vec<SkeletonPiece>, [f64; 5])> =
             self.shapes.iter().filter(|s| s.plan.is_none() && !s.skeleton.is_empty()).map(|s| (s.skeleton.clone(), s.linear)).collect();
         if jobs.is_empty() {
             return;
@@ -404,9 +406,9 @@ impl GlyphView {
         self.planning = Some(cx.spawn(async move |this, cx| {
             let plans = background
                 .spawn(async move {
-                    let plans = crate::par_map(&jobs, |(sk, [a, b, c, d])| {
+                    let plans = crate::par_map(&jobs, |(sk, [a, b, c, d, stroke_pen])| {
                         let shape = Affine::new([*a, *b, *c, *d, 0.0, 0.0]);
-                        Arc::new(scriptoria_outline::plan(&crate::assign::skeleton_of(sk, shape, pen), &params))
+                        Arc::new(scriptoria_outline::plan(&crate::assign::skeleton_of(sk, shape, *stroke_pen), &params))
                     });
                     jobs.into_iter().zip(plans).collect::<Vec<_>>()
                 })
@@ -987,7 +989,7 @@ impl Render for GlyphView {
         let (title, name, count, bearings) = match doc.project.glyphs.get(self.glyph) {
             Some(g) => {
                 let code = g.chars.iter().map(|c| format!("U+{:04X}", *c as u32)).collect::<Vec<_>>().join(" ");
-                let bearings = g.ink_bounds(&doc.project.font).map(|b| (b.x0, g.advance - b.x1));
+                let bearings = g.ink_bounds().map(|b| (b.x0, g.advance - b.x1));
                 (g.chars.iter().collect::<String>(), format!("{} · {code}", g.name), g.strokes.len(), bearings)
             }
             None => (String::new(), "字形已不存在".into(), 0, None),
@@ -1021,13 +1023,7 @@ impl Render for GlyphView {
                     }
                 },
             )))
-            .child(Button::new("center").small().label("左右居中").on_click(cx.listener({
-                let font = font.clone();
-                move |this, _, _, cx| {
-                    let font = font.clone();
-                    this.edit(cx, |g| g.center(&font));
-                }
-            })))
+            .child(Button::new("center").small().label("左右居中").on_click(cx.listener(|this, _, _, cx| this.edit(cx, Glyph::center))))
             .child(Button::new("full-width").small().label("全角放置").tooltip("缩放到字面占字身框的 90%，居中，字宽 1 em").on_click(cx.listener(
                 move |this, _, _, cx| {
                     let font = font.clone();

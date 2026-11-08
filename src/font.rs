@@ -171,7 +171,7 @@ pub fn export(project: &Project) -> Export {
     let precision = PlanParams::default().precision * info.units_per_em as f64 / info.pt_per_em;
     let (with, without): (Vec<&ProjectGlyph>, Vec<&ProjectGlyph>) = project.glyphs.iter().partition(|g| !g.strokes.is_empty());
     let glyphs = crate::par_map(&with, |g| {
-        let skeletons: Vec<Skeleton> = g.strokes.iter().map(|s| crate::assign::placed_skeleton(s, info.pen_scale())).collect();
+        let skeletons: Vec<Skeleton> = g.strokes.iter().map(crate::assign::placed_skeleton).collect();
         let mut glyph = glyph_from_skeletons(&skeletons, precision, 2.0 * precision, Weights::of(info));
         glyph.name = g.name.clone();
         glyph.chars = g.chars.clone();

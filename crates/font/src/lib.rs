@@ -56,6 +56,31 @@ pub struct FontSource {
     /// How far (font units) a contour may stray from a master before it keeps its own deltas
     /// there (see [`build`]): 0 keeps every master exact, up to rounding.
     pub tolerance: f64,
+    pub names: Names,
+    pub lines: LineMetrics,
+}
+
+/// What a font says about itself, besides its family name.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Names {
+    /// The family name in Latin letters, for software that wants one (and for the PostScript
+    /// name); the family name, if empty. When given, the family name is the Chinese (PRC) one.
+    pub english: String,
+    /// Its revision (`head`, and "Version 1.000"); 1 if 0.
+    pub version: f64,
+    pub copyright: String,
+    pub designer: String,
+    /// The terms it may be used under.
+    pub license: String,
+}
+
+/// Lines a font gives besides the ascender and descender (font units; 0 for unknown heights).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LineMetrics {
+    /// Extra space between lines.
+    pub line_gap: i16,
+    pub x_height: i16,
+    pub cap_height: i16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -161,28 +186,40 @@ pub fn build(source: &FontSource) -> Result<Vec<u8>, Error> {
     let gvar = Gvar::new(variations, 1).map_err(|e| Error::Table(format!("gvar: {e:?}")))?;
     let bbox = font_bbox.unwrap_or_default();
 
-    // Names: the usual ones, then the axis and the instances from 256.
-    let family = &source.family;
-    let postscript: String = family.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    // Names: the usual ones (in English; the family also in Chinese when it has an English name),
+    // then the axis and the instances from 256.
+    let about = &source.names;
+    let english = if about.english.trim().is_empty() { source.family.clone() } else { about.english.trim().to_string() };
+    let postscript = postscript_name(&english);
+    let version = if about.version > 0.0 { about.version } else { 1.0 };
     let mut name_records = vec![
-        (1, family.clone()),
+        (1, english.clone()),
         (2, "Regular".to_string()),
-        (3, format!("{family};Regular")),
-        (4, format!("{family} Regular")),
-        (5, "Version 1.000".to_string()),
+        (3, format!("{version:.3};{postscript}-Regular")),
+        (4, format!("{english} Regular")),
+        (5, format!("Version {version:.3}")),
         (6, format!("{postscript}-Regular")),
         (25, postscript.clone()),
         (256, "Weight".to_string()),
     ];
+    for (id, text) in [(0, &about.copyright), (9, &about.designer), (13, &about.license)] {
+        if !text.trim().is_empty() {
+            name_records.push((id, text.trim().to_string()));
+        }
+    }
     for (i, (name, _)) in source.instances.iter().enumerate() {
         name_records.push((257 + i as u16, name.clone()));
     }
-    let name = Name::new(
-        name_records
-            .iter()
-            .map(|(id, text)| NameRecord::new(3, 1, 0x409, NameId::new(*id), OffsetMarker::new(text.clone())))
-            .collect(),
-    );
+    let mut records: Vec<NameRecord> =
+        name_records.iter().map(|(id, text)| NameRecord::new(3, 1, 0x409, NameId::new(*id), OffsetMarker::new(text.clone()))).collect();
+    if english != source.family {
+        // Chinese (PRC).
+        for (id, text) in [(1, source.family.clone()), (4, format!("{} Regular", source.family))] {
+            records.push(NameRecord::new(3, 1, 0x804, NameId::new(id), OffsetMarker::new(text)));
+        }
+    }
+    records.sort_by_key(|r| (r.platform_id, r.encoding_id, r.language_id, r.name_id));
+    let name = Name::new(records);
 
     let fvar = Fvar::new(AxisInstanceArrays::new(
         vec![VariationAxisRecord {
@@ -220,7 +257,7 @@ pub fn build(source: &FontSource) -> Result<Vec<u8>, Error> {
     );
 
     let head = Head::new(
-        Fixed::from_f64(1.0),
+        Fixed::from_f64(version),
         0,
         Flags::BASELINE_AT_Y_0 | Flags::LSB_AT_X_0,
         source.units_per_em,
@@ -238,7 +275,7 @@ pub fn build(source: &FontSource) -> Result<Vec<u8>, Error> {
     let hhea = Hhea::new(
         FWord::new(source.ascender),
         FWord::new(source.descender),
-        FWord::new(0),
+        FWord::new(source.lines.line_gap),
         UfWord::new(advance_max),
         FWord::new(metrics.iter().map(|m| m.side_bearing).min().unwrap_or(0)),
         FWord::new(0),
@@ -275,14 +312,14 @@ pub fn build(source: &FontSource) -> Result<Vec<u8>, Error> {
         us_last_char_index: chars.iter().copied().max().unwrap_or(0).min(0xFFFF) as u16,
         s_typo_ascender: source.ascender,
         s_typo_descender: source.descender,
-        s_typo_line_gap: 0,
+        s_typo_line_gap: source.lines.line_gap,
         us_win_ascent: bbox.y_max.max(source.ascender).max(0) as u16,
         us_win_descent: (-bbox.y_min.min(source.descender)).max(0) as u16,
         ach_vend_id: Tag::new(b"NONE"),
         ul_code_page_range_1: Some(1),
         ul_code_page_range_2: Some(0),
-        sx_height: Some(0),
-        s_cap_height: Some(0),
+        sx_height: Some(source.lines.x_height),
+        s_cap_height: Some(source.lines.cap_height),
         us_default_char: Some(0),
         us_break_char: Some(32),
         us_max_context: Some(0),
@@ -613,4 +650,11 @@ fn hierarchy(n: &[f64], default: usize) -> Vec<(usize, usize, usize)> {
         order.push((m, lower, upper));
     }
     order
+}
+
+/// A PostScript name for a family: its Latin letters and digits (at most 63 with the style), or
+/// "ScriptoriaFont" when it has none.
+fn postscript_name(family: &str) -> String {
+    let name: String = family.chars().filter(|c| c.is_ascii_alphanumeric()).take(54).collect();
+    if name.is_empty() { "ScriptoriaFont".to_string() } else { name }
 }

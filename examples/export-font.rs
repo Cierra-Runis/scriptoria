@@ -29,6 +29,8 @@ fn main() {
         glyphs,
         accuracy: 0.5,
         tolerance: layout.tolerance,
+        names: Default::default(),
+        lines: Default::default(),
     };
     let bytes = build(&source).expect("font");
     let masters: usize = source.glyphs.iter().map(|g| g.masters.len()).sum();

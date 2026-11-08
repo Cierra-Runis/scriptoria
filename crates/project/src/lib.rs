@@ -80,6 +80,28 @@ pub struct FontInfo {
     /// reference's. Positions always follow the reference.
     #[serde(default = "default_fit_strength")]
     pub fit_strength: f64,
+    /// The family name in Latin letters, for software that wants one; `family` is then its
+    /// Chinese name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub english_name: String,
+    /// The font's version (1.000 …).
+    #[serde(default = "default_version")]
+    pub version: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub copyright: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub designer: String,
+    /// The terms the font may be used under.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub license: String,
+    /// Extra space between lines (font units).
+    #[serde(default)]
+    pub line_gap: i16,
+    /// The heights of lowercase and capital letters (font units; 0 for unknown).
+    #[serde(default)]
+    pub x_height: i16,
+    #[serde(default)]
+    pub cap_height: i16,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -102,6 +124,10 @@ fn default_fit_strength() -> f64 {
     1.0
 }
 
+fn default_version() -> f64 {
+    1.0
+}
+
 impl Default for FontInfo {
     fn default() -> Self {
         FontInfo {
@@ -114,6 +140,14 @@ impl Default for FontInfo {
             pt_per_em: DEFAULT_PT_PER_EM,
             reference: None,
             fit_strength: default_fit_strength(),
+            english_name: String::new(),
+            version: default_version(),
+            copyright: String::new(),
+            designer: String::new(),
+            license: String::new(),
+            line_gap: 0,
+            x_height: 0,
+            cap_height: 0,
         }
     }
 }

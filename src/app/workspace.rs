@@ -36,6 +36,7 @@ actions!(
         SaveProjectAs,
         ImportPdf,
         ExportFont,
+        FontInfo,
         MakeTemplate,
         Quit,
         Undo,
@@ -88,6 +89,7 @@ fn menus(appearance: Appearance) -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("导入 PDF…", ImportPdf),
                 MenuItem::action("导出字体…", ExportFont),
+                MenuItem::action("字体信息…", FontInfo),
                 MenuItem::separator(),
                 MenuItem::action("生成格子模板…", MakeTemplate),
                 MenuItem::separator(),
@@ -743,6 +745,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(|this, _: &ShowSample, window, cx| this.open_sample(window, cx)))
+            .on_action(cx.listener(|this, _: &FontInfo, window, cx| crate::app::font_info::open(this.document.clone(), window, cx)))
             .on_action(cx.listener(|this, _: &FollowSystemAppearance, window, cx| this.choose_appearance(Appearance::System, window, cx)))
             .on_action(cx.listener(|this, _: &LightAppearance, window, cx| this.choose_appearance(Appearance::Light, window, cx)))
             .on_action(cx.listener(|this, _: &DarkAppearance, window, cx| this.choose_appearance(Appearance::Dark, window, cx)))

@@ -1,7 +1,7 @@
 //! From handwritten strokes to font glyphs: the weight axis, each glyph's masters, a project as a
 //! font ([`export`]) and a page to try a font in ([`preview_page`]).
 
-use scriptoria_font::{Axis, FontSource, Glyph};
+use scriptoria_font::{Axis, FontSource, Glyph, LineMetrics, Names};
 use scriptoria_ink::Stroke;
 use scriptoria_ink::kurbo::{Affine, BezPath, Rect};
 use scriptoria_outline::{PlanParams, WeightParams, expand, masters, plan};
@@ -191,6 +191,14 @@ pub fn export(project: &Project) -> Export {
         glyphs,
         accuracy: QUADRATIC_ACCURACY,
         tolerance: 2.0 * precision,
+        names: Names {
+            english: info.english_name.clone(),
+            version: info.version,
+            copyright: info.copyright.clone(),
+            designer: info.designer.clone(),
+            license: info.license.clone(),
+        },
+        lines: LineMetrics { line_gap: info.line_gap, x_height: info.x_height, cap_height: info.cap_height },
     };
     Export { source, empty: without.iter().map(|g| g.name.clone()).collect() }
 }

@@ -5,6 +5,7 @@
 
 pub mod charset_picker;
 pub mod document;
+pub mod font_info;
 pub mod font_view;
 pub mod glyph_view;
 pub mod mesh;

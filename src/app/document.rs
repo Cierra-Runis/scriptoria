@@ -236,6 +236,16 @@ impl Document {
         found
     }
 
+    /// Puts in all of the font's settings at once, as one step to undo; a reference font named
+    /// anew is opened first (and the settings stay as they were if it does not open).
+    pub fn replace_font(&mut self, info: FontInfo, cx: &mut Context<Self>) -> Result<(), scriptoria_reference::Error> {
+        if info.reference != self.project.font.reference {
+            self.reference = info.reference.as_ref().map(crate::assign::open_reference).transpose()?.map(Arc::new);
+        }
+        self.update_font(|f| *f = info, cx);
+        Ok(())
+    }
+
     /// Changes the font's settings through `f`, as one step to undo (none if `f` changes nothing).
     pub fn update_font(&mut self, f: impl FnOnce(&mut FontInfo), cx: &mut Context<Self>) {
         let before = self.project.font.clone();

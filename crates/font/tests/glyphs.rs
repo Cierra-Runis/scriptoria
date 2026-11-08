@@ -37,6 +37,8 @@ fn source() -> FontSource {
         glyphs,
         accuracy: ACCURACY,
         tolerance: TOLERANCE,
+        names: Default::default(),
+        lines: Default::default(),
     }
 }
 

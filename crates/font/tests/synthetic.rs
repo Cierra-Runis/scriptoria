@@ -62,6 +62,8 @@ fn source() -> FontSource {
         glyphs,
         accuracy: ACCURACY,
         tolerance: 0.0,
+        names: Default::default(),
+        lines: Default::default(),
     }
 }
 
@@ -142,4 +144,48 @@ fn outlines_show_the_points_the_font_gets() {
     let curve = &contours[1];
     assert_eq!((curve[0], *curve.last().unwrap()), ((200.0, 0.0, true), (500.0, 0.0, true)));
     assert!(curve[1..curve.len() - 1].iter().all(|p| !p.2) && curve.len() > 3, "{curve:?}");
+}
+
+#[test]
+fn the_font_names_itself() {
+    use scriptoria_font::{LineMetrics, Names};
+    use skrifa::raw::TableProvider as _;
+    use skrifa::string::StringId;
+    use skrifa::{FontRef, MetadataProvider as _};
+    let mut source = source();
+    source.family = "我的手写体".into();
+    source.names = Names {
+        english: "My Hand".into(),
+        version: 1.25,
+        copyright: "© 2026 Me".into(),
+        designer: "Me".into(),
+        license: "SIL Open Font License 1.1".into(),
+    };
+    source.lines = LineMetrics { line_gap: 90, x_height: 520, cap_height: 700 };
+    let data = build(&source).unwrap();
+    let font = FontRef::new(&data).unwrap();
+    let names = |id: StringId| -> Vec<(Option<String>, String)> {
+        font.localized_strings(id).map(|s| (s.language().map(str::to_string), s.to_string())).collect()
+    };
+    let family = names(StringId::FAMILY_NAME);
+    assert!(family.contains(&(Some("en-US".into()), "My Hand".into())), "{family:?}");
+    assert!(family.iter().any(|(lang, name)| lang.as_deref().is_some_and(|l| l.starts_with("zh")) && name == "我的手写体"), "{family:?}");
+    assert_eq!(names(StringId::POSTSCRIPT_NAME)[0].1, "MyHand-Regular");
+    assert_eq!(names(StringId::VERSION_STRING)[0].1, "Version 1.250");
+    assert_eq!(names(StringId::COPYRIGHT_NOTICE)[0].1, "© 2026 Me");
+    assert_eq!(names(StringId::DESIGNER)[0].1, "Me");
+    assert_eq!(names(StringId::LICENSE_DESCRIPTION)[0].1, "SIL Open Font License 1.1");
+    assert_eq!(font.head().unwrap().font_revision().to_f64(), 1.25);
+    assert_eq!(font.hhea().unwrap().line_gap().to_i16(), 90);
+    let os2 = font.os2().unwrap();
+    assert_eq!((os2.s_typo_line_gap(), os2.sx_height(), os2.s_cap_height()), (90, Some(520), Some(700)));
+
+    // A family named in Chinese only: one name for all, and still a PostScript name.
+    source.names = Names::default();
+    let data = build(&source).unwrap();
+    let font = FontRef::new(&data).unwrap();
+    let ps: Vec<String> = font.localized_strings(StringId::POSTSCRIPT_NAME).map(|s| s.to_string()).collect();
+    assert_eq!(ps, ["ScriptoriaFont-Regular"]);
+    let family: Vec<String> = font.localized_strings(StringId::FAMILY_NAME).map(|s| s.to_string()).collect();
+    assert_eq!(family, ["我的手写体"]);
 }

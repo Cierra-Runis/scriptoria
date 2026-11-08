@@ -158,6 +158,8 @@ mod tests {
             glyphs: vec![glyph],
             accuracy: 0.5,
             tolerance: 0.0,
+            names: Default::default(),
+            lines: Default::default(),
         };
         ReferenceFont::from_bytes(build(&source).unwrap(), None).unwrap()
     }

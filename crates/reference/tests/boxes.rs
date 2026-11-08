@@ -34,6 +34,8 @@ fn font() -> Vec<u8> {
         glyphs: vec![glyph("A", 'A', 600.0, Rect::new(50.0, 0.0, 550.0, 700.0)), glyph("uni4E00", '一', 1000.0, Rect::new(60.0, 360.0, 940.0, 420.0))],
         accuracy: 0.5,
         tolerance: 0.0,
+        names: Default::default(),
+        lines: Default::default(),
     };
     build(&source).expect("font")
 }

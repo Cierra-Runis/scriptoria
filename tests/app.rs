@@ -321,6 +321,8 @@ fn reference_font(dir: &std::path::Path) -> PathBuf {
         glyphs: vec![glyph],
         accuracy: 0.5,
         tolerance: 0.0,
+        names: Default::default(),
+        lines: Default::default(),
     };
     let file = dir.join("reference.ttf");
     std::fs::write(&file, build(&source).unwrap()).unwrap();
@@ -861,4 +863,47 @@ fn strokes_are_copied_and_kept_as_parts(cx: &mut TestAppContext) {
     assert!(glyphs(&workspace, cx)[1].strokes.is_empty());
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert!(document.read_with(cx, |d, _| d.project.parts.is_empty()));
+}
+
+#[gpui_kit::test]
+fn the_fonts_settings_are_edited_in_one_place(cx: &mut TestAppContext) {
+    let (workspace, cx) = open(vec![], cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    let before = document.read_with(cx, |d, _| d.project.font.clone());
+    let retype = |window: &mut gpui_kit::Window, cx: &mut gpui_kit::App, id: &'static str, text: &str| {
+        window.click(id, cx);
+        window.press("ctrl-a", cx);
+        window.input(text, cx);
+    };
+    cx.update(|window, cx| {
+        scriptoria::app::font_info::open(document.clone(), window, cx);
+        window.render_frame(cx);
+        retype(window, cx, "info-family", "测试手写体");
+        retype(window, cx, "info-english", "Test Hand");
+        retype(window, cx, "info-line-gap", "100");
+        retype(window, cx, "info-license", "OFL-1.1");
+        window.click("font-info-ok", cx);
+    });
+    let after = document.read_with(cx, |d, _| d.project.font.clone());
+    assert_eq!((after.family.as_str(), after.english_name.as_str(), after.line_gap, after.license.as_str()), ("测试手写体", "Test Hand", 100, "OFL-1.1"));
+    assert_eq!(after.ascender, before.ascender);
+    // The font is named so when exported.
+    let names = document.read_with(cx, |d, _| scriptoria::font::export(&d.project).source.names);
+    assert_eq!(names.english, "Test Hand");
+
+    // Settings that make no sense are not taken.
+    cx.update(|window, cx| {
+        scriptoria::app::font_info::open(document.clone(), window, cx);
+        window.render_frame(cx);
+        retype(window, cx, "info-descender", "50");
+        window.click("font-info-ok", cx);
+    });
+    assert_eq!(document.read_with(cx, |d, _| d.project.font.descender), before.descender);
+
+    // One undo puts all back.
+    cx.update(|window, cx| {
+        window.click("font-info-cancel", cx);
+        window.press("ctrl-z", cx);
+    });
+    assert_eq!(document.read_with(cx, |d, _| d.project.font.clone()), before);
 }

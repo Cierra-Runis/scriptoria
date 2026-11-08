@@ -48,6 +48,7 @@ fn glyph_boxes_are_scaled_to_the_em_wanted() {
     assert_eq!((one.bounds, one.advance), (Rect::new(60.0, 360.0, 940.0, 420.0), 1000.0));
     // Characters the font lacks have no glyph.
     assert!(reference.glyph('B', 1000.0).is_none());
+    assert!(reference.has('A') && reference.has('一') && !reference.has('B'));
 }
 
 #[test]

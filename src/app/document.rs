@@ -20,6 +20,12 @@ enum Change {
     /// Glyphs, by index, as they were.
     Glyphs(Vec<(usize, Glyph)>),
     Font(FontInfo),
+    /// Glyphs that were removed, by the index they had (ascending).
+    Removed(Vec<(usize, Glyph)>),
+    /// Glyphs that were added, by index (ascending).
+    Added(Vec<usize>),
+    /// The practice sheets, as they were.
+    Templates(Vec<Template>),
 }
 
 pub struct Document {
@@ -31,6 +37,8 @@ pub struct Document {
     id: u64,
     /// The font characters are placed after, if any.
     reference: Option<Arc<ReferenceFont>>,
+    /// Bumped whenever anything changes.
+    generation: u64,
     /// Per glyph, bumped whenever it changes.
     revisions: Vec<u64>,
     next_revision: u64,
@@ -48,6 +56,9 @@ pub enum DocumentEvent {
     Font,
     /// The project was saved or replaced.
     Saved,
+    /// Glyphs were added or removed: where each glyph that was at an index is now (none if it was
+    /// removed). Followed by [`DocumentEvent::GlyphList`].
+    Reindexed(Arc<[Option<usize>]>),
 }
 
 impl EventEmitter<DocumentEvent> for Document {}
@@ -66,12 +77,17 @@ impl Document {
         let revisions = vec![0; project.glyphs.len()];
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        Document { project, folder, modified: false, id, reference: reference.map(Arc::new), revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
+        Document { project, folder, modified: false, id, reference: reference.map(Arc::new), generation: 0, revisions, next_revision: 1, undo: Vec::new(), redo: Vec::new() }
     }
 
     /// Different for every document made (a project opened twice is two documents).
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Changes whenever the project does.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The glyph's revision: changes whenever the glyph does.
@@ -97,15 +113,76 @@ impl Document {
         if self.modified { format!("{name} •") } else { name }
     }
 
-    /// Adds an empty glyph for every new character of `text`; returns how many.
+    /// Adds an empty glyph for every new character of `text`, at the end, as one step to undo;
+    /// returns how many.
     pub fn add_chars(&mut self, text: &str, cx: &mut Context<Self>) -> usize {
+        let before = self.project.glyphs.len();
         let added = self.project.add_chars(text);
         if added > 0 {
             self.sync_revisions();
             self.touch(cx);
             cx.emit(DocumentEvent::GlyphList);
+            self.record(Change::Added((before..before + added).collect()));
         }
         added
+    }
+
+    /// Removes glyphs, as one step to undo; returns how many.
+    pub fn remove_glyphs(&mut self, glyphs: &[usize], cx: &mut Context<Self>) -> usize {
+        let mut glyphs: Vec<usize> = glyphs.iter().copied().filter(|&g| g < self.project.glyphs.len()).collect();
+        glyphs.sort_unstable();
+        glyphs.dedup();
+        if glyphs.is_empty() {
+            return 0;
+        }
+        let n = glyphs.len();
+        let removed = self.take_glyphs(&glyphs, cx);
+        self.record(Change::Removed(removed));
+        n
+    }
+
+    /// Takes glyphs out (indices ascending); returns them with the indices they had.
+    fn take_glyphs(&mut self, glyphs: &[usize], cx: &mut Context<Self>) -> Vec<(usize, Glyph)> {
+        let n = self.project.glyphs.len();
+        let gone: HashSet<usize> = glyphs.iter().copied().collect();
+        let mut map = Vec::with_capacity(n);
+        let mut kept = 0;
+        for i in 0..n {
+            map.push((!gone.contains(&i)).then(|| {
+                kept += 1;
+                kept - 1
+            }));
+        }
+        let mut removed = Vec::with_capacity(glyphs.len());
+        for &i in glyphs.iter().rev() {
+            removed.push((i, self.project.glyphs.remove(i)));
+            self.revisions.remove(i);
+        }
+        removed.reverse();
+        self.reindexed(map, cx);
+        removed
+    }
+
+    /// Puts glyphs back at the indices they had (ascending); returns those indices.
+    fn put_glyphs(&mut self, glyphs: Vec<(usize, Glyph)>, cx: &mut Context<Self>) -> Vec<usize> {
+        let n = self.project.glyphs.len();
+        let at: HashSet<usize> = glyphs.iter().map(|(i, _)| *i).collect();
+        // The glyphs there were go, in order, to the places left between those put back.
+        let map: Vec<Option<usize>> = (0..n + at.len()).filter(|i| !at.contains(i)).map(Some).collect();
+        let indices: Vec<usize> = glyphs.iter().map(|(i, _)| *i).collect();
+        for (i, g) in glyphs {
+            self.project.glyphs.insert(i, g);
+            self.revisions.insert(i, self.next_revision);
+            self.next_revision += 1;
+        }
+        self.reindexed(map, cx);
+        indices
+    }
+
+    fn reindexed(&mut self, map: Vec<Option<usize>>, cx: &mut Context<Self>) {
+        self.touch(cx);
+        cx.emit(DocumentEvent::Reindexed(map.into()));
+        cx.emit(DocumentEvent::GlyphList);
     }
 
     /// Changes a glyph through `f`, as one step to undo (none if `f` changes nothing).
@@ -211,6 +288,14 @@ impl Document {
                 cx.emit(DocumentEvent::Font);
                 Change::Font(replaced)
             }
+            Change::Removed(glyphs) => Change::Added(self.put_glyphs(glyphs, cx)),
+            Change::Templates(templates) => {
+                let replaced = std::mem::replace(&mut self.project.templates, templates);
+                self.touch(cx);
+                cx.emit(DocumentEvent::GlyphList);
+                Change::Templates(replaced)
+            }
+            Change::Added(glyphs) => Change::Removed(self.take_glyphs(&glyphs, cx)),
         }
     }
 
@@ -243,10 +328,22 @@ impl Document {
         template
     }
 
-    /// Forgets a practice sheet (one that could not be written out).
-    pub fn remove_template(&mut self, id: u32, cx: &mut Context<Self>) {
+    /// Drops a practice sheet that could not be written out (not a step to undo).
+    pub fn discard_template(&mut self, id: u32, cx: &mut Context<Self>) {
         self.project.templates.retain(|t| t.id != id);
         self.touch(cx);
+    }
+
+    /// Forgets a practice sheet (pages written on it are not recognized any more), as a step to
+    /// undo.
+    pub fn remove_template(&mut self, id: u32, cx: &mut Context<Self>) {
+        let before = self.project.templates.clone();
+        self.project.templates.retain(|t| t.id != id);
+        if self.project.templates != before {
+            self.record(Change::Templates(before));
+            self.touch(cx);
+            cx.emit(DocumentEvent::GlyphList);
+        }
     }
 
     /// Puts characters written on practice sheets into their glyphs (added if new), replacing the
@@ -308,6 +405,7 @@ impl Document {
 
     fn touch(&mut self, cx: &mut Context<Self>) {
         self.modified = true;
+        self.generation += 1;
         cx.notify();
     }
 

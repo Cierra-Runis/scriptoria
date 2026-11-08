@@ -113,6 +113,10 @@ impl FontInfo {
     }
 }
 
+/// The cells across and down a practice sheet's page.
+pub const TEMPLATE_COLUMNS: usize = 8;
+pub const TEMPLATE_ROWS: usize = 10;
+
 /// A practice sheet made for the project: its characters, a cell each, laid out by its grid (see
 /// the template crate). Its id is on each page, so that written pages can be found again.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,12 +127,14 @@ pub struct Template {
 }
 
 impl Project {
-    /// A new practice sheet for characters, kept with the project: its grid's baseline is the
-    /// font's.
+    /// A new practice sheet for characters, kept with the project. Its squares are the em as large
+    /// as the font takes handwriting to be ([`FontInfo::pt_per_em`]), so that characters written
+    /// in them come out as those written anywhere else; its baseline is the font's.
     pub fn new_template(&mut self, chars: &[char]) -> &Template {
         let id = self.templates.iter().map(|t| t.id + 1).max().unwrap_or(1);
         let em = (self.font.ascender - self.font.descender) as f64;
-        let grid = scriptoria_template::Grid { baseline: -self.font.descender as f64 / em, ..Default::default() };
+        let cell = em / self.font.pen_scale();
+        let grid = scriptoria_template::Grid::new(cell, TEMPLATE_COLUMNS, TEMPLATE_ROWS, -self.font.descender as f64 / em);
         self.templates.push(Template { id, chars: chars.iter().collect(), grid });
         self.templates.last().expect("just added")
     }
@@ -413,14 +419,14 @@ impl Project {
     /// Adds an empty glyph for every character of `text` without one yet (whitespace and
     /// control characters skipped), in order; returns how many were added.
     pub fn add_chars(&mut self, text: &str) -> usize {
-        let mut added = 0;
+        let mut have: std::collections::HashSet<char> = self.glyphs.iter().flat_map(|g| g.chars.iter().copied()).collect();
+        let before = self.glyphs.len();
         for c in text.chars().filter(|c| !c.is_whitespace() && !c.is_control()) {
-            if self.glyph_for(c).is_none() {
+            if have.insert(c) {
                 self.glyphs.push(Glyph::for_char(c, &self.font));
-                added += 1;
             }
         }
-        added
+        self.glyphs.len() - before
     }
 
     /// The source with this file, added if new; returns its id.
@@ -713,5 +719,14 @@ mod tests {
         let (bottom_left, top_right) = (t * Point::new(10.0, 24.5), t * Point::new(14.5, 20.0));
         assert!((bottom_left - Point::new(0.0, -120.0)).hypot() < 1e-9);
         assert!((top_right - Point::new(1000.0, 880.0)).hypot() < 1e-9);
+    }
+
+    #[test]
+    fn practice_squares_are_the_em_as_handwriting_is_written() {
+        let mut p = Project::new("x");
+        let grid = p.new_template(&['世']).grid;
+        // 4.5 pt to the em of 1000 units, the baseline 120 units up.
+        assert!((grid.cell - 4.5).abs() < 1e-9 && (grid.baseline - 0.12).abs() < 1e-9, "{grid:?}");
+        assert_eq!((grid.columns(), grid.rows()), (TEMPLATE_COLUMNS, TEMPLATE_ROWS));
     }
 }

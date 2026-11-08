@@ -11,13 +11,19 @@ use scriptoria_ink::kurbo::{Affine, Point, Rect};
 use scriptoria_ink::{InkPage, Stroke};
 use scriptoria_project::{FontInfo, Glyph, GlyphStroke, Project, StrokeOrigin, Template};
 use scriptoria_reference::ReferenceFont;
-use scriptoria_template::{CODE, is_sheet_color, is_square, read_code, write_pdf};
+use scriptoria_template::{CODE, Heights, Model, Sheet, is_sheet_color, is_square, read_code};
 
-/// A sheet's PDF, each character shown above its square in the reference font (left blank
-/// without one).
-pub fn sheet_pdf(template: &Template, reference: Option<&ReferenceFont>) -> Vec<u8> {
+/// A sheet's PDF, each character shown as the reference font draws it, above its square and
+/// faintly in it, placed in the em as the reference places it (left blank without one).
+pub fn sheet_pdf(info: &FontInfo, template: &Template, reference: Option<&ReferenceFont>) -> Vec<u8> {
     let chars: Vec<char> = template.chars.chars().collect();
-    write_pdf(&template.grid, template.id, &chars, |c| reference.and_then(|r| r.glyph(c, 1000.0)).map(|g| g.outline))
+    // The sheet's units: the em (descender to ascender) of 1000.
+    let em = (info.ascender - info.descender) as f64;
+    let upm = info.units_per_em as f64 * 1000.0 / em;
+    let models = |c: char| reference.and_then(|r| r.glyph(c, upm)).map(|g| Model { outline: g.outline, advance: g.advance });
+    let top = |c: char| reference.and_then(|r| r.glyph(c, upm)).map(|g| g.bounds.y1).filter(|&y| y > 0.0);
+    let heights = Heights { x_height: top('x'), cap_height: top('H') };
+    Sheet { grid: template.grid, id: template.id, chars: &chars, models: &models, heights }.pdf()
 }
 
 fn rgb(s: &Stroke) -> [u8; 3] {

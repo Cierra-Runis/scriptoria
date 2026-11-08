@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::TestSupportExt as _;
+use gpui::component::ActiveTheme as _;
 use gpui::prelude::*;
 use gpui::{
     Bounds, ContentMask, Context, EventEmitter, FocusHandle, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Path, PathBuilder, Pixels, Point, ScrollEvent, SharedString, Task, Window, canvas, div, hsla,
-    point, px, quad, rgb, size,
+    point, px, quad, size,
 };
 use scriptoria_ink::kurbo;
 use scriptoria_ink::{InkDocument, InkPage, Stroke, StrokeShape};
@@ -21,6 +22,7 @@ use scriptoria_outline::{Plan, PlanParams, WeightParams};
 use scriptoria_skeleton::Skeleton;
 
 use crate::app::mesh::Mesh;
+use crate::app::theme::{LATTE, palette};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorMode {
@@ -203,7 +205,7 @@ fn rgba_to_hsla([r, g, b, a]: [u8; 4]) -> Hsla {
 /// Draws a stroke's skeleton on top: the centerline of every piece, and the circles at the outline
 /// knots at the current weight.
 fn paint_skeleton(window: &mut Window, layout: Layout, sk: &Skeleton, plan: &Plan, weight: &WeightParams) {
-    let ink = gpui::black().opacity(0.75);
+    let ink = LATTE.text.opacity(0.85);
     for piece in &sk.pieces {
         let dense = piece.densify(8);
         if dense.len() < 2 {
@@ -729,7 +731,9 @@ impl Viewer {
         }
     }
 
-    fn render_page_canvas(&self) -> impl IntoElement {
+    fn render_page_canvas(&self, cx: &gpui::App) -> impl IntoElement {
+        // The page keeps its paper in either appearance; what is drawn on it takes the light palette.
+        let page_border = palette(cx).surface1.hsla();
         let page = self.page.clone();
         let cache = self.cache.clone();
         let fit_cell = self.fit.clone();
@@ -738,7 +742,7 @@ impl Viewer {
         let visible = self.visible;
         // Strokes already in a glyph are gray.
         let colors: Vec<Hsla> = (0..page.ink.strokes.len())
-            .map(|i| if self.assigned.contains(&(self.page_index, i)) { rgb(0xB8B8B8).into() } else { self.stroke_color(i) })
+            .map(|i| if self.assigned.contains(&(self.page_index, i)) { LATTE.surface2.hsla() } else { self.stroke_color(i) })
             .collect();
         // The last stroke shown is marked while replaying (not when all are shown).
         let current = (visible < page.ink.strokes.len()).then(|| visible.checked_sub(1)).flatten();
@@ -767,7 +771,7 @@ impl Viewer {
                     let ink = &page.ink;
                     let page_bounds = layout.rect(kurbo::Rect::new(0.0, 0.0, ink.width, ink.height));
                     let paper = ink.paper.map(rgba_to_hsla).unwrap_or(gpui::white());
-                    window.paint_quad(quad(page_bounds, px(2.0), paper, px(1.0), rgb(0xC8C8C8), Default::default()));
+                    window.paint_quad(quad(page_bounds, px(2.0), paper, px(1.0), page_border, Default::default()));
 
                     let cache = cache.borrow();
                     // Strokes not yet "written" are shown faintly, painted first (underneath). They use
@@ -794,20 +798,20 @@ impl Viewer {
                         if let Some(sk) = &skeletons {
                             paint_skeleton(window, layout, &sk.skeletons[i], &sk.plans[i], &weight);
                         }
-                        for (p, color) in [(s.start, rgb(0x16A34A)), (s.end, rgb(0xDC2626))] {
+                        for (p, color) in [(s.start, LATTE.green.hsla()), (s.end, LATTE.red.hsla())] {
                             let c = layout.to_window(p);
                             let dot = Bounds::new(c - point(px(4.0), px(4.0)), size(px(8.0), px(8.0)));
-                            window.paint_quad(quad(dot, px(4.0), color, px(1.5), gpui::white(), Default::default()));
+                            window.paint_quad(quad(dot, px(4.0), color, px(1.5), LATTE.base.hsla(), Default::default()));
                         }
                     };
                     if let Some(i) = current {
-                        mark(i, hsla(0.11, 0.95, 0.5, 1.0));
+                        mark(i, LATTE.peach.hsla());
                     }
                     if let Some(i) = hovered.filter(|h| Some(*h) != current) {
-                        mark(i, hsla(0.58, 0.9, 0.5, 1.0));
+                        mark(i, LATTE.blue.hsla());
                     }
                     // The selection: strokes in the selection color, each in a box.
-                    let selected = hsla(0.75, 0.8, 0.5, 1.0);
+                    let selected = LATTE.mauve.hsla();
                     for &i in &selection {
                         if let Some(path) = &cache.paths[i] {
                             window.paint_path(path.clone(), selected);
@@ -840,6 +844,8 @@ impl Viewer {
     }
 
     fn render_scrubber(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let (track_color, fill, tick_color, thumb_fill) = (p.surface0.hsla(), p.peach.hsla(), p.blue.hsla(), p.base.hsla());
         let bounds_cell = self.scrub_bounds.clone();
         let total = self.total();
         let frac = if total == 0 { 0.0 } else { self.visible as f32 / total as f32 };
@@ -860,17 +866,17 @@ impl Viewer {
                         let track_h = px(6.0);
                         let y = bounds.origin.y + (bounds.size.height - track_h) / 2.0;
                         let track = Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, track_h));
-                        window.paint_quad(quad(track, px(3.0), rgb(0xDDDDDD), px(0.0), gpui::transparent_black(), Default::default()));
+                        window.paint_quad(quad(track, px(3.0), track_color, px(0.0), gpui::transparent_black(), Default::default()));
                         let filled = Bounds::new(track.origin, size(bounds.size.width * frac, track_h));
-                        window.paint_quad(quad(filled, px(3.0), hsla(0.11, 0.95, 0.5, 1.0), px(0.0), gpui::transparent_black(), Default::default()));
+                        window.paint_quad(quad(filled, px(3.0), fill, px(0.0), gpui::transparent_black(), Default::default()));
                         if let Some(hf) = hovered_frac {
                             let x = bounds.origin.x + bounds.size.width * hf;
                             let tick = Bounds::new(point(x - px(1.0), bounds.origin.y + px(2.0)), size(px(2.0), bounds.size.height - px(4.0)));
-                            window.paint_quad(quad(tick, px(1.0), hsla(0.58, 0.9, 0.5, 1.0), px(0.0), gpui::transparent_black(), Default::default()));
+                            window.paint_quad(quad(tick, px(1.0), tick_color, px(0.0), gpui::transparent_black(), Default::default()));
                         }
                         let thumb_c = point(bounds.origin.x + bounds.size.width * frac, bounds.origin.y + bounds.size.height / 2.0);
                         let thumb = Bounds::new(thumb_c - point(px(7.0), px(7.0)), size(px(14.0), px(14.0)));
-                        window.paint_quad(quad(thumb, px(7.0), gpui::white(), px(2.0), hsla(0.11, 0.95, 0.5, 1.0), Default::default()));
+                        window.paint_quad(quad(thumb, px(7.0), thumb_fill, px(2.0), fill, Default::default()));
                     },
                 )
                 .size_full(),
@@ -888,7 +894,8 @@ impl Viewer {
     fn render_weight_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds_cell = self.weight_bounds.clone();
         let frac = (self.weight - WEIGHT_RANGE.0) / (WEIGHT_RANGE.1 - WEIGHT_RANGE.0);
-        let accent = hsla(0.58, 0.9, 0.5, 1.0);
+        let p = palette(cx);
+        let (accent, track_color, thumb_fill) = (p.blue.hsla(), p.surface0.hsla(), p.base.hsla());
         div()
             .id("weight-slider")
             .w(px(160.0))
@@ -904,10 +911,10 @@ impl Viewer {
                         let track_h = px(4.0);
                         let y = bounds.origin.y + (bounds.size.height - track_h) / 2.0;
                         let track = Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, track_h));
-                        window.paint_quad(quad(track, px(2.0), rgb(0xDDDDDD), px(0.0), gpui::transparent_black(), Default::default()));
+                        window.paint_quad(quad(track, px(2.0), track_color, px(0.0), gpui::transparent_black(), Default::default()));
                         let c = point(bounds.origin.x + bounds.size.width * frac, bounds.origin.y + bounds.size.height / 2.0);
                         let thumb = Bounds::new(c - point(px(7.0), px(7.0)), size(px(14.0), px(14.0)));
-                        window.paint_quad(quad(thumb, px(7.0), gpui::white(), px(2.0), accent, Default::default()));
+                        window.paint_quad(quad(thumb, px(7.0), thumb_fill, px(2.0), accent, Default::default()));
                     },
                 )
                 .size_full(),
@@ -930,6 +937,8 @@ impl Viewer {
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         let id: SharedString = id.into();
+        let theme = cx.theme();
+        let (on, on_text, off, off_hover, text) = (theme.primary, theme.primary_foreground, theme.secondary, theme.secondary_hover, theme.secondary_foreground);
         div()
             .id(id)
             .px_3()
@@ -937,8 +946,8 @@ impl Viewer {
             .rounded_md()
             .text_sm()
             .cursor_pointer()
-            .when(active, |d| d.bg(rgb(0x1F2937)).text_color(gpui::white()))
-            .when(!active, |d| d.bg(rgb(0xF3F4F6)).text_color(rgb(0x1F2937)).hover(|d| d.bg(rgb(0xE5E7EB))))
+            .when(active, |d| d.bg(on).text_color(on_text))
+            .when(!active, |d| d.bg(off).text_color(text).hover(move |d| d.bg(off_hover)))
             .child(label.into())
             .on_click(cx.listener(move |this, _, _, cx| {
                 on_click(this, cx);
@@ -980,6 +989,9 @@ impl Viewer {
 
 impl Render for Viewer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, bar, line, ink) = (theme.muted_foreground, theme.tab_bar, theme.border, theme.foreground);
+        let surround = palette(cx).crust.hsla();
         let total = self.total();
         let page_count = self.doc.page_count();
         let playing = self.playing.is_some();
@@ -1010,26 +1022,28 @@ impl Render for Viewer {
             .gap_2()
             .child(self.button("skeleton", "骨架", self.skeleton_mode, cx, |this, cx| this.toggle_skeleton(cx)))
             .when(self.skeleton_mode, |d| {
-                d.child(div().text_sm().text_color(rgb(0x6B7280)).child("字重"))
+                d.child(div().text_sm().text_color(muted).child("字重"))
                     .child(self.render_weight_slider(cx))
                     .child(div().w(px(44.0)).text_sm().child(format!("×{:.2}", self.weight)))
-                    .when(self.computing.is_some(), |d| d.child(div().text_xs().text_color(rgb(0x6B7280)).child("计算中…")))
+                    .when(self.computing.is_some(), |d| d.child(div().text_xs().text_color(muted).child("计算中…")))
             });
 
         let top_bar = div()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap_3()
+            .gap_x_3()
+            .gap_y_1()
             .px_4()
             .py_2()
-            .bg(gpui::white())
+            .bg(bar)
             .border_b_1()
-            .border_color(rgb(0xE5E7EB))
+            .border_color(line)
             .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(self.file_name.clone()))
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x6B7280))
+                    .text_color(muted)
                     .child(format!("第 {}/{} 页 · 共 {total} 笔", self.page_index + 1, page_count)),
             )
             .when(page_count > 1, |d| {
@@ -1042,7 +1056,7 @@ impl Render for Viewer {
                     None => "先在左边选一个字".to_string(),
                 };
                 let can_assign = self.target.is_some();
-                d.child(div().w(px(1.0)).h(px(20.0)).bg(rgb(0xE5E7EB)))
+                d.child(div().w(px(1.0)).h(px(20.0)).bg(line))
                     .child(div().text_sm().child(format!("已选 {} 笔", self.selection.len())))
                     .child(self.button("assign", label, can_assign, cx, move |this, cx| {
                         if can_assign {
@@ -1053,9 +1067,9 @@ impl Render for Viewer {
             })
             .child(div().flex_1())
             .child(skeleton_controls)
-            .child(div().w(px(1.0)).h(px(20.0)).bg(rgb(0xE5E7EB)))
+            .child(div().w(px(1.0)).h(px(20.0)).bg(line))
             .child(zoom_controls)
-            .child(div().w(px(1.0)).h(px(20.0)).bg(rgb(0xE5E7EB)))
+            .child(div().w(px(1.0)).h(px(20.0)).bg(line))
             .child(mode_buttons);
 
         let bottom_bar = div()
@@ -1064,9 +1078,9 @@ impl Render for Viewer {
             .gap_1()
             .px_4()
             .py_2()
-            .bg(gpui::white())
+            .bg(bar)
             .border_t_1()
-            .border_color(rgb(0xE5E7EB))
+            .border_color(line)
             .child(
                 div()
                     .flex()
@@ -1077,7 +1091,7 @@ impl Render for Viewer {
                     .child(self.render_scrubber(cx))
                     .child(div().w(px(120.0)).text_sm().text_right().child(format!("{} / {total} 笔", self.visible))),
             )
-            .child(div().text_xs().text_color(rgb(0x6B7280)).child(self.status_text()));
+            .child(div().text_xs().text_color(muted).child(self.status_text()));
 
         div()
             .track_focus(&self.focus)
@@ -1088,8 +1102,8 @@ impl Render for Viewer {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0xEDEDED))
-            .text_color(rgb(0x111827))
+            .bg(surround)
+            .text_color(ink)
             .child(top_bar)
             .child(
                 div()
@@ -1097,7 +1111,7 @@ impl Render for Viewer {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(self.render_page_canvas())
+                    .child(self.render_page_canvas(cx))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_canvas_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_canvas_down))
                     .on_scroll(cx.listener(Self::on_scroll))

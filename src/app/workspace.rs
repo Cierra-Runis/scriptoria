@@ -7,7 +7,10 @@ use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::menu::AppMenuBar;
 use gpui::component::notification::Notification;
 use gpui::component::tab::{Tab, TabBar};
-use gpui::component::{ActiveTheme as _, GlobalState, Sizable as _, TitleBar, WindowExt as _, h_resizable, resizable_panel, v_flex};
+use gpui::component::{
+    ActiveTheme as _, GlobalState, Sizable as _, TITLE_BAR_HEIGHT, TitleBar, WindowExt as _, h_flex, h_resizable, resizable_panel, v_flex,
+};
+use gpui::TestSupportExt as _;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, KeyBinding, Menu, MenuItem, PathPromptOptions, SharedString, Subscription, Task, Window,
@@ -21,12 +24,32 @@ use crate::app::font_view::{FontView, FontViewEvent};
 use crate::app::glyph_view::GlyphView;
 use crate::app::outlines::Outlines;
 use crate::app::sample_view::{SampleEvent, SampleView};
+use crate::app::theme::{self, Appearance};
 use crate::app::viewer::{Viewer, ViewerEvent};
 
-actions!(scriptoria, [NewProject, OpenProject, SaveProject, SaveProjectAs, ImportPdf, ExportFont, MakeTemplate, Quit, Undo, Redo, ShowSample]);
+actions!(
+    scriptoria,
+    [
+        NewProject,
+        OpenProject,
+        SaveProject,
+        SaveProjectAs,
+        ImportPdf,
+        ExportFont,
+        MakeTemplate,
+        Quit,
+        Undo,
+        Redo,
+        ShowSample,
+        FollowSystemAppearance,
+        LightAppearance,
+        DarkAppearance
+    ]
+);
 
-/// Key bindings and menus, once at startup.
+/// Key bindings, menus and colors, once at startup.
 pub fn init(cx: &mut App) {
+    theme::init(cx);
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewProject, None),
         KeyBinding::new("ctrl-o", OpenProject, None),
@@ -41,12 +64,18 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-z", Redo, None),
         KeyBinding::new("ctrl-t", ShowSample, None),
     ]);
-    GlobalState::global_mut(cx).set_app_menus(menus().into_iter().map(Menu::owned).collect());
-    cx.set_menus(menus());
+    set_menus(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
-fn menus() -> Vec<Menu> {
+/// The menus, for the window's menu bar and the system's.
+fn set_menus(cx: &mut App) {
+    let appearance = theme::appearance(cx);
+    GlobalState::global_mut(cx).set_app_menus(menus(appearance).into_iter().map(Menu::owned).collect());
+    cx.set_menus(menus(appearance));
+}
+
+fn menus(appearance: Appearance) -> Vec<Menu> {
     vec![
         Menu {
             name: "文件".into(),
@@ -71,7 +100,23 @@ fn menus() -> Vec<Menu> {
             items: vec![MenuItem::action("撤销", Undo), MenuItem::action("重做", Redo)],
             disabled: false,
         },
-        Menu { name: "视图".into(), items: vec![MenuItem::action("样张", ShowSample)], disabled: false },
+        Menu {
+            name: "视图".into(),
+            items: vec![
+                MenuItem::action("样张", ShowSample),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu {
+                    name: "外观".into(),
+                    items: vec![
+                        MenuItem::action("跟随系统", FollowSystemAppearance).checked(appearance == Appearance::System),
+                        MenuItem::action("亮色（Catppuccin Latte）", LightAppearance).checked(appearance == Appearance::Light),
+                        MenuItem::action("暗色（Catppuccin Mocha）", DarkAppearance).checked(appearance == Appearance::Dark),
+                    ],
+                    disabled: false,
+                }),
+            ],
+            disabled: false,
+        },
     ]
 }
 
@@ -124,6 +169,9 @@ impl Workspace {
                 }
             }),
             cx.subscribe_in(&document, window, |this, _, event: &DocumentEvent, _, cx| {
+                if let DocumentEvent::Reindexed(map) = event {
+                    this.reindex(map, cx);
+                }
                 if matches!(event, DocumentEvent::Glyph(_) | DocumentEvent::GlyphList | DocumentEvent::Saved) {
                     this.refresh_pages(cx);
                 }
@@ -132,8 +180,17 @@ impl Workspace {
                 FontViewEvent::Selected(_) => this.refresh_pages(cx),
                 FontViewEvent::Open(glyph) => this.open_glyph(*glyph, window, cx),
                 FontViewEvent::OpenSample => this.open_sample(window, cx),
+                FontViewEvent::MakeTemplate(glyphs) => this.make_template_for(glyphs, window, cx),
+                FontViewEvent::ExportTemplate(id) => this.export_template(*id, window, cx),
+            }),
+            // Light or dark as the system turns, unless one was picked.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                if theme::appearance(cx) == Appearance::System {
+                    theme::apply(window, cx);
+                }
             }),
         ];
+        theme::apply(window, cx);
         let mut this = Workspace {
             focus: cx.focus_handle(),
             document,
@@ -244,6 +301,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Follows glyphs added or removed: their tabs show the glyphs they showed; those of glyphs
+    /// removed close.
+    fn reindex(&mut self, map: &[Option<usize>], cx: &mut Context<Self>) {
+        for i in (0..self.pages.len()).rev() {
+            let Page::Glyph { glyph, .. } = &mut self.pages[i] else { continue };
+            match map.get(*glyph).copied().flatten() {
+                Some(g) => *glyph = g,
+                None => self.close_tab(i, cx),
+            }
+        }
+        cx.notify();
+    }
+
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.pages.len() {
             return;
@@ -255,8 +325,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The window's title: the project's name, marked while it has unsaved changes.
+    pub fn title(&self, cx: &App) -> String {
+        format!("{} — Scriptoria", self.document.read(cx).title())
+    }
+
     fn update_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.set_window_title(&format!("{} — Scriptoria", self.document.read(cx).title()));
+        window.set_window_title(&self.title(cx));
+        cx.notify();
+    }
+
+    /// Shows the window light, dark or as the system is, from now on.
+    pub fn choose_appearance(&mut self, appearance: Appearance, window: &mut Window, cx: &mut Context<Self>) {
+        theme::choose(appearance, window, cx);
+        set_menus(cx);
+        self.menu_bar.update(cx, |m, cx| m.reload(cx));
         cx.notify();
     }
 
@@ -375,7 +458,13 @@ impl Workspace {
         } else {
             selection
         };
-        let chars: Vec<char> = glyphs.iter().filter_map(|&g| doc.project.glyphs[g].chars.first().copied()).collect();
+        self.make_template_for(&glyphs, window, cx);
+    }
+
+    /// Asks where to write a practice sheet for glyphs, then writes it and opens it.
+    fn make_template_for(&mut self, glyphs: &[usize], window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        let chars: Vec<char> = glyphs.iter().filter_map(|&g| doc.project.glyphs.get(g)?.chars.first().copied()).collect();
         if chars.is_empty() {
             window.push_notification(Notification::warning("没有要写的字：先在左边加字，或选中要重写的字"), cx);
             return;
@@ -391,12 +480,43 @@ impl Workspace {
         .detach();
     }
 
+    /// Asks where to write a practice sheet of the project's (by id) out again, then writes it.
+    fn export_template(&mut self, id: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        let start = doc.folder.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        let name = format!("{} 格子模板 #{id}.pdf", doc.project.font.family);
+        let path = cx.prompt_for_new_path(&start, Some(&name));
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(path))) = path.await {
+                this.update_in(cx, |this, window, cx| this.export_template_to(id, path, true, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Writes a practice sheet of the project's (by id) to `path` again, as it was made (pages
+    /// written on either copy are recognized); then opens it, if asked.
+    pub fn export_template_to(&mut self, id: u32, path: PathBuf, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.document.read(cx);
+        let Some(template) = doc.project.templates.iter().find(|t| t.id == id) else { return };
+        let pdf = crate::template::sheet_pdf(&doc.project.font, template, doc.reference().map(|r| r.as_ref()));
+        match std::fs::write(&path, pdf) {
+            Ok(()) => {
+                window.push_notification(Notification::success(format!("已导出格子模板 #{id} 到 {}", path.display())), cx);
+                if open {
+                    cx.open_with_system(&path);
+                }
+            }
+            Err(e) => window.push_notification(Notification::error(format!("写不出 {}：{e}", path.display())), cx),
+        }
+    }
+
     /// Writes a practice sheet for characters to `path` (a PDF) and keeps it with the project;
     /// then opens it, if asked.
     pub fn make_template_to(&mut self, path: PathBuf, chars: &[char], open: bool, window: &mut Window, cx: &mut Context<Self>) {
         let template = self.document.update(cx, |d, cx| d.new_template(chars, cx));
         let reference = self.document.read(cx).reference().cloned();
-        let pdf = crate::template::sheet_pdf(&template, reference.as_deref());
+        let pdf = crate::template::sheet_pdf(&self.document.read(cx).project.font, &template, reference.as_deref());
         match std::fs::write(&path, pdf) {
             Ok(()) => {
                 let pages = template.grid.pages(chars.len());
@@ -409,7 +529,7 @@ impl Workspace {
                 }
             }
             Err(e) => {
-                self.document.update(cx, |d, cx| d.remove_template(template.id, cx));
+                self.document.update(cx, |d, cx| d.discard_template(template.id, cx));
                 window.push_notification(Notification::error(format!("写不出 {}：{e}", path.display())), cx);
             }
         }
@@ -631,13 +751,33 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(|this, _: &ShowSample, window, cx| this.open_sample(window, cx)))
+            .on_action(cx.listener(|this, _: &FollowSystemAppearance, window, cx| this.choose_appearance(Appearance::System, window, cx)))
+            .on_action(cx.listener(|this, _: &LightAppearance, window, cx| this.choose_appearance(Appearance::Light, window, cx)))
+            .on_action(cx.listener(|this, _: &DarkAppearance, window, cx| this.choose_appearance(Appearance::Dark, window, cx)))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .child(TitleBar::new().child(self.menu_bar.clone()))
+            .child(
+                // The window has no frame of its own: its title is drawn over the middle of the title
+                // bar (not taking the mouse, so the bar still drags the window).
+                div().relative().flex_shrink_0().child(TitleBar::new().child(self.menu_bar.clone())).child(
+                    h_flex()
+                        .id("window-title")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(TITLE_BAR_HEIGHT)
+                        .justify_center()
+                        .text_sm()
+                        .child(div().child(self.document.read(cx).title()))
+                        .child(div().text_color(theme.muted_foreground).child(" — Scriptoria"))
+                        .test_support(),
+                ),
+            )
             .child(
                 h_resizable("main")
-                    .child(resizable_panel().size(px(380.0)).child(self.font_view.clone()))
+                    .child(resizable_panel().size(px(560.0)).child(self.font_view.clone()))
                     .child(resizable_panel().child(self.render_pages(cx))),
             )
     }

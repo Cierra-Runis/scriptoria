@@ -28,6 +28,7 @@ use scriptoria_project::{Glyph, GlyphStroke, Outline, OutlineKind, SkeletonPiece
 
 use crate::app::document::{Document, DocumentEvent};
 use crate::app::mesh::Mesh;
+use crate::app::theme::palette;
 use crate::font::{AXIS, Weights};
 
 /// Tessellation tolerance (pt, the strokes' own units): an em of 4.5 pt is some 600 px here.
@@ -45,8 +46,6 @@ const ZOOM_RANGE: (f32, f32) = (0.2, 40.0);
 const ZOOM_PER_PX: f32 = 0.004;
 /// Arrow keys move the selection this far (font units); ten times as far with Shift.
 const NUDGE: f64 = 10.0;
-/// The color of selected strokes (as on the pages).
-const SELECTED: Hsla = Hsla { h: 0.75, s: 0.8, l: 0.5, a: 1.0 };
 /// The face of a full-width character (its larger side), as a fraction of the em: shown as a
 /// guide, and what "full width" scales to.
 const FACE: f64 = 0.9;
@@ -251,6 +250,8 @@ impl GlyphView {
             cx.subscribe_in(&document, window, move |this, _, event: &DocumentEvent, window, cx| match event {
                 DocumentEvent::Glyph(g) if *g == this.glyph => this.sync(window, cx),
                 DocumentEvent::GlyphList | DocumentEvent::Saved => this.sync(window, cx),
+                // The glyph moved (or went: then there is none to show; the tab closes).
+                DocumentEvent::Reindexed(map) => this.glyph = map.get(this.glyph).copied().flatten().unwrap_or(usize::MAX),
                 DocumentEvent::Font => {
                     this.ensure_plans(cx);
                     this.regenerate(cx);
@@ -737,12 +738,14 @@ impl GlyphView {
 
     fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (ink, accent, muted, line, paper) = (theme.foreground, SELECTED, theme.muted_foreground, theme.border, theme.background);
-        let advance_color: Hsla = gpui::hsla(0.58, 0.85, 0.5, 1.0);
-        let order_color: Hsla = gpui::hsla(0.0, 0.75, 0.52, 1.0);
+        let p = palette(cx);
+        // Selected strokes in the accent (as on the pages), the advance and hovered strokes blue, the
+        // writing order red.
+        let (ink, muted, line, paper) = (theme.foreground, theme.muted_foreground, theme.border, theme.background);
+        let (accent, advance_color, order_color, on_badge) = (p.mauve.hsla(), p.blue.hsla(), p.red.hsla(), p.base.hsla());
         // The reference glyph and the guides, faint.
         let reference_color = muted.opacity(0.18);
-        let guide = gpui::hsla(0.33, 0.6, 0.45, 0.35);
+        let guide = p.green.opacity(0.45);
         let doc = self.document.read(cx);
         let font = &doc.project.font;
         let (ascender, descender, upm) = (font.ascender as f64, font.descender as f64, font.units_per_em as f64);
@@ -845,10 +848,10 @@ impl GlyphView {
                         let Some(start) = start else { continue };
                         let c = view.to_window(*start);
                         let dot = Bounds::new(c - point(px(3.0), px(3.0)), size(px(6.0), px(6.0)));
-                        window.paint_quad(quad(dot, px(3.0), order_color, px(1.0), gpui::white(), Default::default()));
+                        window.paint_quad(quad(dot, px(3.0), order_color, px(1.0), on_badge, Default::default()));
                         let badge = Bounds::new(c - point(px(22.0), px(22.0)), size(px(16.0), px(16.0)));
                         window.paint_quad(quad(badge, px(8.0), order_color, px(0.0), gpui::transparent_black(), Default::default()));
-                        label_centered(window, cx, &(i + 1).to_string(), badge.center(), gpui::white(), px(10.0));
+                        label_centered(window, cx, &(i + 1).to_string(), badge.center(), on_badge, px(10.0));
                     }
                     if let Some(b) = selection_box {
                         let r = view.rect(b);
@@ -870,7 +873,7 @@ impl GlyphView {
 
     fn render_stroke_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (accent, muted, border) = (SELECTED, theme.muted_foreground, theme.border);
+        let (accent, muted, border) = (palette(cx).mauve.hsla(), theme.muted_foreground, theme.border);
         let doc = self.document.read(cx);
         let sources = &doc.project.sources;
         let rows: Vec<_> = self

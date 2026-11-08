@@ -13,7 +13,7 @@ fn main() {
     let mut project = Project::new("Sample");
     let template = project.new_template(&chars).clone();
     let reference = scriptoria::assign::system_reference().map(|(_, f)| f);
-    let pdf = scriptoria::template::sheet_pdf(&template, reference.as_ref());
+    let pdf = scriptoria::template::sheet_pdf(&project.font, &template, reference.as_ref());
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/scriptoria-template.pdf");
     std::fs::write(&path, pdf).expect("write");
     println!("{} characters, {} page(s) → {}", chars.len(), template.grid.pages(chars.len()), path.display());

@@ -1,8 +1,12 @@
-//! The glyph grid, as in FontForge's main window: every glyph of the project in a cell, drawn as
-//! the font draws it at the default weight (from its strokes as written until that is ready),
-//! with its character. Characters typed or pasted into the box above become new glyphs; a click
-//! selects a glyph (Ctrl adds or removes, Shift selects a range), a double click opens it. Selected
-//! glyphs are placed after the reference font, made full width or centered all at once.
+//! The glyph grid, as in FontForge's main window: the project's glyphs in cells, drawn as the font
+//! draws them at the default weight (from their strokes as written until that is ready), with
+//! their characters. A list beside it sorts the glyphs into groups (all; not written yet, written;
+//! by Unicode block; by practice sheet) and the grid shows one group, in the project's order or by
+//! code point. Characters typed or pasted into the box above become new glyphs (`U+4E00-U+4E2F`
+//! adds a range); a block is filled in with the characters the reference font has. A click
+//! selects a glyph (Ctrl adds or removes, Shift selects a range), a double click opens it.
+//! Selected glyphs are placed after the reference font, made full width, centered, given a
+//! practice sheet or removed all at once; a sheet is written out again or forgotten.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
@@ -12,7 +16,7 @@ use gpui::TestSupportExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::slider::{Slider, SliderEvent, SliderState};
-use gpui::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClickEvent, Context, Entity, EventEmitter, Pixels, SharedString, Subscription, Window, canvas, div,
@@ -26,11 +30,14 @@ use crate::app::document::{Document, DocumentEvent};
 use crate::app::mesh::Mesh;
 use crate::app::outlines::Outlines;
 use crate::font::{AXIS, WRITTEN_MIN, Weights};
+use crate::groups::{self, Group, Listed, Section};
 
 /// A cell's drawing area (px, square), the margin inside it, and the label under it.
 const CELL: f32 = 76.0;
 const MARGIN: f32 = 6.0;
 const LABEL: f32 = 20.0;
+/// The width of the list of groups (px).
+const GROUPS: f32 = 172.0;
 /// Tessellation tolerance (font units): far below a pixel at cell size.
 const TOLERANCE: f32 = 2.0;
 /// What a full-width glyph's larger side becomes, as a fraction of the em.
@@ -43,9 +50,23 @@ pub enum FontViewEvent {
     Open(usize),
     /// Show the sample text.
     OpenSample,
+    /// Make a practice sheet for these glyphs.
+    MakeTemplate(Vec<usize>),
+    /// Write a practice sheet (by id) out again.
+    ExportTemplate(u32),
 }
 
 impl EventEmitter<FontViewEvent> for FontView {}
+
+/// The groups and the glyphs shown, as they were for a state of the document.
+struct Shown {
+    /// The document (its id, its generation), the group and the order they were made for.
+    key: (u64, u64, Group, bool),
+    listed: Vec<Listed>,
+    glyphs: Vec<usize>,
+    /// For a block: how many characters the reference font has that the project does not.
+    missing: usize,
+}
 
 pub struct FontView {
     document: Entity<Document>,
@@ -55,6 +76,10 @@ pub struct FontView {
     selected: Option<usize>,
     /// All glyphs selected (with `selected`).
     selection: BTreeSet<usize>,
+    /// The group shown, and whether by code point.
+    group: Group,
+    by_code: bool,
+    shown: Option<Shown>,
     /// The grid's width at the last paint, for the number of columns.
     width: Rc<Cell<Pixels>>,
     /// Per glyph: its strokes as written (font units, y down from the ascender) at a revision.
@@ -66,7 +91,7 @@ pub struct FontView {
 
 impl FontView {
     pub fn new(document: Entity<Document>, outlines: Entity<Outlines>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("输入或粘贴要做的字，回车加入"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("输入要做的字或 U+4E00-U+4E2F，回车加入"));
         let written_weight = document.read(cx).project.font.written_weight;
         let written = cx.new(|_| SliderState::new().max(AXIS.max as f32).min(WRITTEN_MIN as f32).step(10.0).default_value(written_weight as f32));
         let subscriptions = vec![
@@ -90,18 +115,27 @@ impl FontView {
                 }
             }),
             cx.subscribe(&document, |this, document, event: &DocumentEvent, cx| {
-                if matches!(event, DocumentEvent::GlyphList | DocumentEvent::Glyph(_) | DocumentEvent::Saved) {
-                    // A replaced project may have fewer glyphs; its meshes are all new.
-                    let n = document.read(cx).project.glyphs.len();
-                    if this.selected.is_some_and(|s| s >= n) {
-                        this.select(None, cx);
+                match event {
+                    // Glyphs added or removed: the selection follows them.
+                    DocumentEvent::Reindexed(map) => {
+                        let moved = |g: usize| map.get(g).copied().flatten();
+                        this.selection = this.selection.iter().filter_map(|&g| moved(g)).collect();
+                        this.selected = this.selected.and_then(moved);
                     }
-                    this.selection.retain(|&i| i < n);
-                    if matches!(event, DocumentEvent::Saved) && document.read(cx).folder.is_some() {
-                        this.meshes.borrow_mut().retain(|&i, _| i < n);
+                    DocumentEvent::GlyphList | DocumentEvent::Glyph(_) | DocumentEvent::Saved => {
+                        // A replaced project may have fewer glyphs.
+                        let n = document.read(cx).project.glyphs.len();
+                        if this.selected.is_some_and(|s| s >= n) {
+                            this.select(None, cx);
+                        }
+                        this.selection.retain(|&i| i < n);
+                        if matches!(event, DocumentEvent::Saved) {
+                            this.group = Group::All;
+                        }
                     }
-                    cx.notify();
+                    DocumentEvent::Font => {}
                 }
+                cx.notify();
             }),
             cx.observe(&outlines, |_, _, cx| cx.notify()),
         ];
@@ -111,6 +145,9 @@ impl FontView {
             input,
             selected: None,
             selection: BTreeSet::new(),
+            group: Group::All,
+            by_code: false,
+            shown: None,
             width: Rc::new(Cell::new(px(600.0))),
             meshes: Rc::default(),
             written,
@@ -133,6 +170,58 @@ impl FontView {
         self.selection.iter().copied().collect()
     }
 
+    /// The group shown.
+    pub fn group(&self) -> Group {
+        self.group
+    }
+
+    /// Shows a group of glyphs (in code point order, or the project's). The selection keeps only
+    /// the glyphs shown.
+    pub fn show(&mut self, group: Group, by_code: bool, cx: &mut Context<Self>) {
+        self.group = group;
+        self.by_code = by_code;
+        let shown: BTreeSet<usize> = self.glyphs(cx).iter().copied().collect();
+        self.selection.retain(|g| shown.contains(g));
+        if self.selected.is_some_and(|s| !shown.contains(&s)) {
+            self.set_selected(None, cx);
+        }
+        cx.notify();
+    }
+
+    /// The groups and the glyphs shown, made again when the document has changed.
+    fn refresh(&mut self, cx: &App) -> &Shown {
+        let doc = self.document.read(cx);
+        let key = (doc.id(), doc.generation(), self.group, self.by_code);
+        if self.shown.as_ref().is_none_or(|s| s.key != key) {
+            let project = &doc.project;
+            let listed = groups::list(project);
+            // A group gone (its sheet forgotten, its last glyph removed): all of them.
+            if !listed.iter().any(|l| l.group == self.group) {
+                self.group = Group::All;
+            }
+            let mut glyphs = groups::members(project, self.group);
+            if self.by_code {
+                glyphs.sort_by_key(|&g| project.glyphs[g].chars.first().map_or(u32::MAX, |&c| c as u32));
+            }
+            let missing = match (self.group, doc.reference()) {
+                (Group::Block(start), Some(r)) => groups::missing_in_block(project, start, |c| r.has(c)).chars().count(),
+                _ => 0,
+            };
+            self.shown = Some(Shown { key: (key.0, key.1, self.group, self.by_code), listed, glyphs, missing });
+        }
+        self.shown.as_ref().expect("just made")
+    }
+
+    /// The glyphs shown, in the order shown.
+    pub fn glyphs(&mut self, cx: &App) -> Vec<usize> {
+        self.refresh(cx).glyphs.clone()
+    }
+
+    /// The groups listed.
+    pub fn groups(&mut self, cx: &App) -> Vec<Listed> {
+        self.refresh(cx).listed.clone()
+    }
+
     /// Selects one glyph (or none).
     pub fn select(&mut self, glyph: Option<usize>, cx: &mut Context<Self>) {
         self.selection = glyph.into_iter().collect();
@@ -148,11 +237,15 @@ impl FontView {
     }
 
     /// A click on a glyph: selects it alone; with Ctrl adds or removes it; with Shift adds the
-    /// glyphs from the last one clicked.
+    /// glyphs shown from the last one clicked.
     fn click(&mut self, glyph: usize, ctrl: bool, shift: bool, cx: &mut Context<Self>) {
         match (ctrl, shift, self.selected) {
             (_, true, Some(from)) => {
-                self.selection.extend(from.min(glyph)..=from.max(glyph));
+                let shown = self.glyphs(cx);
+                let at = |g: usize| shown.iter().position(|&s| s == g);
+                if let (Some(a), Some(b)) = (at(from), at(glyph)) {
+                    self.selection.extend(&shown[a.min(b)..=a.max(b)]);
+                }
                 self.set_selected(Some(glyph), cx);
             }
             (true, _, _) => {
@@ -166,8 +259,9 @@ impl FontView {
         cx.notify();
     }
 
+    /// Selects every glyph shown.
     fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.selection = (0..self.document.read(cx).project.glyphs.len()).collect();
+        self.selection = self.glyphs(cx).into_iter().collect();
         cx.notify();
     }
 
@@ -177,26 +271,49 @@ impl FontView {
         self.document.update(cx, |d, cx| d.update_glyphs(&glyphs, f, cx));
     }
 
-    /// Selects the first glyph without strokes after the selected one (wrapping around), if any.
+    /// Removes the selected glyphs, as one step to undo.
+    fn remove_selection(&mut self, cx: &mut Context<Self>) {
+        let glyphs = self.selection();
+        self.document.update(cx, |d, cx| d.remove_glyphs(&glyphs, cx));
+        self.select(None, cx);
+    }
+
+    /// Selects the next glyph shown without strokes after the selected one (wrapping around), if
+    /// any.
     pub fn select_next_empty(&mut self, cx: &mut Context<Self>) {
+        let shown = self.glyphs(cx);
         let glyphs = &self.document.read(cx).project.glyphs;
-        let n = glyphs.len();
-        let from = self.selected.map_or(0, |s| s + 1);
-        let next = (0..n).map(|k| (from + k) % n).find(|&i| glyphs[i].strokes.is_empty());
+        let n = shown.len();
+        let from = self.selected.and_then(|s| shown.iter().position(|&g| g == s)).map_or(0, |p| p + 1);
+        let next = (0..n).map(|k| shown[(from + k) % n]).find(|&g| glyphs[g].strokes.is_empty());
         if next.is_some() {
             self.select(next, cx);
         }
     }
 
     fn add_typed(&mut self, input: Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) {
-        let text = input.read(cx).value().to_string();
+        let text = groups::expand_ranges(&input.read(cx).value());
+        self.add_chars(&text, cx);
+        input.update(cx, |s, cx| s.set_value("", window, cx));
+    }
+
+    /// Adds glyphs for characters; the first new one is selected if none was.
+    fn add_chars(&mut self, text: &str, cx: &mut Context<Self>) -> usize {
         let first_new = self.document.read(cx).project.glyphs.len();
-        let added = self.document.update(cx, |d, cx| d.add_chars(&text, cx));
+        let added = self.document.update(cx, |d, cx| d.add_chars(text, cx));
         if added > 0 && self.selected.is_none() {
             self.select(Some(first_new), cx);
         }
-        input.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
+        added
+    }
+
+    /// Adds the characters of a block the reference font has and the project does not.
+    pub fn fill_block(&mut self, start: u32, cx: &mut Context<Self>) -> usize {
+        let doc = self.document.read(cx);
+        let Some(reference) = doc.reference().cloned() else { return 0 };
+        let missing = groups::missing_in_block(&doc.project, start, |c| reference.has(c));
+        self.add_chars(&missing, cx)
     }
 
     fn columns(&self) -> usize {
@@ -281,6 +398,146 @@ impl FontView {
             }))
             .test_support()
     }
+
+    /// The list of groups: status, Unicode blocks, practice sheets.
+    fn render_groups(&self, listed: &[Listed], cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (muted, active, hover, border, background) = (theme.muted_foreground, theme.primary, theme.secondary_hover, theme.border, theme.sidebar);
+        let mut list = v_flex().id("groups").w(px(GROUPS)).flex_shrink_0().h_full().overflow_y_scroll().p_1().gap_px().bg(background).border_r_1().border_color(border);
+        let mut section = Section::Status;
+        for (i, l) in listed.iter().enumerate() {
+            if l.section != section {
+                section = l.section;
+                let title = match section {
+                    Section::Status => "状态",
+                    Section::Blocks => "Unicode 区块",
+                    Section::Templates => "格子模板",
+                };
+                list = list.child(div().px_2().pt_3().pb_1().text_xs().text_color(muted).child(title));
+            }
+            let current = l.group == self.group;
+            let count = match l.group {
+                Group::Unwritten | Group::Written => l.glyphs.to_string(),
+                _ => format!("{}/{}", l.written, l.glyphs),
+            };
+            let group = l.group;
+            list = list.child(
+                h_flex()
+                    .id(("group", i))
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(current, |d| d.bg(active.opacity(0.18)))
+                    .when(!current, |d| d.hover(move |d| d.bg(hover)))
+                    .child(div().flex_1().min_w_0().truncate().child(l.name.clone()))
+                    .child(div().flex_shrink_0().text_color(muted).child(count))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let by_code = this.by_code;
+                        this.show(group, by_code, cx);
+                    }))
+                    .test_support(),
+            );
+        }
+        list
+    }
+
+    /// What can be done with the group shown as a whole.
+    fn render_group_actions(&self, shown: &Shown, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let listed = shown.listed.iter().find(|l| l.group == self.group);
+        let (name, n, written) = listed.map_or(("", 0, 0), |l| (l.name.as_str(), l.glyphs, l.written));
+        let has_reference = self.document.read(cx).reference().is_some();
+        let glyphs = shown.glyphs.clone();
+        let mut row = h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .flex_wrap()
+            .child(div().flex_1().min_w(px(120.0)).text_xs().text_color(theme.muted_foreground).child(format!("{name}：{n} 个字形，已写 {written}")));
+        match self.group {
+            Group::Block(start) => {
+                let missing = shown.missing;
+                row = row.child(
+                    Button::new("fill-block")
+                        .xsmall()
+                        .label(format!("补全本区块（{missing} 字）"))
+                        .tooltip("加入参考字体有、工程里还没有的字")
+                        .disabled(!has_reference || missing == 0)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.fill_block(start, cx);
+                        })),
+                );
+            }
+            Group::Template(id) => {
+                row = row
+                    .child(
+                        Button::new("export-template")
+                            .xsmall()
+                            .label("重新导出 PDF…")
+                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(FontViewEvent::ExportTemplate(id)))),
+                    )
+                    .child(
+                        Button::new("remove-template")
+                            .xsmall()
+                            .danger()
+                            .label("删除模板")
+                            .tooltip("之后导入写在这份模板上的页，不再自动归位（可撤销）")
+                            .on_click(cx.listener(move |this, _, _, cx| this.document.update(cx, |d, cx| d.remove_template(id, cx)))),
+                    );
+            }
+            _ => {}
+        }
+        row.child(
+            Button::new("template-group")
+                .xsmall()
+                .label("为本组生成格子模板…")
+                .disabled(glyphs.is_empty())
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(FontViewEvent::MakeTemplate(glyphs.clone())))),
+        )
+    }
+
+    /// What can be done with the glyphs selected.
+    fn render_selection_actions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let n = self.selection.len();
+        let font = self.document.read(cx).project.font.clone();
+        let has_reference = self.document.read(cx).reference().is_some();
+        let selection = self.selection();
+        h_flex()
+            .px_2()
+            .pb_1()
+            .gap_1()
+            .flex_wrap()
+            .text_xs()
+            .child(div().flex_1().min_w(px(60.0)).child(format!("已选 {n} 个：")))
+            .child(Button::new("fit-selection").xsmall().label("按参考摆放").disabled(!has_reference).on_click(cx.listener(|this, _, _, cx| {
+                let glyphs = this.selection();
+                this.document.update(cx, |d, cx| d.fit_to_reference(&glyphs, cx));
+            })))
+            .child(
+                Button::new("full-width-selection")
+                    .xsmall()
+                    .label("全角")
+                    .on_click(cx.listener(move |this, _, _, cx| this.edit_selection(cx, |g| g.fit_full_width(&font, FACE)))),
+            )
+            .child(Button::new("center-selection").xsmall().label("居中").on_click(cx.listener(|this, _, _, cx| this.edit_selection(cx, Glyph::center))))
+            .child(
+                Button::new("template-selection")
+                    .xsmall()
+                    .label("生成格子模板…")
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(FontViewEvent::MakeTemplate(selection.clone())))),
+            )
+            .child(
+                Button::new("remove-selection")
+                    .xsmall()
+                    .danger()
+                    .label("删除")
+                    .tooltip("删除选中的字形（可撤销）")
+                    .on_click(cx.listener(|this, _, _, cx| this.remove_selection(cx))),
+            )
+    }
 }
 
 /// A glyph's strokes as written, placed in the em, y down from the ascender (font units).
@@ -303,131 +560,127 @@ pub fn glyph_meshes(glyph: &Glyph, ascender: f64) -> Vec<Rc<Mesh>> {
 
 impl Render for FontView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.document.read(cx).project.glyphs.len();
+        self.refresh(cx);
+        let shown = self.shown.take().expect("refreshed");
+        let shown_glyphs = Rc::new(shown.glyphs.clone());
+        let count = shown_glyphs.len();
         let columns = self.columns();
         let rows = count.div_ceil(columns);
         let width = self.width.clone();
         let input = self.input.clone();
         let weights = self.shown_weights(cx);
+        let groups = self.render_groups(&shown.listed, cx);
+        let group_actions = self.render_group_actions(&shown, cx);
+        let selection_actions = (!self.selection.is_empty()).then(|| self.render_selection_actions(cx));
+        self.shown = Some(shown);
+        let by_code = self.by_code;
         let theme = cx.theme();
-        v_flex()
-            .size_full()
-            .bg(theme.secondary)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(div().flex_1().child(Input::new(&self.input).id("chars")))
-                    .child(Button::new("add-chars").primary().label("加入").on_click(cx.listener(move |this, _, window, cx| {
-                        this.add_typed(input.clone(), window, cx);
-                    }))),
-            )
-            .child(
-                // Which weight the handwriting is: the others are its strokes thinned or thickened.
-                h_flex()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .child(div().flex_shrink_0().child("原稿字重"))
-                    .child(div().id("written-weight").flex_1().min_w(px(80.0)).child(Slider::new(&self.written)).test_support())
-                    .child(div().flex_shrink_0().w(px(28.0)).child(format!("{:.0}", weights.written)))
-                    .child(div().flex_shrink_0().text_color(theme.muted_foreground).child(format!(
-                        "100 = ×{:.2} · 900 = ×{:.2}",
-                        weights.scale(AXIS.min),
-                        weights.scale(AXIS.max)
-                    ))),
-            )
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{count} 个字形 · 单击选中（Ctrl/Shift 多选），双击打开")),
+        let grid = if count == 0 {
+            div().flex_1().p_4().text_sm().text_color(theme.muted_foreground).child("这一组还没有字形").into_any_element()
+        } else {
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    canvas(
+                        move |bounds, window, _| {
+                            if (f32::from(bounds.size.width) - f32::from(width.get())).abs() > 1.0 {
+                                width.set(bounds.size.width);
+                                window.refresh();
+                            }
+                        },
+                        |_, _, _, _| {},
                     )
-                    .child(Button::new("select-all").xsmall().ghost().label("全选").on_click(cx.listener(|this, _, _, cx| this.select_all(cx))))
-                    .child(
-                        Button::new("open-sample")
-                            .xsmall()
-                            .label("样张")
-                            .tooltip("把一段文字按现在的摆放排出来看")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(FontViewEvent::OpenSample))),
-                    ),
-            )
-            .when(!self.selection.is_empty(), |d| {
-                let n = self.selection.len();
-                let font = self.document.read(cx).project.font.clone();
-                let has_reference = self.document.read(cx).reference().is_some();
-                d.child(
-                    h_flex()
-                        .px_2()
-                        .pb_1()
-                        .gap_1()
-                        .text_xs()
-                        .child(div().flex_1().child(format!("已选 {n} 个字：")))
-                        .child(
-                            Button::new("fit-selection")
-                                .xsmall()
-                                .label("按参考摆放")
-                                .disabled(!has_reference)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let glyphs = this.selection();
-                                    this.document.update(cx, |d, cx| d.fit_to_reference(&glyphs, cx));
-                                })),
-                        )
-                        .child(Button::new("full-width-selection").xsmall().label("全角").on_click(cx.listener(
-                            move |this, _, _, cx| this.edit_selection(cx, |g| g.fit_full_width(&font, FACE)),
-                        )))
-                        .child(
-                            Button::new("center-selection")
-                                .xsmall()
-                                .label("居中")
-                                .on_click(cx.listener(|this, _, _, cx| this.edit_selection(cx, Glyph::center))),
-                        ),
+                    .absolute()
+                    .size_full(),
                 )
-            })
+                .child(
+                    uniform_list(
+                        "glyph-rows",
+                        rows,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            range
+                                .map(|row| {
+                                    let cells = shown_glyphs[row * columns..((row + 1) * columns).min(count)].iter().map(|&g| this.render_cell(g, cx)).collect::<Vec<_>>();
+                                    h_flex().gap_2().px_2().py_1().children(cells)
+                                })
+                                .collect()
+                        }),
+                    )
+                    .size_full(),
+                )
+                .into_any_element()
+        };
+        let theme = cx.theme();
+        h_flex()
+            .size_full()
+            .bg(theme.background)
+            .child(groups)
             .child(
-                div()
-                    .relative()
+                v_flex()
                     .flex_1()
-                    .min_h_0()
+                    .min_w_0()
+                    .h_full()
                     .child(
-                        canvas(
-                            move |bounds, window, _| {
-                                if (f32::from(bounds.size.width) - f32::from(width.get())).abs() > 1.0 {
-                                    width.set(bounds.size.width);
-                                    window.refresh();
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
+                        h_flex()
+                            .gap_2()
+                            .p_2()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(div().flex_1().child(Input::new(&self.input).id("chars")))
+                            .child(Button::new("add-chars").primary().label("加入").on_click(cx.listener(move |this, _, window, cx| {
+                                this.add_typed(input.clone(), window, cx);
+                            }))),
                     )
                     .child(
-                        uniform_list(
-                            "glyph-rows",
-                            rows,
-                            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                range
-                                    .map(|row| {
-                                        let cells = (row * columns..((row + 1) * columns).min(count)).map(|i| this.render_cell(i, cx)).collect::<Vec<_>>();
-                                        h_flex().gap_2().px_2().py_1().children(cells)
-                                    })
-                                    .collect()
-                            }),
-                        )
-                        .size_full(),
-                    ),
+                        // Which weight the handwriting is: the others are its strokes thinned or thickened.
+                        h_flex()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .text_xs()
+                            .child(div().flex_shrink_0().child("原稿字重"))
+                            .child(div().id("written-weight").flex_1().min_w(px(80.0)).child(Slider::new(&self.written)).test_support())
+                            .child(div().flex_shrink_0().w(px(28.0)).child(format!("{:.0}", weights.written)))
+                            .child(div().flex_shrink_0().text_color(theme.muted_foreground).child(format!(
+                                "100 = ×{:.2} · 900 = ×{:.2}",
+                                weights.scale(AXIS.min),
+                                weights.scale(AXIS.max)
+                            ))),
+                    )
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .child(div().flex_1().text_xs().text_color(theme.muted_foreground).child("单击选中（Ctrl/Shift 多选），双击打开"))
+                            .child(Button::new("select-all").xsmall().ghost().label("全选").on_click(cx.listener(|this, _, _, cx| this.select_all(cx))))
+                            .child(
+                                Button::new("by-code")
+                                    .xsmall()
+                                    .ghost()
+                                    .label("按码位排")
+                                    .selected(by_code)
+                                    .tooltip("按码位排列，而不是按加入的先后")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let group = this.group;
+                                        this.show(group, !by_code, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("open-sample")
+                                    .xsmall()
+                                    .label("样张")
+                                    .tooltip("把一段文字按现在的摆放排出来看")
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(FontViewEvent::OpenSample))),
+                            ),
+                    )
+                    .child(group_actions)
+                    .children(selection_actions)
+                    .child(grid),
             )
     }
 }

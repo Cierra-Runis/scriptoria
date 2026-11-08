@@ -8,6 +8,7 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext, point, px};
 use scriptoria::app::glyph_view::GlyphView;
 use scriptoria::app::{self, Workspace};
+use scriptoria::groups::Group;
 use scriptoria_ink::kurbo::{Point, Rect, Vec2};
 use scriptoria_ink::{InkDocument, Stroke};
 use scriptoria_project::Glyph;
@@ -418,15 +419,19 @@ fn the_grid_and_the_sample_show_the_font(cx: &mut TestAppContext) {
     assert!(workspace.read_with(cx, |w, _| w.glyph_view(1)).is_some());
 }
 
-/// A practice sheet "written on": its first page drawn as the sheet does, with `strokes` filled in
-/// black on top, each set of strokes moved into the square of the cell given.
+/// A practice sheet "written on": its first page drawn as the sheet does (a box for each character
+/// to write over), with `strokes` filled in black on top, each set of strokes moved into the square
+/// of the cell given.
 fn written_sheet(template: &scriptoria_project::Template, strokes: &[(usize, Vec<Stroke>)]) -> Vec<u8> {
-    use scriptoria_ink::kurbo::{Affine, PathEl};
+    use scriptoria_ink::kurbo::{Affine, PathEl, Shape as _};
     use scriptoria_template::pdf_writer::{Content, Pdf, Rect as PdfRect, Ref};
+    use scriptoria_template::{FAINT, Heights, Model, Sheet};
     let grid = &template.grid;
     let chars: Vec<char> = template.chars.chars().collect();
+    let model = |_| Some(Model { outline: scriptoria_ink::kurbo::Rect::new(100.0, -50.0, 900.0, 800.0).to_path(0.1), advance: 1000.0 });
+    let sheet = Sheet { grid: *grid, id: template.id, chars: &chars, models: &model, heights: Heights::default() };
     let mut c = Content::new();
-    scriptoria_template::draw_page(&mut c, grid, template.id, &chars, 0, &|_| None);
+    sheet.draw_page(&mut c, 0);
     c.set_fill_rgb(0.1, 0.1, 0.1);
     for (cell, strokes) in strokes {
         let square = grid.cell(*cell).square;
@@ -461,11 +466,18 @@ fn written_sheet(template: &scriptoria_project::Template, strokes: &[(usize, Vec
             c.fill_nonzero();
         }
     }
-    let (catalog, tree, page, contents) = (Ref::new(1), Ref::new(2), Ref::new(3), Ref::new(4));
+    let (catalog, tree, page, contents, faint) = (Ref::new(1), Ref::new(2), Ref::new(3), Ref::new(4), Ref::new(5));
     let mut pdf = Pdf::new();
     pdf.catalog(catalog).pages(tree);
     pdf.pages(tree).kids([page]).count(1);
-    pdf.page(page).parent(tree).media_box(PdfRect::new(0.0, 0.0, grid.width as f32, grid.height as f32)).contents(contents).resources();
+    scriptoria_template::write_faint_state(&mut pdf, faint);
+    pdf.page(page)
+        .parent(tree)
+        .media_box(PdfRect::new(0.0, 0.0, grid.width as f32, grid.height as f32))
+        .contents(contents)
+        .resources()
+        .ext_g_states()
+        .pair(FAINT, faint);
     pdf.stream(contents, &c.finish());
     pdf.finish()
 }
@@ -509,5 +521,73 @@ fn written_sheets_fill_their_glyphs(cx: &mut TestAppContext) {
     // One undo takes the sheet's writing back.
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert!(glyphs(&workspace, cx)[0].strokes.is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui_kit::test]
+fn glyphs_are_grouped_and_removed_together(cx: &mut TestAppContext) {
+    let (workspace, cx) = open(vec![], cx);
+    // Characters typed, and a range of code points.
+    cx.update(|window, cx| {
+        window.click("chars", cx);
+        window.input("世あA U+3041-U+3043", cx);
+        window.press("enter", cx);
+    });
+    let chars = |cx: &mut VisualTestContext| -> String { glyphs(&workspace, cx).iter().flat_map(|g| g.chars.clone()).collect() };
+    assert_eq!(chars(cx), "世あAぁぃ");
+
+    // The hiragana shown alone, then by code point.
+    let font_view = workspace.read_with(cx, |w, _| w.font_view().clone());
+    let groups = font_view.update(cx, |f, cx| f.groups(cx));
+    let hiragana = groups.iter().position(|l| l.group == Group::Block(0x3040)).expect("a group for the hiragana");
+    assert_eq!((groups[hiragana].name.as_str(), groups[hiragana].glyphs), ("平假名", 3));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("group", hiragana), cx);
+    });
+    assert_eq!(font_view.update(cx, |f, cx| f.glyphs(cx)), [1, 3, 4]);
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("by-code", cx);
+    });
+    assert_eq!(font_view.update(cx, |f, cx| f.glyphs(cx)), [3, 1, 4], "ぁ あ ぃ");
+
+    // With A open in a tab, the hiragana removed at once: the tab still shows A.
+    workspace.update_in(cx, |w, window, cx| w.open_glyph(2, window, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("select-all", cx);
+        window.render_frame(cx);
+        window.click("remove-selection", cx);
+        window.render_frame(cx);
+    });
+    assert_eq!(chars(cx), "世A");
+    assert_eq!(workspace.read_with(cx, |w, cx| w.glyph_view(1).map(|v| v.read(cx).glyph_index())), Some(1));
+    // Its group gone, all glyphs are shown.
+    assert_eq!(font_view.read_with(cx, |f, _| f.group()), Group::All);
+    // One undo puts them back where they were.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(chars(cx), "世あAぁぃ");
+    assert!(workspace.read_with(cx, |w, _| w.glyph_view(2)).is_some());
+
+    // A practice sheet is a group too, and is forgotten (and remembered) like a change.
+    let dir = std::env::temp_dir().join(format!("scriptoria-groups-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    workspace.update_in(cx, |w, window, cx| w.make_template_to(dir.join("sheet.pdf"), &['ぃ', '世'], false, window, cx));
+    let groups = font_view.update(cx, |f, cx| f.groups(cx));
+    let sheet = groups.iter().position(|l| l.group == Group::Template(1)).expect("a group for the sheet");
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("group", sheet), cx);
+    });
+    assert_eq!(font_view.update(cx, |f, cx| f.glyphs(cx)), [4, 0], "in the sheet's order");
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("remove-template", cx);
+    });
+    let templates = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, cx| w.document().read(cx).project.templates.len());
+    assert_eq!(templates(cx), 0);
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(templates(cx), 1);
     std::fs::remove_dir_all(&dir).ok();
 }

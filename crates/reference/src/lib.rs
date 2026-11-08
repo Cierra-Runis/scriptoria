@@ -107,6 +107,11 @@ impl ReferenceFont {
         FontRef::from_index(&self.data, self.face.index).expect("checked when opened")
     }
 
+    /// Whether the font maps a character to a glyph.
+    pub fn has(&self, c: char) -> bool {
+        self.font().charmap().map(c).is_some()
+    }
+
     /// The glyph of a character, scaled to `units_per_em`; none if the font lacks it or it draws
     /// nothing (a space).
     pub fn glyph(&self, c: char, units_per_em: f64) -> Option<Glyph> {

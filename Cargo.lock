@@ -6414,6 +6414,7 @@ dependencies = [
  "anyhow",
  "gpui-kit",
  "lyon",
+ "scriptoria-charsets",
  "scriptoria-font",
  "scriptoria-ink",
  "scriptoria-outline",
@@ -6424,6 +6425,13 @@ dependencies = [
  "scriptoria-testkit",
  "serde_json",
  "skrifa 0.49.0",
+]
+
+[[package]]
+name = "scriptoria-charsets"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
  "unicode-blocks",
 ]
 

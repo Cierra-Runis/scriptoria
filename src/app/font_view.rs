@@ -690,7 +690,13 @@ impl Render for FontView {
                             .child(div().flex_1().child(Input::new(&self.input).id("chars")))
                             .child(Button::new("add-chars").primary().label("加入").on_click(cx.listener(move |this, _, window, cx| {
                                 this.add_typed(input.clone(), window, cx);
-                            }))),
+                            })))
+                            .child(
+                                Button::new("add-charset")
+                                    .label("字符集…")
+                                    .tooltip("按国家标准（通用规范汉字表、GB 2312、Big5、JIS、KS）或 Unicode 区块加字")
+                                    .on_click(cx.listener(|this, _, window, cx| crate::app::charset_picker::open(this.document.clone(), window, cx))),
+                            ),
                     )
                     .child(
                         // Which weight the handwriting is: the others are its strokes thinned or thickened.

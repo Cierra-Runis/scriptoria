@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use scriptoria_project::Project;
-use unicode_blocks::{UnicodeBlock, find_unicode_block};
+use scriptoria_charsets::{Block, block, block_of};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Group {
@@ -38,66 +38,6 @@ pub struct Listed {
     pub written: usize,
 }
 
-fn block_of(c: char) -> Option<UnicodeBlock> {
-    find_unicode_block(c)
-}
-
-/// The block starting at a code point.
-pub fn block(start: u32) -> Option<UnicodeBlock> {
-    char::from_u32(start).and_then(block_of).filter(|b| b.start() == start)
-}
-
-/// A block's name, in Chinese for the blocks handwriting is mostly made of.
-pub fn block_name(b: UnicodeBlock) -> String {
-    let name = b.name();
-    if let Some(ext) = name.strip_prefix("CJK Unified Ideographs Extension ") {
-        return format!("中日韩统一表意文字扩展 {ext}");
-    }
-    let chinese = match name {
-        "Basic Latin" => "基本拉丁字母",
-        "Latin-1 Supplement" => "拉丁字母补充-1",
-        "Latin Extended-A" => "拉丁字母扩展-A",
-        "Latin Extended-B" => "拉丁字母扩展-B",
-        "Latin Extended Additional" => "拉丁字母扩展附加",
-        "IPA Extensions" => "国际音标扩展",
-        "Greek and Coptic" => "希腊字母和科普特字母",
-        "Cyrillic" => "西里尔字母",
-        "General Punctuation" => "常用标点",
-        "Superscripts and Subscripts" => "上标和下标",
-        "Currency Symbols" => "货币符号",
-        "Letterlike Symbols" => "类字母符号",
-        "Number Forms" => "数字形式",
-        "Arrows" => "箭头",
-        "Mathematical Operators" => "数学运算符",
-        "Enclosed Alphanumerics" => "带圈字母数字",
-        "Box Drawing" => "制表符",
-        "Geometric Shapes" => "几何图形",
-        "Miscellaneous Symbols" => "杂项符号",
-        "CJK Radicals Supplement" => "中日韩部首补充",
-        "Kangxi Radicals" => "康熙部首",
-        "CJK Symbols and Punctuation" => "中日韩符号和标点",
-        "Hiragana" => "平假名",
-        "Katakana" => "片假名",
-        "Bopomofo" => "注音符号",
-        "Hangul Compatibility Jamo" => "谚文兼容字母",
-        "Kanbun" => "汉文训读",
-        "Bopomofo Extended" => "注音符号扩展",
-        "CJK Strokes" => "中日韩笔画",
-        "Katakana Phonetic Extensions" => "片假名音标扩展",
-        "Enclosed CJK Letters and Months" => "带圈中日韩字母和月份",
-        "CJK Compatibility" => "中日韩兼容",
-        "CJK Unified Ideographs" => "中日韩统一表意文字",
-        "Hangul Syllables" => "谚文音节",
-        "CJK Compatibility Ideographs" => "中日韩兼容表意文字",
-        "Vertical Forms" => "竖排形式",
-        "CJK Compatibility Forms" => "中日韩兼容形式",
-        "Small Form Variants" => "小写变体形式",
-        "Halfwidth and Fullwidth Forms" => "半角及全角形式",
-        _ => name,
-    };
-    chinese.to_string()
-}
-
 /// The groups of a project, in the order listed: all, by state, by block (in code point order),
 /// by practice sheet.
 pub fn list(project: &Project) -> Vec<Listed> {
@@ -108,13 +48,13 @@ pub fn list(project: &Project) -> Vec<Listed> {
         Listed { group: Group::Unwritten, section: Section::Status, name: "未书写".into(), glyphs: glyphs.len() - written, written: 0 },
         Listed { group: Group::Written, section: Section::Status, name: "已书写".into(), glyphs: written, written },
     ];
-    let mut blocks: BTreeMap<u32, (UnicodeBlock, usize, usize)> = BTreeMap::new();
+    let mut blocks: BTreeMap<u32, (Block, usize, usize)> = BTreeMap::new();
     let mut none = (0, 0);
     for g in glyphs {
         let w = usize::from(!g.strokes.is_empty());
         match g.chars.first().copied().and_then(block_of) {
             Some(b) => {
-                let e = blocks.entry(b.start()).or_insert((b, 0, 0));
+                let e = blocks.entry(b.start).or_insert((b, 0, 0));
                 e.1 += 1;
                 e.2 += w;
             }
@@ -124,7 +64,7 @@ pub fn list(project: &Project) -> Vec<Listed> {
             }
         }
     }
-    out.extend(blocks.into_values().map(|(b, n, w)| Listed { group: Group::Block(b.start()), section: Section::Blocks, name: block_name(b), glyphs: n, written: w }));
+    out.extend(blocks.into_values().map(|(b, n, w)| Listed { group: Group::Block(b.start), section: Section::Blocks, name: b.name(), glyphs: n, written: w }));
     if none.0 > 0 {
         out.push(Listed { group: Group::NoBlock, section: Section::Blocks, name: "其他".into(), glyphs: none.0, written: none.1 });
     }
@@ -156,7 +96,7 @@ fn template_members(by_char: &HashMap<char, usize>, chars: &str) -> Vec<usize> {
 /// The glyphs of a group: in the project's order, or a sheet's in the sheet's.
 pub fn members(project: &Project, group: Group) -> Vec<usize> {
     let glyphs = &project.glyphs;
-    let first_block = |i: usize| glyphs[i].chars.first().copied().and_then(block_of).map(|b| b.start());
+    let first_block = |i: usize| glyphs[i].chars.first().copied().and_then(block_of).map(|b| b.start);
     let all = 0..glyphs.len();
     match group {
         Group::All => all.collect(),
@@ -173,7 +113,7 @@ pub fn members(project: &Project, group: Group) -> Vec<usize> {
 pub fn missing_in_block(project: &Project, start: u32, has: impl Fn(char) -> bool) -> String {
     let Some(b) = block(start) else { return String::new() };
     let have: HashSet<char> = project.glyphs.iter().flat_map(|g| g.chars.iter().copied()).collect();
-    (b.start()..=b.end()).filter_map(char::from_u32).filter(|c| !have.contains(c) && has(*c)).collect()
+    b.chars().filter(|c| !have.contains(c) && has(*c)).collect()
 }
 
 /// The most characters one range typed may give.
@@ -250,7 +190,6 @@ mod tests {
         let missing = missing_in_block(&p, 0x3040, |c| ('ぁ'..='う').contains(&c));
         assert_eq!(missing, "ぁぃぅう");
         assert_eq!(block(0x3041), None, "not where a block starts");
-        assert_eq!(block_name(block(0x20000).unwrap()), "中日韩统一表意文字扩展 B");
     }
 
     #[test]

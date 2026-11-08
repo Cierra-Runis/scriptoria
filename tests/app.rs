@@ -709,3 +709,26 @@ fn strokes_turn_flip_and_stretch_keeping_their_width(cx: &mut TestAppContext) {
     });
     assert_eq!(view.read_with(cx, |v, _| v.nodes()), scriptoria::app::glyph_view::Nodes::Quadratic);
 }
+
+#[gpui_kit::test]
+fn sets_of_characters_are_added_at_once(cx: &mut TestAppContext) {
+    let (workspace, cx) = open(vec![], cx);
+    let count = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, cx| w.document().read(cx).project.glyphs.len());
+    // The printable ASCII characters, chosen in the dialog (filtered down to them first).
+    cx.update(|window, cx| {
+        window.click("add-charset", cx);
+        window.render_frame(cx);
+        window.click("charset-filter", cx);
+        window.input("ascii", cx);
+        window.render_frame(cx);
+        window.click(("standard", 11usize), cx);
+        window.render_frame(cx);
+        window.click("add-charsets", cx);
+    });
+    assert_eq!(count(cx), 94);
+    let first = workspace.read_with(cx, |w, cx| w.document().read(cx).project.glyphs[0].chars.clone());
+    assert_eq!(first, ['!']);
+    // One step to undo.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(count(cx), 0);
+}

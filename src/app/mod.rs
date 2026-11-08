@@ -3,6 +3,7 @@
 //! sample text ([`sample_view`]), sharing the open project ([`document`]) and the glyphs' outlines
 //! ([`outlines`]), in the colors of [`theme`].
 
+pub mod charset_picker;
 pub mod document;
 pub mod font_view;
 pub mod glyph_view;

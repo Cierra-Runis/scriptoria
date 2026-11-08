@@ -1,0 +1,27 @@
+tongyong-guifan.txt: 通用规范汉字表 (State Council of China, 2013), its 8105 characters one to a line in the
+table's order (level 1: lines 1–3500, level 2: 3501–6500, level 3: 6501–8105). Taken from
+https://github.com/jaywcjlove/table-of-general-standard-chinese-characters (data/characters.txt),
+checked against https://github.com/iDvel/The-Table-of-General-Standard-Chinese-Characters
+(identical). That repository's licence:
+
+MIT License
+
+Copyright (c) 2026 小弟调调
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -715,13 +715,14 @@ fn sets_of_characters_are_added_at_once(cx: &mut TestAppContext) {
     let (workspace, cx) = open(vec![], cx);
     let count = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, cx| w.document().read(cx).project.glyphs.len());
     // The printable ASCII characters, chosen in the dialog (filtered down to them first).
+    let ascii = scriptoria_charsets::standards().iter().position(|s| s.name.starts_with("ASCII")).unwrap();
     cx.update(|window, cx| {
         window.click("add-charset", cx);
         window.render_frame(cx);
         window.click("charset-filter", cx);
         window.input("ascii", cx);
         window.render_frame(cx);
-        window.click(("standard", 11usize), cx);
+        window.click(("standard", ascii), cx);
         window.render_frame(cx);
         window.click("add-charsets", cx);
     });

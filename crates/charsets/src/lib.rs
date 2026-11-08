@@ -1,5 +1,6 @@
 //! Character sets a font is made for: the Unicode blocks (named in Chinese where handwriting is
-//! mostly made of them), and national standards' sets of characters, each in its own order.
+//! mostly made of them), and national standards' sets of characters, each in its own order: first
+//! GB 18030-2022 (the mandatory Chinese character set), by its three implementation levels.
 //!
 //! The standards' sets come from their encodings' tables (as the `encoding_rs` crate has them,
 //! after the WHATWG Encoding Standard), read over the code ranges each standard gives its levels:
@@ -148,6 +149,50 @@ fn table(encoding: &'static Encoding, leads: RangeInclusive<u8>, trails: &[Range
     out
 }
 
+/// GB 18030-2022's unified ideographs, by the extents of Unicode 11 (the standard's level 1 leaves
+/// out the last 16 of the basic block and the last 10 of extension A as later versions have them):
+/// the basic block and extension A (level 1), extensions B to F (level 3).
+const GB18030_BASIC: RangeInclusive<u32> = 0x4E00..=0x9FEF;
+const GB18030_EXTENSION_A: RangeInclusive<u32> = 0x3400..=0x4DB5;
+const GB18030_EXTENSIONS_B_TO_F: [RangeInclusive<u32>; 5] = [0x20000..=0x2A6D6, 0x2A700..=0x2B734, 0x2B740..=0x2B81D, 0x2B820..=0x2CEA1, 0x2CEB0..=0x2EBE0];
+/// The unified ideographs among the compatibility ideographs (in GB 18030's two-byte part).
+const UNIFIED_COMPATIBILITY: [u32; 12] = [0xFA0E, 0xFA0F, 0xFA11, 0xFA13, 0xFA14, 0xFA1F, 0xFA21, 0xFA23, 0xFA24, 0xFA27, 0xFA28, 0xFA29];
+/// The Kangxi radicals (level 3).
+const KANGXI_RADICALS: RangeInclusive<u32> = 0x2F00..=0x2FD5;
+
+fn chars_in(range: RangeInclusive<u32>) -> impl Iterator<Item = char> {
+    range.filter_map(char::from_u32)
+}
+
+/// GB 18030-2022's sets, cumulative as its implementation levels are: the Chinese characters of
+/// level 1 (basic block, extension A, the 12 unified compatibility ideographs: 27,570), of level 2
+/// (and the 196 of the 通用规范汉字表 in extensions B to E), of level 3 (all 87,887, and the 214
+/// Kangxi radicals); and the other characters of its two-byte part (symbols, full-width forms,
+/// kana, Greek, Cyrillic and the like).
+fn gb18030(tongyong: &[char]) -> Vec<(&'static str, Vec<char>)> {
+    let level1: Vec<char> = chars_in(GB18030_EXTENSION_A)
+        .chain(chars_in(GB18030_BASIC))
+        .chain(UNIFIED_COMPATIBILITY.iter().filter_map(|&c| char::from_u32(c)))
+        .collect();
+    let in_b_to_f = |c: char| GB18030_EXTENSIONS_B_TO_F.iter().any(|r| r.contains(&(c as u32)));
+    let mut level2 = level1.clone();
+    level2.extend(tongyong.iter().copied().filter(|&c| in_b_to_f(c)));
+    let mut level3 = level1.clone();
+    level3.extend(GB18030_EXTENSIONS_B_TO_F.iter().cloned().flat_map(chars_in));
+    level3.extend(chars_in(KANGXI_RADICALS));
+    let hanzi: std::collections::HashSet<char> = level3.iter().copied().collect();
+    let two_byte: Vec<char> = table(encoding_rs::GB18030, 0x81..=0xFE, &[0x40..=0x7E, 0x80..=0xFE], 0..=u16::MAX)
+        .into_iter()
+        .filter(|c| !hanzi.contains(c))
+        .collect();
+    vec![
+        ("GB 18030-2022 实现级别 1 汉字", level1),
+        ("GB 18030-2022 实现级别 2 汉字", level2),
+        ("GB 18030-2022 实现级别 3 汉字与康熙部首", level3),
+        ("GB 18030 双字节部分的其他字符（符号、字母、假名等）", two_byte),
+    ]
+}
+
 /// Punctuation Chinese text is written with.
 const CHINESE_PUNCTUATION: &str = "，。、；：？！“”‘’（）《》〈〉【】〔〕「」『』—…·～";
 
@@ -159,7 +204,8 @@ pub fn standards() -> Vec<Charset> {
     let full = [row(0xA1, 0xFE)];
     let big5 = [row(0x40, 0x7E), row(0xA1, 0xFE)];
     let any = 0..=u16::MAX;
-    vec![
+    let mut sets: Vec<Charset> = gb18030(&tongyong).into_iter().map(|(name, chars)| set(name, chars)).collect();
+    sets.extend([
         set("通用规范汉字表 一级字表", tongyong[..3500].to_vec()),
         set("通用规范汉字表 二级字表", tongyong[3500..6500].to_vec()),
         set("通用规范汉字表 三级字表", tongyong[6500..].to_vec()),
@@ -173,7 +219,8 @@ pub fn standards() -> Vec<Charset> {
         set("KS X 1001 漢字", table(EUC_KR, row(0xCA, 0xFD), &full, any)),
         set("ASCII 可打印字符", ('!'..='~').collect()),
         set("中文常用标点", CHINESE_PUNCTUATION.chars().collect()),
-    ]
+    ]);
+    sets
 }
 
 #[cfg(test)]
@@ -189,6 +236,9 @@ mod tests {
     fn the_standards_have_the_sizes_they_say() {
         let sets = standards();
         for (prefix, n) in [
+            ("GB 18030-2022 实现级别 1", 27_570),
+            ("GB 18030-2022 实现级别 2", 27_570 + 196),
+            ("GB 18030-2022 实现级别 3", 87_887 + 214),
             ("通用规范汉字表 一级", 3500),
             ("通用规范汉字表 二级", 3000),
             ("通用规范汉字表 三级", 1605),
@@ -226,7 +276,7 @@ mod tests {
         assert_eq!(ends("JIS X 0208 第一"), ('亜', '腕'));
         assert_eq!(ends("KS X 1001 한글"), ('가', '힝'));
         // Every level of the 通用规范汉字表 is unified ideographs (with its extensions).
-        let tongyong: Vec<char> = sets[..3].iter().flat_map(|s| s.chars.clone()).collect();
+        let tongyong: Vec<char> = sets.iter().filter(|s| s.name.starts_with("通用规范汉字表")).flat_map(|s| s.chars.clone()).collect();
         assert_eq!(tongyong.iter().collect::<HashSet<_>>().len(), 8105);
         assert!(tongyong.iter().all(|&c| block_of(c).is_some_and(|b| b.english.starts_with("CJK Unified Ideographs"))));
     }
@@ -243,5 +293,31 @@ mod tests {
         assert_eq!(block(0x20000).unwrap().name(), "中日韩统一表意文字扩展 B");
         assert_eq!(block(0x3041), None, "not where a block starts");
         assert_eq!(block_of('A').map(|b| b.start), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod gb18030 {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn the_levels_hold_one_another() {
+        let sets = standards();
+        let set = |prefix: &str| -> HashSet<char> { sets.iter().find(|s| s.name.starts_with(prefix)).unwrap().chars.iter().copied().collect() };
+        let (one, two, three) = (set("GB 18030-2022 实现级别 1"), set("GB 18030-2022 实现级别 2"), set("GB 18030-2022 实现级别 3"));
+        assert!(one.is_subset(&two) && two.is_subset(&three));
+        // Level 1 ends where GB 18030-2005's required part did; level 2 adds the 通用规范汉字表's
+        // characters beyond it; level 3 is all 87,887 Chinese characters and the Kangxi radicals.
+        assert!(one.contains(&'\u{9FEF}') && !one.contains(&'\u{9FF0}') && one.contains(&'\u{4DB5}') && !one.contains(&'\u{4DB6}'));
+        let tongyong = set("通用规范汉字表 一级").into_iter().chain(set("通用规范汉字表 二级")).chain(set("通用规范汉字表 三级"));
+        assert!(tongyong.into_iter().all(|c| two.contains(&c)), "level 2 has the whole 通用规范汉字表");
+        assert!(three.contains(&'⼀') && three.contains(&'\u{2EBE0}') && !three.contains(&'\u{2EBE1}'));
+        let hanzi = three.iter().filter(|&&c| !(0x2F00..=0x2FD5).contains(&(c as u32))).count();
+        assert_eq!(hanzi, 87_887);
+        // The two-byte part's other characters: punctuation, full-width forms, kana and the like.
+        let other = set("GB 18030 双字节部分的其他字符");
+        assert!(other.contains(&'，') && other.contains(&'Ａ') && other.contains(&'あ') && other.contains(&'α'));
+        assert!(other.is_disjoint(&three));
     }
 }

@@ -2,7 +2,7 @@
 name = "scriptoria-charsets"
 version = "0.1.0"
 edition = "2024"
-description = "Character sets to make a font for: Unicode blocks (with Chinese names) and national standards' sets (通用规范汉字表, GB 2312, Big5, JIS X 0208, KS X 1001)"
+description = "Character sets to make a font for: Unicode blocks (with Chinese names) and national standards' sets (GB 18030-2022 levels, 通用规范汉字表, GB 2312, Big5, JIS X 0208, KS X 1001)"
 
 [dependencies]
 encoding_rs = "0.8"

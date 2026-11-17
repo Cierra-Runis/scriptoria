@@ -1,0 +1,8 @@
+[package]
+name = "scriptoria-ids"
+version = "0.1.0"
+edition = "2024"
+description = "What Chinese characters are made of: ideographic description sequences (BabelStone's IDS data), the components in a character and where they sit"
+
+[dependencies]
+kurbo = "0.13"

@@ -3,7 +3,7 @@
 //! ```text
 //! <svg viewBox="…" …>                          the em (font units, y flipped for viewing)
 //!   <g transform="scale(1 -1)">                font units, y up
-//!     <g class="stroke" data-pen="222.2" transform="matrix(a b c d e f)">
+//!     <g class="stroke" data-pen="222.2" [data-link="part use index a b c d e f"] transform="matrix(a b c d e f)">
 //!                                              one per stroke, in writing order; the matrix is its
 //!                                              placement, page coordinates to font units; data-pen
 //!                                              its pen scale (font units per page unit for widths)
@@ -26,7 +26,7 @@ use std::fmt::Write as _;
 
 use kurbo::{Affine, BezPath, CubicBez, PathEl, Point};
 
-use crate::{FontInfo, Glyph, GlyphStroke, Outline, OutlineKind, SkeletonPiece};
+use crate::{FontInfo, Glyph, GlyphStroke, Link, Outline, OutlineKind, SkeletonPiece};
 
 const INK: &str = "#1f2937";
 const SKELETON: &str = "#2563eb";
@@ -50,7 +50,11 @@ pub(crate) fn write_strokes(glyph: &Glyph, font: &FontInfo) -> String {
     s += "<g transform=\"scale(1 -1)\">\n";
     for stroke in &glyph.strokes {
         let [a, b, c, d, e, f] = stroke.placement.as_coeffs();
-        let _ = writeln!(s, "<g class=\"stroke\" data-pen=\"{}\" transform=\"matrix({a} {b} {c} {d} {e} {f})\">", stroke.pen);
+        let link = stroke.link.map_or(String::new(), |l| {
+            let [a, b, c, d, e, f] = l.transform.as_coeffs();
+            format!(" data-link=\"{} {} {} {a} {b} {c} {d} {e} {f}\"", l.part, l.instance, l.index)
+        });
+        let _ = writeln!(s, "<g class=\"stroke\" data-pen=\"{}\"{link} transform=\"matrix({a} {b} {c} {d} {e} {f})\">", stroke.pen);
         match stroke.outline.kind {
             OutlineKind::Filled => {
                 let _ = writeln!(s, "<path class=\"outline\" data-kind=\"filled\" fill=\"{INK}\" d=\"{}\"/>", stroke.outline.path.to_svg());
@@ -103,7 +107,22 @@ pub(crate) fn read_strokes(text: &str, pen: f64) -> Result<Vec<GlyphStroke>, Str
                     Some(p) => number(&p)?,
                     None => pen,
                 };
-                strokes.push(GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: Vec::new(), placement, pen });
+                let link = match tag.get("data-link") {
+                    Some(text) => {
+                        let parts: Vec<&str> = text.split_whitespace().collect();
+                        let [part, instance, index, a, b, c, d, e, f] = parts[..] else { return Err(format!("bad data-link {text:?}")) };
+                        let n = |s: &str| number(s);
+                        let whole = |s: &str| s.parse::<u32>().map_err(|_| format!("bad data-link {text:?}"));
+                        Some(Link {
+                            part: whole(part)?,
+                            instance: whole(instance)?,
+                            index: whole(index)? as usize,
+                            transform: Affine::new([n(a)?, n(b)?, n(c)?, n(d)?, n(e)?, n(f)?]),
+                        })
+                    }
+                    None => None,
+                };
+                strokes.push(GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: Vec::new(), placement, pen, link });
                 in_stroke = true;
             }
             ("g", true) => in_stroke = false,

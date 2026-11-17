@@ -19,10 +19,12 @@
 //!
 //! The glyph files open in a browser, the glyph upright. See [`svg`] for their details.
 
+mod parts;
 mod skeleton;
 mod style;
 mod svg;
 
+pub use parts::{Link, Part, Unlinked};
 pub use skeleton::Node;
 
 use std::path::{Path, PathBuf};
@@ -44,16 +46,9 @@ pub struct Project {
     pub glyphs: Vec<Glyph>,
     /// The practice sheets made for it, to find their pages again when written.
     pub templates: Vec<Template>,
-    /// Strokes kept to be put into glyphs again (radicals, components), by name.
+    /// Strokes kept to be put into glyphs again (radicals, components); glyphs that use one are
+    /// kept like it (see [`Link`]).
     pub parts: Vec<Part>,
-}
-
-/// Strokes kept to be put into other glyphs (a radical, a component), placed as they were in the
-/// glyph they were taken from.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Part {
-    pub name: String,
-    pub strokes: Vec<GlyphStroke>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -430,6 +425,8 @@ pub struct GlyphStroke {
     /// not change when the stroke is scaled later, so that strokes keep the width of the pen that
     /// wrote them, and glyphs scaled to balance one another still match in weight.
     pub pen: f64,
+    /// The part it was put in with and is kept like, if any (see [`Link`]).
+    pub link: Option<Link>,
 }
 
 /// A stroke's outline as written, as a number: the same stroke of the same page gives the same
@@ -550,11 +547,15 @@ impl Project {
             glyphs.push(Glyph { name: g.name, chars: g.chars.chars().collect(), advance: g.advance, strokes });
         }
         let mut parts = Vec::with_capacity(file.part.len());
-        for p in file.part {
+        for (i, p) in file.part.into_iter().enumerate() {
             let path = dir.join(&p.file);
             let text = std::fs::read_to_string(&path).map_err(|e| Error::Io(path.clone(), e))?;
             let strokes = svg::read_strokes(&text, file.font.pen_scale()).map_err(|e| Error::Svg(path, e))?;
-            parts.push(Part { name: p.name, strokes });
+            // Parts from before they had ids are numbered in order.
+            let mut part = Part::new(p.id.unwrap_or(i as u32 + 1), &p.name, strokes, file.font.units_per_em as f64);
+            part.component = p.component.and_then(|c| c.chars().next()).or(part.component);
+            part.region = p.region.map(|[x0, y0, x1, y1]| Rect::new(x0, y0, x1, y1));
+            parts.push(part);
         }
         Ok(Project { font: file.font, glyphs, templates: file.template, parts })
     }
@@ -581,10 +582,15 @@ impl Project {
         }
         for (i, part) in self.parts.iter().enumerate() {
             let f = format!("{PART_DIR}/{}.svg", part_file_name(i, &part.name));
-            let glyph = Glyph { name: part.name.clone(), chars: Vec::new(), advance: self.font.units_per_em as f64, strokes: part.strokes.clone() };
-            write(&dir.join(&f), &svg::write_strokes(&glyph, &self.font))?;
+            write(&dir.join(&f), &svg::write_strokes(&part.glyph, &self.font))?;
             used.push(dir.join(&f));
-            parts.push(PartEntry { name: part.name.clone(), file: f });
+            parts.push(PartEntry {
+                id: Some(part.id),
+                name: part.name.clone(),
+                component: part.component.map(String::from),
+                region: part.region.map(|r| [r.x0, r.y0, r.x1, r.y1]),
+                file: f,
+            });
         }
         let file = ProjectFile { format: FORMAT, font: self.font.clone(), glyph: entries, template: self.templates.clone(), part: parts };
         write(&dir.join(PROJECT_FILE), &toml::to_string_pretty(&file).map_err(|e| Error::Toml(e.to_string()))?)?;
@@ -655,7 +661,13 @@ struct ProjectFile {
 
 #[derive(Serialize, Deserialize)]
 struct PartEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<u32>,
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    component: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    region: Option<[f64; 4]>,
     file: String,
 }
 
@@ -722,6 +734,7 @@ mod tests {
                 skeleton: Vec::new(),
                 placement: Affine::IDENTITY,
                 pen: FontInfo::default().pen_scale(),
+                link: None,
             })
             .collect();
         Glyph { name: "x".into(), chars: vec!['x'], advance: 10.0, strokes }

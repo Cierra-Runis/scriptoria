@@ -23,6 +23,8 @@ pub enum Group {
     Template(u32),
     /// Glyphs with a problem.
     Problem(Problem),
+    /// Glyphs using a part, by its id.
+    Part(u32),
 }
 
 /// Where a group is listed.
@@ -31,6 +33,7 @@ pub enum Section {
     Status,
     Blocks,
     Templates,
+    Parts,
     Problems,
 }
 
@@ -81,6 +84,11 @@ pub fn list(project: &Project, problems: &[Vec<Problem>]) -> Vec<Listed> {
         let w = members.iter().filter(|&&g| !glyphs[g].strokes.is_empty()).count();
         out.push(Listed { group: Group::Template(t.id), section: Section::Templates, name: format!("模板 #{}", t.id), glyphs: members.len(), written: w });
     }
+    for part in &project.parts {
+        let users = project.glyphs_using(part.id);
+        let w = users.iter().filter(|&&g| !glyphs[g].strokes.is_empty()).count();
+        out.push(Listed { group: Group::Part(part.id), section: Section::Parts, name: format!("部件「{}」", part.name), glyphs: users.len(), written: w });
+    }
     for p in Problem::ALL {
         let n = problems.iter().filter(|found| found.contains(&p)).count();
         if n > 0 {
@@ -120,6 +128,7 @@ pub fn members(project: &Project, group: Group, problems: &[Vec<Problem>]) -> Ve
         Group::NoBlock => all.filter(|&i| first_block(i).is_none()).collect(),
         Group::Template(id) => project.templates.iter().find(|t| t.id == id).map(|t| template_members(&chars_to_glyphs(project), &t.chars)).unwrap_or_default(),
         Group::Problem(p) => all.filter(|&i| problems.get(i).is_some_and(|found| found.contains(&p))).collect(),
+        Group::Part(id) => project.glyphs_using(id),
     }
 }
 
@@ -169,6 +178,7 @@ mod tests {
             skeleton: Vec::new(),
             placement: Affine::IDENTITY,
             pen: 1.0,
+            link: None,
         });
     }
 

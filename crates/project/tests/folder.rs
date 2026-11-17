@@ -30,6 +30,7 @@ fn stroke(x: f64, kind: OutlineKind) -> GlyphStroke {
         skeleton: vec![piece, dot],
         placement: initial_placement(Rect::new(x, 0.0, x + 4.5, 4.5), &Default::default()) * Affine::rotate(0.01),
         pen: 222.25,
+        link: None,
     }
 }
 
@@ -42,9 +43,13 @@ fn sample() -> Project {
     ];
     p.glyphs[1].strokes = vec![stroke(3.0, OutlineKind::Filled)];
     p.glyphs[1].advance = 612.5;
-    // Parts, whatever their names.
-    p.parts.push(Part { name: "氵".into(), strokes: vec![stroke(4.0, OutlineKind::Filled), stroke(5.0, OutlineKind::Filled)] });
-    p.parts.push(Part { name: "left / 左".into(), strokes: vec![stroke(6.0, OutlineKind::Line { width: 0.3 })] });
+    // Parts, whatever their names: one kept from 世's strokes (linked there), with where it sits;
+    // one of a stroke of its own, used in A, moved.
+    let id = p.make_part(0, &[1], "氵").unwrap();
+    p.part_mut(id).unwrap().region = Some(kurbo::Rect::new(0.0, 0.0, 0.5, 1.0));
+    let other = p.next_part_id();
+    p.parts.push(Part::new(other, "left / 左", vec![stroke(6.0, OutlineKind::Line { width: 0.3 })], 1000.0));
+    p.insert_part(1, other, Affine::translate((12.5, -3.0)) * Affine::scale(0.75), Some(0));
     // A practice sheet: its id and grid come back too.
     let first = p.new_template(&['世', 'A']).id;
     assert_eq!(p.new_template(&['a']).id, first + 1);
@@ -160,6 +165,7 @@ fn parts_come_back_and_go() {
     let dir = folder("parts");
     let mut p = sample();
     p.save(&dir).unwrap();
+    assert_eq!(Project::load(&dir).unwrap(), p, "parts and the links to them come back");
     assert_eq!(Project::load(&dir).unwrap().parts, p.parts);
     let files = |dir: &PathBuf| std::fs::read_dir(dir.join("parts")).map_or(0, |d| d.count());
     assert_eq!(files(&dir), 2);
@@ -168,5 +174,36 @@ fn parts_come_back_and_go() {
     p.save(&dir).unwrap();
     assert_eq!(files(&dir), 1);
     assert_eq!(Project::load(&dir).unwrap().parts, p.parts);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn parts_kept_before_they_had_ids_open() {
+    // Projects before 2026-11-17 kept parts by name only: they are numbered in order.
+    let dir = folder("old-parts");
+    let mut p = sample();
+    for g in &mut p.glyphs {
+        g.strokes.iter_mut().for_each(|s| s.link = None);
+    }
+    p.parts.iter_mut().for_each(|part| part.region = None);
+    p.save(&dir).unwrap();
+    let toml = dir.join("project.toml");
+    let text = std::fs::read_to_string(&toml).unwrap();
+    // The fields the [[part]] tables have since, taken out.
+    let mut in_part = false;
+    let mut old = String::new();
+    for l in text.lines() {
+        if l.starts_with('[') {
+            in_part = l == "[[part]]";
+        }
+        if !(in_part && (l.starts_with("id = ") || l.starts_with("component = "))) {
+            old += l;
+            old.push('\n');
+        }
+    }
+    std::fs::write(&toml, old).unwrap();
+    let back = Project::load(&dir).unwrap();
+    assert_eq!(back.parts.iter().map(|p| (p.id, p.name.as_str())).collect::<Vec<_>>(), [(1, "氵"), (2, "left / 左")]);
+    assert_eq!(back.parts[0].component, Some('氵'));
     std::fs::remove_dir_all(&dir).unwrap();
 }

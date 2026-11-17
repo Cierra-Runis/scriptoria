@@ -59,6 +59,8 @@ pub enum FontViewEvent {
     MakeTemplate(Vec<usize>),
     /// Write a practice sheet (by id) out again.
     ExportTemplate(u32),
+    /// Open a part (by id) to edit it.
+    OpenPart(u32),
 }
 
 impl EventEmitter<FontViewEvent> for FontView {}
@@ -150,7 +152,7 @@ impl FontView {
                             this.group = Group::All;
                         }
                     }
-                    DocumentEvent::Font | DocumentEvent::Parts => {}
+                    DocumentEvent::Font | DocumentEvent::Parts | DocumentEvent::Unlinked(..) => {}
                 }
                 cx.notify();
             }),
@@ -474,13 +476,14 @@ impl FontView {
                     Section::Status => "状态",
                     Section::Blocks => "Unicode 区块",
                     Section::Templates => "格子模板",
+                    Section::Parts => "部件（用到它的字）",
                     Section::Problems => "检查",
                 };
                 list = list.child(div().px_2().pt_3().pb_1().text_xs().text_color(muted).child(title));
             }
             let current = l.group == self.group;
             let count = match l.group {
-                Group::Unwritten | Group::Written | Group::Problem(_) => l.glyphs.to_string(),
+                Group::Unwritten | Group::Written | Group::Problem(_) | Group::Part(_) => l.glyphs.to_string(),
                 _ => format!("{}/{}", l.written, l.glyphs),
             };
             let group = l.group;
@@ -553,6 +556,17 @@ impl FontView {
                             .label("删除模板")
                             .tooltip("之后导入写在这份模板上的页，不再自动归位（可撤销）")
                             .on_click(cx.listener(move |this, _, _, cx| this.document.update(cx, |d, cx| d.remove_template(id, cx)))),
+                    );
+            }
+            Group::Part(id) => {
+                row = row
+                    .child(Button::new("edit-part").xsmall().label("编辑部件").tooltip("改部件，这些字都跟着变").on_click(cx.listener(move |_, _, _, cx| cx.emit(FontViewEvent::OpenPart(id)))))
+                    .child(
+                        Button::new("part-uses")
+                            .xsmall()
+                            .label("用在哪些字…")
+                            .tooltip("按汉字拆分找出含这个部件的字，批量加进去或拼字")
+                            .on_click(cx.listener(move |this, _, window, cx| crate::app::part_uses::open(this.document.clone(), id, window, cx))),
                     );
             }
             _ => {}

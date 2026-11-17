@@ -8,6 +8,7 @@ extern crate gpui_kit as gpui;
 
 pub mod app;
 pub mod assign;
+pub mod components;
 pub mod font;
 pub mod groups;
 pub mod problems;

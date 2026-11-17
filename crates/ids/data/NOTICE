@@ -1,0 +1,13 @@
+ids.txt: ideographic description sequences, one character to a line ("character<TAB>sequence"),
+taken from BabelStone's IDS.TXT (https://babelstone.co.uk/CJK/IDS.TXT, Unicode 16.0, file date
+2025-06-27, maintained by Andrew West). For each character the sequence for its G (China) source
+form is kept, or the first sequence if none is marked G; characters described by themselves (no
+decomposition) are left out. The "^", "$" and source markers are removed.
+
+The file's terms: "anyone is free to make use of the IDS data provided in this file for personal or
+commercial purposes without asking permission or providing attribution. I furthermore waive any
+copyright claims to the presentation format of the IDS data used in this file, so anyone is free to
+fork the file, or use it as the basis for a new IDS data set."
+
+Unencoded components appear as {n} (see the original file for what each is); "？" stands for a
+component that cannot be represented.

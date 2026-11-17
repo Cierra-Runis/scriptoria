@@ -196,10 +196,16 @@ fn gb18030(tongyong: &[char]) -> Vec<(&'static str, Vec<char>)> {
 /// Punctuation Chinese text is written with.
 const CHINESE_PUNCTUATION: &str = "，。、；：？！“”‘’（）《》〈〉【】〔〕「」『』—…·～";
 
+/// The 8105 characters of 通用规范汉字表, in its order (levels 1, 2 and 3: the first 3500, the
+/// next 3000, the rest).
+pub fn tongyong_guifan() -> Vec<char> {
+    TONGYONG.lines().filter_map(|l| l.trim().chars().next()).collect()
+}
+
 /// The standards' sets, in the order listed.
 pub fn standards() -> Vec<Charset> {
     let set = |name: &str, chars: Vec<char>| Charset { name: format!("{name}（{}）", chars.len()), chars };
-    let tongyong: Vec<char> = TONGYONG.lines().filter_map(|l| l.trim().chars().next()).collect();
+    let tongyong = tongyong_guifan();
     let row = |a: u8, b: u8| a..=b;
     let full = [row(0xA1, 0xFE)];
     let big5 = [row(0x40, 0x7E), row(0xA1, 0xFE)];

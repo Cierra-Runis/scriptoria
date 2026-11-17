@@ -22,11 +22,22 @@ pub enum Problem {
     ManyCircles,
     /// Much larger or smaller than the reference font's character.
     OffReference,
+    /// Made of parts one of which is inside another (see [`crate::components::order_to_check`]):
+    /// the writing order may want changing.
+    WritingOrder,
 }
 
 impl Problem {
-    pub const ALL: [Problem; 7] =
-        [Problem::NoSkeleton, Problem::Duplicate, Problem::OutsideEm, Problem::OddAdvance, Problem::UnevenWeight, Problem::ManyCircles, Problem::OffReference];
+    pub const ALL: [Problem; 8] = [
+        Problem::NoSkeleton,
+        Problem::Duplicate,
+        Problem::OutsideEm,
+        Problem::OddAdvance,
+        Problem::UnevenWeight,
+        Problem::ManyCircles,
+        Problem::OffReference,
+        Problem::WritingOrder,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -37,6 +48,7 @@ impl Problem {
             Problem::UnevenWeight => "笔画粗细不一",
             Problem::ManyCircles => "骨架圆太多",
             Problem::OffReference => "大小与参考字差得多",
+            Problem::WritingOrder => "笔顺需核对",
         }
     }
 
@@ -50,6 +62,7 @@ impl Problem {
             Problem::UnevenWeight => "有一笔比别的笔粗或细六成以上：在单字视图里用“变细 / 变粗”",
             Problem::ManyCircles => "某一笔骨架上的圆超过 120 个：在“改骨架”里精简",
             Problem::OffReference => "墨迹比参考字体的这个字大或小三成以上：按参考摆放，或手动缩放",
+            Problem::WritingOrder => "用部件拼成、有包围结构（如 国、这）：拼字按拆分顺序，外框的封口笔或走之常要挪到最后，在单字视图里用“提前 / 推后”",
         }
     }
 }
@@ -132,7 +145,7 @@ mod tests {
         let mut path = BezPath::new();
         path.move_to((x0, y));
         path.line_to((x1, y + r));
-        GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path }, skeleton: vec![piece], placement: Affine::IDENTITY, pen: 1.0 }
+        GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path }, skeleton: vec![piece], placement: Affine::IDENTITY, pen: 1.0, link: None }
     }
 
     fn glyph(strokes: Vec<GlyphStroke>) -> Glyph {

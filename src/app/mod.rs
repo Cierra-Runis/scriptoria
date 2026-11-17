@@ -10,6 +10,7 @@ pub mod font_view;
 pub mod glyph_view;
 pub mod mesh;
 pub mod outlines;
+pub mod part_uses;
 pub mod sample_view;
 pub mod theme;
 pub mod viewer;

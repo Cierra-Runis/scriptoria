@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext, point, px};
+use scriptoria::app::document::Target;
 use scriptoria::app::glyph_view::GlyphView;
 use scriptoria::app::{self, Workspace};
 use scriptoria::groups::Group;
-use scriptoria_ink::kurbo::{Point, Rect, Vec2};
+use scriptoria_ink::kurbo::{Affine, Point, Rect, Vec2};
 use scriptoria_ink::{InkDocument, Stroke};
 use scriptoria_project::Glyph;
 
@@ -848,21 +849,165 @@ fn strokes_are_copied_and_kept_as_parts(cx: &mut TestAppContext) {
     });
     let parts = document.read_with(cx, |d, _| d.project.parts.clone());
     assert_eq!(parts.len(), 1);
-    assert_eq!((parts[0].name.as_str(), parts[0].strokes.clone()), ("竖", vec![shi.strokes[1].clone()]));
+    assert_eq!((parts[0].name.as_str(), parts[0].glyph.strokes.clone()), ("竖", vec![shi.strokes[1].clone()]));
+    // The stroke stays in 世, linked to the part.
+    let link = glyphs(&workspace, cx)[0].strokes[1].link.expect("linked");
+    assert_eq!((link.part, link.index, link.transform), (parts[0].id, 0, Affine::IDENTITY));
 
-    // Put into 丗 with a click.
+    // Put into 丗 with a click: where it was, linked.
     workspace.update_in(cx, |w, window, cx| w.open_glyph(1, window, cx));
     other.update(cx, |v, cx| v.show_parts(true, cx));
     cx.update(|window, cx| {
         window.render_frame(cx);
         window.click(("part", 0usize), cx);
     });
-    assert_eq!(glyphs(&workspace, cx)[1].strokes, [shi.strokes[1].clone()]);
-    // Undo takes the insertion back, then the part.
+    let put = glyphs(&workspace, cx)[1].strokes.clone();
+    assert_eq!(put.len(), 1);
+    assert_eq!((put[0].placement, &put[0].skeleton), (shi.strokes[1].placement, &shi.strokes[1].skeleton));
+    assert_eq!(put[0].link.map(|l| l.part), Some(parts[0].id));
+    // Undo takes the insertion back, then the part (and the link in 世).
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert!(glyphs(&workspace, cx)[1].strokes.is_empty());
     cx.update(|window, cx| window.press("ctrl-z", cx));
     assert!(document.read_with(cx, |d, _| d.project.parts.is_empty()));
+    assert_eq!(glyphs(&workspace, cx)[0], shi);
+}
+
+/// 世 written and opened, 丗 added; 世's second stroke kept as the part 竖 and put into 丗. Returns
+/// the part's id.
+fn shi_with_a_part(cx: &mut TestAppContext) -> (Entity<Workspace>, u32, &mut VisualTestContext) {
+    let (workspace, _, cx) = open_shi(cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    let id = document.update(cx, |d, cx| {
+        d.add_chars("丗", cx);
+        let id = d.make_part(0, &[1], "竖", cx).unwrap();
+        d.insert_part(1, id, Affine::IDENTITY, None, cx);
+        id
+    });
+    (workspace, id, cx)
+}
+
+#[gpui_kit::test]
+fn glyphs_follow_the_parts_they_use(cx: &mut TestAppContext) {
+    let (workspace, id, cx) = shi_with_a_part(cx);
+    let before = glyphs(&workspace, cx);
+    // The part opened in a tab of its own, its stroke moved right.
+    workspace.update_in(cx, |w, window, cx| w.open_part(id, window, cx));
+    let part_view = workspace.read_with(cx, |w, _| w.target_view(Target::Part(id))).expect("the part opens in a tab");
+    assert_eq!(part_view.read_with(cx, |v, _| v.target()), Target::Part(id));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.press("ctrl-a", cx);
+        window.press("right", cx);
+    });
+    // Both glyphs using it follow; the strokes of their own stay.
+    let after = glyphs(&workspace, cx);
+    let x = |s: &scriptoria_project::GlyphStroke| s.placement.as_coeffs()[4];
+    assert!((x(&after[0].strokes[1]) - x(&before[0].strokes[1]) - 10.0).abs() < 1e-9);
+    assert!((x(&after[1].strokes[0]) - x(&before[1].strokes[0]) - 10.0).abs() < 1e-9);
+    assert_eq!(after[0].strokes[0], before[0].strokes[0]);
+    // One undo puts the part and both glyphs back.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert_eq!(glyphs(&workspace, cx), before);
+}
+
+#[gpui_kit::test]
+fn uses_of_parts_moved_whole_stay_linked_and_changed_ones_do_not(cx: &mut TestAppContext) {
+    let (workspace, id, cx) = shi_with_a_part(cx);
+    workspace.update_in(cx, |w, window, cx| w.open_glyph(1, window, cx));
+    cx.run_until_parked();
+    // 丗's use of the part moved as a whole: still the part's, moved.
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("stroke", 0usize), cx);
+        window.press("right", cx);
+    });
+    let link = glyphs(&workspace, cx)[1].strokes[0].link.expect("still linked");
+    assert_eq!(link.part, id);
+    let moved = link.transform.as_coeffs();
+    assert!(Affine::translate((10.0, 0.0)).as_coeffs().iter().zip(moved).all(|(a, b)| (a - b).abs() < 1e-6), "{moved:?}");
+    // Made thicker, it is no longer the part's (世's use stays).
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("pen-thicker", cx);
+    });
+    let now = glyphs(&workspace, cx);
+    assert!(now[1].strokes[0].link.is_none());
+    assert!(now[0].strokes[1].link.is_some());
+    // Undone, linked again.
+    cx.update(|window, cx| window.press("ctrl-z", cx));
+    assert!(glyphs(&workspace, cx)[1].strokes[0].link.is_some());
+}
+
+/// A project of 河 (its strokes 世's), its first two strokes kept as the part 氵, where 氵 sits
+/// in 河; and `more` added, empty.
+fn he_with_water<'a>(more: &str, cx: &'a mut TestAppContext) -> (Entity<Workspace>, u32, &'a mut VisualTestContext) {
+    let (workspace, cx) = open(vec![], cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    let id = document.update(cx, |d, cx| {
+        d.add_chars("河", cx);
+        d.assign(0, &shi_strokes(), cx);
+        let id = d.make_part(0, &[0, 1], "氵", cx).unwrap();
+        let region = scriptoria::components::region_in(scriptoria_ids::Table::builtin(), &d.project, &['河'], id);
+        assert_eq!(region.map(|r| (r.x0, r.x1)), Some((0.0, 0.5)));
+        d.update_project(&[], |p| p.part_mut(id).unwrap().region = region, cx);
+        d.add_chars(more, cx);
+        id
+    });
+    (workspace, id, cx)
+}
+
+#[gpui_kit::test]
+fn parts_are_put_into_the_characters_that_have_them(cx: &mut TestAppContext) {
+    let (workspace, id, cx) = he_with_water("湖海世", cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    cx.update(|window, cx| {
+        scriptoria::app::part_uses::open(document.clone(), id, window, cx);
+        window.render_frame(cx);
+        window.click("put-part", cx);
+    });
+    let gs = glyphs(&workspace, cx);
+    // 湖 and 海 (not 世) get 氵 where 河 has it: on the left, as it is there.
+    for g in &gs[1..3] {
+        assert_eq!(g.strokes.len(), 2, "{}", g.name);
+        for (s, t) in g.strokes.iter().zip(&gs[0].strokes) {
+            assert!(s.link.is_some_and(|l| l.part == id));
+            assert!((s.placement.as_coeffs()[4] - t.placement.as_coeffs()[4]).abs() < 1e-6);
+        }
+    }
+    assert!(gs[3].strokes.is_empty());
+    // As one step.
+    cx.update(|window, cx| window.click("close-part-uses", cx));
+    document.update(cx, |d, cx| d.undo(cx));
+    assert!(glyphs(&workspace, cx)[1..].iter().all(|g| g.strokes.is_empty()));
+}
+
+#[gpui_kit::test]
+fn characters_are_put_together_from_parts(cx: &mut TestAppContext) {
+    let (workspace, water, cx) = he_with_water("青清", cx);
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    // 青 written (with 世's strokes), kept whole as a part.
+    let qing = document.update(cx, |d, cx| {
+        d.assign(1, &shi_strokes(), cx);
+        let n = d.project.glyphs[1].strokes.len();
+        let id = d.make_part(1, &(0..n).collect::<Vec<_>>(), "青", cx).unwrap();
+        let region = scriptoria::components::region_in(scriptoria_ids::Table::builtin(), &d.project, &['青'], id);
+        d.update_project(&[], |p| p.part_mut(id).unwrap().region = region, cx);
+        id
+    });
+    cx.update(|window, cx| {
+        scriptoria::app::part_uses::open(document.clone(), water, window, cx);
+        window.render_frame(cx);
+        window.click("compose-all", cx);
+    });
+    // 清 = 氵 + 青, in that order; 青 on the right half, smaller.
+    let gs = glyphs(&workspace, cx);
+    let parts: Vec<u32> = gs[2].strokes.iter().map(|s| s.link.expect("linked").part).collect();
+    let n = gs[1].strokes.len();
+    assert_eq!(parts, [vec![water; 2], vec![qing; n]].concat());
+    let (right, whole) = (Glyph { strokes: gs[2].strokes[2..].to_vec(), ..gs[2].clone() }.ink_bounds().unwrap(), gs[1].ink_bounds().unwrap());
+    assert!(right.width() < whole.width() && right.center().x > whole.center().x - 1.0);
 }
 
 #[gpui_kit::test]

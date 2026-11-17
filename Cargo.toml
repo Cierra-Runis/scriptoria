@@ -20,6 +20,7 @@ scriptoria-project = { path = "crates/project" }
 scriptoria-reference = { path = "crates/reference" }
 scriptoria-template = { path = "crates/template" }
 scriptoria-charsets = { path = "crates/charsets" }
+scriptoria-ids = { path = "crates/ids" }
 
 # The tools in `examples/` and the pipeline test in `tests/` (they read `test/test.pdf`).
 [dev-dependencies]

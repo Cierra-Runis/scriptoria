@@ -8,8 +8,9 @@
 //! circles of their skeletons are moved, made larger or smaller, removed and added (a double click
 //! on a centerline), and skeletons smoothed and thinned out; a stroke as a whole is made thinner or
 //! thicker by its pen. Strokes are copied, cut and pasted (between glyphs too), and kept as named
-//! parts (a radical, a component) to put into other glyphs. The advance is dragged or typed. Every
-//! change is one step to undo.
+//! parts (a radical, a component) to put into other glyphs, linked: a part is opened and edited
+//! like a glyph, and every glyph using it follows. The advance is dragged or typed. Every change is
+//! one step to undo.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -34,7 +35,7 @@ use scriptoria_ink::kurbo::{self, Affine, BezPath, ParamCurveNearest as _, Shape
 use scriptoria_outline::{Plan, PlanParams, WeightParams};
 use scriptoria_project::{Glyph, GlyphStroke, Node as SkeletonNode, Outline, OutlineKind, SkeletonPiece};
 
-use crate::app::document::{Document, DocumentEvent};
+use crate::app::document::{Document, DocumentEvent, Target};
 use crate::app::mesh::Mesh;
 use crate::app::theme::palette;
 use crate::font::{AXIS, Weights};
@@ -207,6 +208,15 @@ impl Shapes {
 struct StrokeClipboard(Vec<GlyphStroke>);
 
 impl gpui::Global for StrokeClipboard {}
+
+/// What a glyph view asks of the window around it.
+#[derive(Clone, Debug)]
+pub enum GlyphViewEvent {
+    /// Open a part to edit it.
+    OpenPart(u32),
+}
+
+impl gpui::EventEmitter<GlyphViewEvent> for GlyphView {}
 
 /// What the mouse and keys edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,7 +407,8 @@ fn units(v: f64) -> String {
 pub struct GlyphView {
     focus: FocusHandle,
     document: Entity<Document>,
-    glyph: usize,
+    /// The glyph or part shown.
+    target: Target,
     /// Per stroke of the glyph, in order.
     shapes: Vec<Shapes>,
     planning: Option<Task<()>>,
@@ -436,7 +447,7 @@ pub struct GlyphView {
 }
 
 impl GlyphView {
-    pub fn new(document: Entity<Document>, glyph: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(document: Entity<Document>, target: Target, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let weight = cx.new(|_| SliderState::new().max(AXIS.max as f32).min(AXIS.min as f32).step(1.0).default_value(AXIS.default as f32));
         let advance = cx.new(|cx| InputState::new(window, cx));
         let typed = |value: &'static str, window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx).default_value(value));
@@ -444,11 +455,22 @@ impl GlyphView {
         let part_name = cx.new(|cx| InputState::new(window, cx).placeholder("部件名，如 氵"));
         let subscriptions = vec![
             cx.subscribe_in(&document, window, move |this, _, event: &DocumentEvent, window, cx| match event {
-                DocumentEvent::Glyph(g) if *g == this.glyph => this.sync(window, cx),
+                DocumentEvent::Glyph(g) if this.target == Target::Glyph(*g) => this.sync(window, cx),
                 DocumentEvent::GlyphList | DocumentEvent::Saved => this.sync(window, cx),
                 // The glyph moved (or went: then there is none to show; the tab closes).
-                DocumentEvent::Reindexed(map) => this.glyph = map.get(this.glyph).copied().flatten().unwrap_or(usize::MAX),
-                DocumentEvent::Parts => cx.notify(),
+                DocumentEvent::Reindexed(map) => {
+                    if let Target::Glyph(g) = this.target {
+                        this.target = Target::Glyph(map.get(g).copied().flatten().unwrap_or(usize::MAX));
+                    }
+                }
+                DocumentEvent::Parts => match this.target {
+                    Target::Part(_) => this.sync(window, cx),
+                    Target::Glyph(_) => cx.notify(),
+                },
+                DocumentEvent::Unlinked(g, names) if this.target == Target::Glyph(*g) => {
+                    let names: Vec<String> = names.iter().map(|n| format!("「{n}」")).collect();
+                    window.push_notification(Notification::info(format!("这些笔画改过了，已断开与部件{}的链接", names.join(""))), cx);
+                }
                 DocumentEvent::Font => {
                     this.ensure_plans(cx);
                     this.regenerate(cx);
@@ -470,7 +492,7 @@ impl GlyphView {
         let mut this = GlyphView {
             focus: cx.focus_handle(),
             document,
-            glyph,
+            target,
             shapes: Vec::new(),
             planning: None,
             planned_for: (0.0, 0.0),
@@ -503,9 +525,17 @@ impl GlyphView {
         &self.focus
     }
 
-    /// The glyph shown (its index in the project).
+    /// The glyph shown (its index in the project; none for a part).
     pub fn glyph_index(&self) -> usize {
-        self.glyph
+        match self.target {
+            Target::Glyph(g) => g,
+            Target::Part(_) => usize::MAX,
+        }
+    }
+
+    /// The glyph or part shown.
+    pub fn target(&self) -> Target {
+        self.target
     }
 
     /// The selected strokes, in writing order.
@@ -551,7 +581,7 @@ impl GlyphView {
     }
 
     fn glyph<'a>(&self, cx: &'a App) -> Option<&'a Glyph> {
-        self.document.read(cx).project.glyphs.get(self.glyph)
+        self.document.read(cx).glyph_of(self.target)
     }
 
     fn wght(&self, cx: &App) -> f64 {
@@ -573,7 +603,7 @@ impl GlyphView {
 
     /// Follows the glyph after a change: keeps the shapes of strokes that are still there.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (shapes, advance) = match self.document.read(cx).project.glyphs.get(self.glyph) {
+        let (shapes, advance) = match self.document.read(cx).glyph_of(self.target) {
             Some(glyph) => {
                 let mut old = std::mem::take(&mut self.shapes);
                 let shapes: Vec<Shapes> = glyph
@@ -596,7 +626,7 @@ impl GlyphView {
         self.shapes = shapes;
         self.selection.retain(|&i| i < n);
         self.hovered = self.hovered.filter(|&h| h < n);
-        if let Some(glyph) = self.document.read(cx).project.glyphs.get(self.glyph) {
+        if let Some(glyph) = self.document.read(cx).glyph_of(self.target) {
             self.circles.retain(|&(s, p, i)| glyph.strokes.get(s).is_some_and(|st| st.has_node((p, i))));
         }
         self.advance.update(cx, |s, cx| s.set_value(units(advance), window, cx));
@@ -682,8 +712,8 @@ impl GlyphView {
     // ---- Edits ----
 
     fn edit(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Glyph)) {
-        let glyph = self.glyph;
-        self.document.update(cx, |d, cx| d.update_glyph(glyph, f, cx));
+        let target = self.target;
+        self.document.update(cx, |d, cx| d.update_target(target, f, cx));
     }
 
     fn selected(&self) -> Vec<usize> {
@@ -791,100 +821,237 @@ impl GlyphView {
         self.append_strokes(strokes, cx);
     }
 
-    /// Adds strokes after the glyph's last (one step to undo), and selects them.
-    fn append_strokes(&mut self, strokes: Vec<GlyphStroke>, cx: &mut Context<Self>) {
+    /// Adds strokes after the glyph's last (one step to undo), and selects them. Uses of parts
+    /// among them stay linked, as new uses in this glyph; into a part they come as its own.
+    fn append_strokes(&mut self, mut strokes: Vec<GlyphStroke>, cx: &mut Context<Self>) {
         if strokes.is_empty() {
             return;
         }
-        let first = self.glyph(cx).map_or(0, |g| g.strokes.len());
+        let Some(glyph) = self.glyph(cx) else { return };
+        let first = glyph.strokes.len();
+        match self.target {
+            Target::Part(_) => strokes.iter_mut().for_each(|s| s.link = None),
+            Target::Glyph(_) => {
+                let mut next = glyph.strokes.iter().filter_map(|s| s.link.map(|l| l.instance + 1)).max().unwrap_or(1);
+                let mut renumbered = std::collections::BTreeMap::new();
+                for l in strokes.iter_mut().filter_map(|s| s.link.as_mut()) {
+                    l.instance = *renumbered.entry((l.part, l.instance)).or_insert_with(|| {
+                        next += 1;
+                        next - 1
+                    });
+                }
+            }
+        }
         let n = strokes.len();
         self.edit(cx, |g| g.strokes.extend(strokes));
         self.selection = (first..first + n).collect();
         cx.notify();
     }
 
-    /// Puts a part's strokes into the glyph, where they were in the glyph they came from.
-    pub fn insert_part(&mut self, name: &str, cx: &mut Context<Self>) {
-        let strokes = self.document.read(cx).project.parts.iter().find(|p| p.name == name).map(|p| p.strokes.clone()).unwrap_or_default();
-        self.append_strokes(strokes, cx);
+    /// Puts a part into the glyph where it was in the glyph it was taken from, linked (into a
+    /// part: its strokes, as the part's own), and selects it.
+    pub fn insert_part(&mut self, part: u32, cx: &mut Context<Self>) {
+        let target = self.target;
+        let first = self.glyph(cx).map_or(0, |g| g.strokes.len());
+        let n = self.document.read(cx).project.part(part).map_or(0, |p| p.glyph.strokes.len());
+        match target {
+            Target::Glyph(g) => {
+                self.document.update(cx, |d, cx| d.insert_part(g, part, Affine::IDENTITY, None, cx));
+            }
+            Target::Part(own) if own != part => {
+                let strokes = self.document.read(cx).project.part(part).map(|p| p.glyph.strokes.clone()).unwrap_or_default();
+                self.edit(cx, |g| g.strokes.extend(strokes));
+            }
+            Target::Part(_) => return,
+        }
+        self.selection = (first..first + n).collect();
+        cx.notify();
     }
 
-    /// Keeps the selected strokes as a part, under the name typed (or the glyph's character).
+    /// Takes the selected strokes out and puts a part in their place: at the first one's place in
+    /// the writing order, its ink filling their ink's box. One step to undo.
+    pub fn replace_with_part(&mut self, part: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Target::Glyph(g) = self.target else { return };
+        let which = self.selected();
+        let doc = self.document.read(cx);
+        let (Some(glyph), Some(p)) = (doc.project.glyphs.get(g), doc.project.part(part)) else { return };
+        let chosen = Glyph { strokes: which.iter().filter_map(|&i| glyph.strokes.get(i).cloned()).collect(), ..glyph.clone() };
+        let (Some(to), Some(from)) = (chosen.ink_bounds(), p.glyph.ink_bounds()) else {
+            window.push_notification(Notification::warning("先选中要换成部件的笔画"), cx);
+            return;
+        };
+        let k = |a: f64, b: f64| if b > 1e-9 { a / b } else { 1.0 };
+        let transform = Affine::translate(to.center().to_vec2()) * Affine::scale_non_uniform(k(to.width(), from.width()), k(to.height(), from.height())) * Affine::translate(-from.center().to_vec2());
+        let at = which.first().copied();
+        let n = p.glyph.strokes.len();
+        self.selection.clear();
+        self.document.update(cx, |d, cx| {
+            d.update_project(
+                &[g],
+                |p| {
+                    p.glyphs[g].remove_strokes(&which);
+                    p.normalize_links(g);
+                    p.insert_part(g, part, transform, at)
+                },
+                cx,
+            )
+        });
+        let at = at.unwrap_or(0);
+        self.selection = (at..at + n).collect();
+        cx.notify();
+    }
+
+    /// The uses of parts among the selected strokes: (part, instance).
+    fn selected_uses(&self, cx: &App) -> BTreeSet<(u32, u32)> {
+        let Some(glyph) = self.glyph(cx) else { return BTreeSet::new() };
+        self.selection.iter().filter_map(|&i| glyph.strokes.get(i)?.link).map(|l| (l.part, l.instance)).collect()
+    }
+
+    /// Unlinks the uses of parts the selection is in: their strokes stay, as the glyph's own.
+    pub fn unlink_selection(&mut self, cx: &mut Context<Self>) {
+        let Target::Glyph(g) = self.target else { return };
+        let uses = self.selected_uses(cx);
+        if uses.is_empty() {
+            return;
+        }
+        self.document.update(cx, |d, cx| {
+            d.update_project(
+                &[g],
+                |p| {
+                    for &(part, instance) in &uses {
+                        p.unlink(g, part, instance);
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
+    /// Opens a part to edit it.
+    pub fn open_part(&mut self, part: u32, cx: &mut Context<Self>) {
+        cx.emit(GlyphViewEvent::OpenPart(part));
+    }
+
+    /// Keeps the selected strokes as a part, under the name typed (or the glyph's character); they
+    /// stay in the glyph, linked to it.
     fn save_part(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Target::Glyph(g) = self.target else { return };
         let Some(glyph) = self.glyph(cx) else { return };
-        let strokes: Vec<GlyphStroke> = self.selection.iter().filter_map(|&i| glyph.strokes.get(i).cloned()).collect();
-        if strokes.is_empty() {
+        let which = self.selected();
+        if which.is_empty() {
             window.push_notification(Notification::warning("先选中要存为部件的笔画"), cx);
             return;
         }
         let typed = self.part_name.read(cx).value().trim().to_string();
         let name = if typed.is_empty() { glyph.chars.iter().collect() } else { typed };
-        let n = strokes.len();
-        self.document.update(cx, |d, cx| d.save_part(&name, strokes, cx));
+        let chars = glyph.chars.clone();
+        let made = self.document.update(cx, |d, cx| {
+            let id = d.make_part(g, &which, &name, cx)?;
+            // Where the part is in the character it was taken from, by its decomposition.
+            let region = crate::components::region_in(scriptoria_ids::Table::builtin(), &d.project, &chars, id);
+            if region.is_some() {
+                d.update_project(&[], |p| p.part_mut(id).map(|part| part.region = region), cx);
+            }
+            Some(id)
+        });
         self.part_name.update(cx, |s, cx| s.set_value("", window, cx));
-        window.push_notification(Notification::success(format!("已存为部件「{name}」（{n} 笔）")), cx);
+        if made.is_some() {
+            window.push_notification(Notification::success(format!("已存为部件「{name}」（{} 笔），这个字里的这几笔已链接到它", which.len())), cx);
+        }
     }
 
-    /// The parts kept: each inserted with a click, or forgotten; and the selected strokes kept as
-    /// one.
+    /// The parts kept: each inserted with a click, opened, looked for in other characters, put in
+    /// place of the selected strokes or forgotten; and the selected strokes kept as one.
     fn render_parts(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (muted, hover) = (theme.muted_foreground, theme.secondary_hover);
-        let rows: Vec<_> = self
-            .document
-            .read(cx)
+        let in_glyph = matches!(self.target, Target::Glyph(_));
+        let none = self.selection.is_empty();
+        let doc = self.document.read(cx);
+        let rows: Vec<_> = doc
             .project
             .parts
             .iter()
             .enumerate()
+            .filter(|(_, part)| self.target != Target::Part(part.id))
             .map(|(i, part)| {
-                let name = part.name.clone();
-                let forget = part.name.clone();
-                h_flex()
+                let id = part.id;
+                let users = doc.project.glyphs_using(id).len();
+                v_flex()
                     .id(("part", i))
-                    .gap_2()
                     .px_2()
                     .py_1()
-                    .text_sm()
                     .cursor_pointer()
                     .hover(move |d| d.bg(hover))
-                    .child(div().flex_1().min_w_0().truncate().child(part.name.clone()))
-                    .child(div().text_xs().text_color(muted).child(format!("{} 笔", part.strokes.len())))
-                    .child(Button::new(("remove-part", i)).xsmall().ghost().label("×").tooltip("不再保留这个部件").on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.document.update(cx, |d, cx| d.remove_part(&forget, cx));
-                    })))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_sm()
+                            .child(div().flex_1().min_w_0().truncate().child(part.name.clone()))
+                            .child(div().text_xs().text_color(muted).child(format!("{} 笔 · {users} 字", part.glyph.strokes.len())))
+                            .child(Button::new(("remove-part", i)).xsmall().ghost().label("×").tooltip("不再保留这个部件（用到它的字留下笔画，断开链接）").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.document.update(cx, |d, cx| d.remove_part(id, cx));
+                                },
+                            ))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(Button::new(("edit-part", i)).xsmall().ghost().label("编辑").tooltip("打开部件来改；用到它的字都跟着变").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_part(id, cx);
+                                },
+                            )))
+                            .child(Button::new(("part-uses", i)).xsmall().ghost().label("用在哪些字…").tooltip("按汉字拆分找出含这个部件的字，批量加进去").on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    crate::app::part_uses::open(this.document.clone(), id, window, cx);
+                                },
+                            )))
+                            .when(in_glyph && !none, |d| {
+                                d.child(Button::new(("replace-with-part", i)).xsmall().ghost().label("替换选中").tooltip("删掉选中的笔画，在那里放这个部件（链接）").on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.replace_with_part(id, window, cx);
+                                    },
+                                )))
+                            }),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         window.focus(&this.focus, cx);
-                        this.insert_part(&name, cx);
+                        this.insert_part(id, cx);
                     }))
                     .test_support()
             })
             .collect();
-        let none = self.selection.is_empty();
         v_flex()
             .flex_1()
             .min_h_0()
             .child(div().id("part-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
-            .child(
-                v_flex()
-                    .gap_1()
-                    .p_2()
-                    .child(div().text_xs().text_color(muted).child("点一个部件把它加进这个字（原来的位置），再移动缩放"))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(div().flex_1().child(Input::new(&self.part_name).xsmall().id("part-name")))
-                            .child(
-                                Button::new("save-part")
-                                    .xsmall()
-                                    .label("存为部件")
-                                    .tooltip("把选中的笔画存起来，以后加进别的字（不填名字就用这个字）")
-                                    .disabled(none)
-                                    .on_click(cx.listener(|this, _, window, cx| this.save_part(window, cx))),
-                            ),
-                    ),
-            )
+            .when(in_glyph, |d| {
+                d.child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .child(div().text_xs().text_color(muted).child("点一个部件把它加进这个字（原来的位置，链接），再移动缩放"))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(div().flex_1().child(Input::new(&self.part_name).xsmall().id("part-name")))
+                                .child(
+                                    Button::new("save-part")
+                                        .xsmall()
+                                        .label("存为部件")
+                                        .tooltip("把选中的笔画存为部件，以后加进别的字（不填名字就用这个字）；改部件时用到它的字都跟着变")
+                                        .disabled(none)
+                                        .on_click(cx.listener(|this, _, window, cx| this.save_part(window, cx))),
+                                ),
+                        ),
+                )
+            })
     }
 
     // ---- Skeletons ----
@@ -1434,7 +1601,7 @@ impl GlyphView {
         let font = &doc.project.font;
         let (ascender, descender, upm) = (font.ascender as f64, font.descender as f64, font.units_per_em as f64);
         let em = kurbo::Rect::new(0.0, descender, upm, ascender);
-        let Some(glyph) = doc.project.glyphs.get(self.glyph) else { return div().into_any_element() };
+        let Some(glyph) = doc.glyph_of(self.target) else { return div().into_any_element() };
         let advance = self.drag_advance().unwrap_or(glyph.advance);
         let preview = self.drag_transform();
         let regenerated = self.regenerated();
@@ -1671,7 +1838,8 @@ impl GlyphView {
 
     fn render_stroke_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (accent, muted, border) = (palette(cx).mauve.hsla(), theme.muted_foreground, theme.border);
+        let (accent, muted, border, link_color) = (palette(cx).mauve.hsla(), theme.muted_foreground, theme.border, palette(cx).teal.hsla());
+        let doc = self.document.read(cx);
         let rows: Vec<_> = self
             .glyph(cx)
             .map(|g| g.strokes.as_slice())
@@ -1682,6 +1850,7 @@ impl GlyphView {
                 // Where the pen came down (font units).
                 let start = s.skeleton.first().and_then(|p| p.circles.first()).map(|&(c, _)| s.placement * c);
                 let from = start.map_or_else(|| "（没有骨架）".to_string(), |p| format!("落笔 ({:.0}, {:.0})", p.x, p.y));
+                let linked = s.link.and_then(|l| doc.project.part(l.part)).map(|p| format!("🔗{}", p.name));
                 let selected = self.selection.contains(&i);
                 let hovered = self.hovered == Some(i);
                 h_flex()
@@ -1693,7 +1862,8 @@ impl GlyphView {
                     .when(selected, |d| d.bg(accent.opacity(0.15)))
                     .when(hovered && !selected, |d| d.bg(muted.opacity(0.1)))
                     .child(div().w(px(22.0)).text_right().font_weight(gpui::FontWeight::SEMIBOLD).child((i + 1).to_string()))
-                    .child(div().text_xs().text_color(muted).overflow_hidden().whitespace_nowrap().child(from))
+                    .child(div().flex_1().min_w_0().text_xs().text_color(muted).overflow_hidden().whitespace_nowrap().child(from))
+                    .children(linked.map(|name| div().flex_shrink_0().text_xs().text_color(link_color).child(name)))
                     .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                         window.focus(&this.focus, cx);
                         let m = ev.modifiers();
@@ -1718,6 +1888,25 @@ impl GlyphView {
             .collect();
         let none = self.selection.is_empty();
         let parts = self.document.read(cx).project.parts.len();
+        // The parts the selection is linked to.
+        let uses = self.selected_uses(cx);
+        let linked_parts: BTreeSet<u32> = uses.iter().map(|&(p, _)| p).collect();
+        let link_bar = (!uses.is_empty()).then(|| {
+            let first = *linked_parts.first().expect("some part");
+            h_flex()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .border_t_1()
+                .border_color(border)
+                .child(div().flex_1().text_xs().text_color(link_color).child("选中的是链接的部件"))
+                .child(Button::new("edit-linked-part").xsmall().label("编辑部件").tooltip("打开部件来改；用到它的字都跟着变").on_click(cx.listener(
+                    move |this, _, _, cx| this.open_part(first, cx),
+                )))
+                .child(Button::new("unlink").xsmall().label("断开链接").tooltip("这几笔留在字里，成为这个字自己的笔画，不再跟着部件变").on_click(cx.listener(
+                    |this, _, _, cx| this.unlink_selection(cx),
+                )))
+        });
         v_flex()
             .w(px(220.0))
             .h_full()
@@ -1739,6 +1928,7 @@ impl GlyphView {
             } else {
                 div().id("stroke-list").flex_1().min_h_0().overflow_y_scroll().children(rows).into_any_element()
             })
+            .children(link_bar)
             .child(match self.mode {
                 Mode::Strokes => self.render_transforms(cx).into_any_element(),
                 Mode::Skeleton => self.render_skeleton_panel(cx).into_any_element(),
@@ -1899,13 +2089,18 @@ impl Render for GlyphView {
         let doc = self.document.read(cx);
         let font = doc.project.font.clone();
         let has_reference = doc.reference().is_some();
-        let (title, name, count, bearings) = match doc.project.glyphs.get(self.glyph) {
-            Some(g) => {
+        let is_part = matches!(self.target, Target::Part(_));
+        let (title, name, count, bearings) = match (self.target, doc.glyph_of(self.target)) {
+            (Target::Glyph(_), Some(g)) => {
                 let code = g.chars.iter().map(|c| format!("U+{:04X}", *c as u32)).collect::<Vec<_>>().join(" ");
                 let bearings = g.ink_bounds().map(|b| (b.x0, g.advance - b.x1));
                 (g.chars.iter().collect::<String>(), format!("{} · {code}", g.name), g.strokes.len(), bearings)
             }
-            None => (String::new(), "字形已不存在".into(), 0, None),
+            (Target::Part(id), Some(g)) => {
+                let users = doc.project.glyphs_using(id).len();
+                (g.name.clone(), format!("部件 · 用在 {users} 个字里，改动会跟着过去"), g.strokes.len(), None)
+            }
+            (_, None) => (String::new(), "已不存在".into(), 0, None),
         };
         let wght = self.wght(cx);
         let scale = self.scale(cx);
@@ -1928,9 +2123,9 @@ impl Render for GlyphView {
                 Some((l, r)) => format!("左边距 {} · 右边距 {}", units(l), units(r)),
                 None => String::new(),
             }))
-            .child(Button::new("fit-reference").small().label("按参考摆放").disabled(!has_reference).tooltip("照参考字体里这个字的位置和大小摆放（强度见左侧设置）").on_click(cx.listener(
+            .child(Button::new("fit-reference").small().label("按参考摆放").disabled(!has_reference || is_part).tooltip("照参考字体里这个字的位置和大小摆放（强度见左侧设置）").on_click(cx.listener(
                 |this, _, window, cx| {
-                    let glyph = this.glyph;
+                    let Target::Glyph(glyph) = this.target else { return };
                     if this.document.update(cx, |d, cx| d.fit_to_reference(&[glyph], cx)) == 0 {
                         window.push_notification(Notification::warning("参考字体里没有这个字"), cx);
                     }

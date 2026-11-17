@@ -19,9 +19,9 @@ use gpui::{
 use scriptoria_ink::{InkDocument, InkPage};
 use scriptoria_project::Project;
 
-use crate::app::document::{Document, DocumentEvent};
+use crate::app::document::{Document, DocumentEvent, Target};
 use crate::app::font_view::{FontView, FontViewEvent};
-use crate::app::glyph_view::GlyphView;
+use crate::app::glyph_view::{GlyphView, GlyphViewEvent};
 use crate::app::outlines::Outlines;
 use crate::app::sample_view::{SampleEvent, SampleView};
 use crate::app::theme::{self, Appearance};
@@ -126,8 +126,8 @@ fn menus(appearance: Appearance) -> Vec<Menu> {
 enum Page {
     /// A handwritten document.
     Pdf { title: SharedString, view: Entity<Viewer> },
-    /// A glyph, by its index in the project.
-    Glyph { title: SharedString, glyph: usize, view: Entity<GlyphView> },
+    /// A glyph (by its index in the project) or a part.
+    Glyph { title: SharedString, target: Target, view: Entity<GlyphView> },
     /// The sample text.
     Sample { view: Entity<SampleView> },
 }
@@ -174,6 +174,9 @@ impl Workspace {
                 if let DocumentEvent::Reindexed(map) = event {
                     this.reindex(map, cx);
                 }
+                if let DocumentEvent::Parts = event {
+                    this.follow_parts(cx);
+                }
                 if matches!(event, DocumentEvent::Glyph(_) | DocumentEvent::GlyphList | DocumentEvent::Saved) {
                     this.refresh_pages(cx);
                 }
@@ -184,6 +187,7 @@ impl Workspace {
                 FontViewEvent::OpenSample => this.open_sample(window, cx),
                 FontViewEvent::MakeTemplate(glyphs) => this.make_template_for(glyphs, window, cx),
                 FontViewEvent::ExportTemplate(id) => this.export_template(*id, window, cx),
+                FontViewEvent::OpenPart(id) => this.open_part(*id, window, cx),
             }),
             // Light or dark as the system turns, unless one was picked.
             cx.observe_window_appearance(window, |_, window, cx| {
@@ -270,8 +274,13 @@ impl Workspace {
 
     /// The view of a glyph, if open in a tab.
     pub fn glyph_view(&self, glyph: usize) -> Option<Entity<GlyphView>> {
+        self.target_view(Target::Glyph(glyph))
+    }
+
+    /// The view of a glyph or part, if open in a tab.
+    pub fn target_view(&self, target: Target) -> Option<Entity<GlyphView>> {
         self.pages.iter().find_map(|p| match p {
-            Page::Glyph { glyph: g, view, .. } if *g == glyph => Some(view.clone()),
+            Page::Glyph { target: t, view, .. } if *t == target => Some(view.clone()),
             _ => None,
         })
     }
@@ -283,15 +292,36 @@ impl Workspace {
 
     /// Shows a glyph in its tab, opened if needed.
     pub fn open_glyph(&mut self, glyph: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let existing = self.pages.iter().position(|p| matches!(p, Page::Glyph { glyph: g, .. } if *g == glyph));
+        self.open_target(Target::Glyph(glyph), window, cx);
+    }
+
+    /// Shows a part in its tab, opened if needed, to edit it.
+    pub fn open_part(&mut self, part: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_target(Target::Part(part), window, cx);
+    }
+
+    fn open_target(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.pages.iter().position(|p| matches!(p, Page::Glyph { target: t, .. } if *t == target));
         let index = match existing {
             Some(i) => i,
             None => {
-                let Some(g) = self.document.read(cx).project.glyphs.get(glyph) else { return };
-                let chars: String = g.chars.iter().collect();
-                let title: SharedString = if chars.is_empty() { g.name.clone().into() } else { format!("「{chars}」").into() };
-                let view = cx.new(|cx| GlyphView::new(self.document.clone(), glyph, window, cx));
-                self.pages.push(Page::Glyph { title, glyph, view });
+                let doc = self.document.read(cx);
+                let title: SharedString = match target {
+                    Target::Glyph(glyph) => {
+                        let Some(g) = doc.project.glyphs.get(glyph) else { return };
+                        let chars: String = g.chars.iter().collect();
+                        if chars.is_empty() { g.name.clone().into() } else { format!("「{chars}」").into() }
+                    }
+                    Target::Part(id) => {
+                        let Some(p) = doc.project.part(id) else { return };
+                        format!("部件「{}」", p.name).into()
+                    }
+                };
+                let view = cx.new(|cx| GlyphView::new(self.document.clone(), target, window, cx));
+                self._subscriptions.push(cx.subscribe_in(&view, window, |this, _, event: &GlyphViewEvent, window, cx| match event {
+                    GlyphViewEvent::OpenPart(part) => this.open_part(*part, window, cx),
+                }));
+                self.pages.push(Page::Glyph { title, target, view });
                 self.pages.len() - 1
             }
         };
@@ -307,9 +337,21 @@ impl Workspace {
     /// removed close.
     fn reindex(&mut self, map: &[Option<usize>], cx: &mut Context<Self>) {
         for i in (0..self.pages.len()).rev() {
-            let Page::Glyph { glyph, .. } = &mut self.pages[i] else { continue };
+            let Page::Glyph { target: Target::Glyph(glyph), .. } = &mut self.pages[i] else { continue };
             match map.get(*glyph).copied().flatten() {
                 Some(g) => *glyph = g,
+                None => self.close_tab(i, cx),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Follows the parts: the tabs of parts no longer kept close, the others take their names.
+    fn follow_parts(&mut self, cx: &mut Context<Self>) {
+        for i in (0..self.pages.len()).rev() {
+            let Page::Glyph { target: Target::Part(id), title, .. } = &mut self.pages[i] else { continue };
+            match self.document.read(cx).project.part(*id) {
+                Some(p) => *title = format!("部件「{}」", p.name).into(),
                 None => self.close_tab(i, cx),
             }
         }

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Context, EventEmitter};
 use scriptoria_ink::Stroke;
-use scriptoria_ink::kurbo::Rect;
-use scriptoria_project::{FontInfo, Glyph, GlyphStroke, Part, Project, Reference, Template};
+use scriptoria_ink::kurbo::{Affine, Rect};
+use scriptoria_project::{FontInfo, Glyph, Part, Project, Reference, Template};
 
 use crate::problems::Problem;
 use scriptoria_reference::ReferenceFont;
@@ -31,6 +31,15 @@ enum Change {
     Templates(Vec<Template>),
     /// The parts, as they were.
     Parts(Vec<Part>),
+    /// Changes made as one step.
+    Batch(Vec<Change>),
+}
+
+/// What a glyph view shows and edits: a glyph of the font (by index) or a part (by id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Target {
+    Glyph(usize),
+    Part(u32),
 }
 
 pub struct Document {
@@ -72,6 +81,9 @@ pub enum DocumentEvent {
     Reindexed(Arc<[Option<usize>]>),
     /// The parts kept changed.
     Parts,
+    /// A change to a glyph made uses of parts in it no longer the parts' own: the glyph, and the
+    /// names of the parts.
+    Unlinked(usize, Vec<String>),
 }
 
 impl EventEmitter<DocumentEvent> for Document {}
@@ -208,11 +220,16 @@ impl Document {
     /// Changes glyphs through `f`, all as one step to undo; returns how many changed.
     pub fn update_glyphs(&mut self, glyphs: &[usize], mut f: impl FnMut(&mut Glyph), cx: &mut Context<Self>) -> usize {
         let mut before = Vec::new();
+        let mut unlinked = Vec::new();
         for &i in glyphs {
             let Some(g) = self.project.glyphs.get_mut(i) else { continue };
             let was = g.clone();
             f(g);
-            if *g != was {
+            let gone = self.project.normalize_links(i);
+            if !gone.is_empty() {
+                unlinked.push((i, gone));
+            }
+            if self.project.glyphs[i] != was {
                 before.push((i, was));
             }
         }
@@ -223,7 +240,72 @@ impl Document {
             }
             self.record(Change::Glyphs(before));
         }
+        for (i, gone) in unlinked {
+            let names = gone.iter().filter_map(|&(p, _)| self.project.part(p).map(|p| p.name.clone())).collect();
+            cx.emit(DocumentEvent::Unlinked(i, names));
+        }
         changed
+    }
+
+    /// The glyph a target is: a glyph of the font, or a part's.
+    pub fn glyph_of(&self, target: Target) -> Option<&Glyph> {
+        match target {
+            Target::Glyph(i) => self.project.glyphs.get(i),
+            Target::Part(id) => self.project.part(id).map(|p| &p.glyph),
+        }
+    }
+
+    /// Changes a glyph or a part through `f`, as one step to undo; a part's change goes into every
+    /// glyph using it, in the same step.
+    pub fn update_target(&mut self, target: Target, f: impl FnOnce(&mut Glyph), cx: &mut Context<Self>) {
+        match target {
+            Target::Glyph(i) => self.update_glyph(i, f, cx),
+            Target::Part(id) => {
+                let users = self.project.glyphs_using(id);
+                self.step(
+                    &users,
+                    |p| {
+                        if let Some(part) = p.part_mut(id) {
+                            f(&mut part.glyph);
+                            // A part's strokes are its own.
+                            part.glyph.strokes.iter_mut().for_each(|s| s.link = None);
+                        }
+                        p.sync_part(id);
+                    },
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Changes the project through `f` as one step to undo: the parts, and of the glyphs, those
+    /// in `glyphs` (others it changes are not kept for undo). Returns what `f` does.
+    fn step<R>(&mut self, glyphs: &[usize], f: impl FnOnce(&mut Project) -> R, cx: &mut Context<Self>) -> R {
+        let parts = self.project.parts.clone();
+        let mut glyphs: Vec<usize> = glyphs.iter().copied().filter(|&g| g < self.project.glyphs.len()).collect();
+        glyphs.sort_unstable();
+        glyphs.dedup();
+        let before: Vec<(usize, Glyph)> = glyphs.iter().map(|&i| (i, self.project.glyphs[i].clone())).collect();
+        let result = f(&mut self.project);
+        let before: Vec<(usize, Glyph)> = before.into_iter().filter(|(i, g)| self.project.glyphs.get(*i) != Some(g)).collect();
+        let mut changes = Vec::new();
+        for &(i, _) in &before {
+            self.changed(i, cx);
+        }
+        if !before.is_empty() {
+            changes.push(Change::Glyphs(before));
+        }
+        if self.project.parts != parts {
+            changes.push(Change::Parts(parts));
+            self.touch(cx);
+            cx.emit(DocumentEvent::Parts);
+        }
+        match changes.len() {
+            0 => {}
+            1 => self.record(changes.pop().expect("one change")),
+            _ => self.record(Change::Batch(changes)),
+        }
+        result
     }
 
     /// Places glyphs as the reference font places their characters (see
@@ -328,6 +410,11 @@ impl Document {
                 Change::Templates(replaced)
             }
             Change::Added(glyphs) => Change::Removed(self.take_glyphs(&glyphs, cx)),
+            Change::Batch(changes) => {
+                let mut replaced: Vec<Change> = changes.into_iter().rev().map(|c| self.apply(c, cx)).collect();
+                replaced.reverse();
+                Change::Batch(replaced)
+            }
         }
     }
 
@@ -359,30 +446,34 @@ impl Document {
         template
     }
 
-    /// Keeps strokes as a part named `name` (in place of a part of that name), as a step to undo.
-    pub fn save_part(&mut self, name: &str, strokes: Vec<GlyphStroke>, cx: &mut Context<Self>) {
-        let before = self.project.parts.clone();
-        let part = Part { name: name.to_string(), strokes };
-        match self.project.parts.iter_mut().find(|p| p.name == name) {
-            Some(p) => *p = part,
-            None => self.project.parts.push(part),
-        }
-        self.parts_changed(before, cx);
+    /// Keeps some of a glyph's strokes (by index) as a new part, named; they stay in the glyph,
+    /// linked to it. One step to undo; returns the part's id.
+    pub fn make_part(&mut self, glyph: usize, strokes: &[usize], name: &str, cx: &mut Context<Self>) -> Option<u32> {
+        self.step(&[glyph], |p| p.make_part(glyph, strokes, name), cx)
     }
 
-    /// Forgets a part, as a step to undo.
-    pub fn remove_part(&mut self, name: &str, cx: &mut Context<Self>) {
-        let before = self.project.parts.clone();
-        self.project.parts.retain(|p| p.name != name);
-        self.parts_changed(before, cx);
+    /// Puts a part into a glyph under `transform`, its strokes at `at` in the writing order (after
+    /// the last, without), as a step to undo; returns the use.
+    pub fn insert_part(&mut self, glyph: usize, part: u32, transform: Affine, at: Option<usize>, cx: &mut Context<Self>) -> Option<u32> {
+        self.step(&[glyph], |p| p.insert_part(glyph, part, transform, at), cx)
     }
 
-    fn parts_changed(&mut self, before: Vec<Part>, cx: &mut Context<Self>) {
-        if self.project.parts != before {
-            self.record(Change::Parts(before));
-            self.touch(cx);
-            cx.emit(DocumentEvent::Parts);
-        }
+    /// Changes the project's parts and glyphs through `f` as one step to undo, keeping for undo
+    /// the glyphs in `glyphs` (and the parts).
+    pub fn update_project<R>(&mut self, glyphs: &[usize], f: impl FnOnce(&mut Project) -> R, cx: &mut Context<Self>) -> R {
+        self.step(glyphs, f, cx)
+    }
+
+    /// Unlinks a use of a part in a glyph (its strokes stay, as the glyph's own), as a step to
+    /// undo.
+    pub fn unlink(&mut self, glyph: usize, part: u32, instance: u32, cx: &mut Context<Self>) {
+        self.step(&[glyph], |p| p.unlink(glyph, part, instance), cx);
+    }
+
+    /// Forgets a part, as a step to undo: the glyphs using it keep its strokes as their own.
+    pub fn remove_part(&mut self, part: u32, cx: &mut Context<Self>) {
+        let users = self.project.glyphs_using(part);
+        self.step(&users, |p| p.remove_part(part), cx);
     }
 
     /// Drops a practice sheet that could not be written out (not a step to undo).
@@ -446,11 +537,16 @@ impl Document {
             self.project
                 .glyphs
                 .iter()
-                .map(|g| {
+                .enumerate()
+                .map(|(i, g)| {
                     let reference = g.chars.first().and_then(|&c| {
                         *boxes.entry(c).or_insert_with(|| self.reference.as_ref().and_then(|r| r.glyph(c, upm)).map(|g| g.bounds))
                     });
-                    crate::problems::check(g, &self.project.font, reference)
+                    let mut found = crate::problems::check(g, &self.project.font, reference);
+                    if crate::components::order_to_check(scriptoria_ids::Table::builtin(), &self.project, i) {
+                        found.push(Problem::WritingOrder);
+                    }
+                    found
                 })
                 .collect(),
         );

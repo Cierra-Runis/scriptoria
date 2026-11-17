@@ -20,7 +20,7 @@ pub fn glyph_stroke(stroke: &Stroke, placement: Affine, pen: f64) -> GlyphStroke
         .iter()
         .map(|p| SkeletonPiece { circles: p.samples.iter().map(|s| (s.p, s.r)).collect(), spine: p.spine.clone() })
         .collect();
-    GlyphStroke { outline: Outline { kind, path: stroke.path.clone() }, skeleton, placement, pen }
+    GlyphStroke { outline: Outline { kind, path: stroke.path.clone() }, skeleton, placement, pen, link: None }
 }
 
 /// Adds written strokes to the end of a glyph, in the order given, all placed alike.
@@ -200,6 +200,7 @@ mod tests {
             skeleton: Vec::new(),
             placement: Affine::translate((dx, 0.0)),
             pen: 1.0,
+            link: None,
         }
     }
 

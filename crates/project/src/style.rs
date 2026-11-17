@@ -48,7 +48,7 @@ mod tests {
     fn stroke(a: (f64, f64), b: (f64, f64), r: f64) -> GlyphStroke {
         let mut piece = SkeletonPiece { circles: vec![(Point::from(a), r), (Point::from(b), r)], spine: Vec::new() };
         piece.respine();
-        GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: vec![piece], placement: Affine::IDENTITY, pen: 1.0 }
+        GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: vec![piece], placement: Affine::IDENTITY, pen: 1.0, link: None }
     }
 
     fn glyph(strokes: Vec<GlyphStroke>) -> Glyph {

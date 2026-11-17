@@ -177,7 +177,7 @@ mod tests {
     fn line(n: usize) -> GlyphStroke {
         let mut piece = SkeletonPiece { circles: (0..n).map(|i| (Point::new(i as f64, 0.0), 0.1 + i as f64 / 100.0)).collect(), spine: Vec::new() };
         piece.respine();
-        GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: vec![piece], placement: Affine::IDENTITY, pen: 1.0 }
+        GlyphStroke { outline: Outline { kind: OutlineKind::Filled, path: BezPath::new() }, skeleton: vec![piece], placement: Affine::IDENTITY, pen: 1.0, link: None }
     }
 
     /// Whether every segment of the centerline runs between its two circles.

@@ -1,0 +1,15 @@
+# A few characters, as in BabelStone's IDS data (G source forms), for the tests.
+吅	⿰口口
+品	⿱口吅
+国	⿴囗玉
+河	⿰氵可
+清	⿰氵青
+谢	⿰讠射
+青	⿱龶⺝
+射	⿰身寸
+吕	⿱口口
+宫	⿱宀吕
+营	⿱⿱艹冖吕
+这	⿺辶文
+七	〾⿻一乚
+𬻌	㇯東㇒

@@ -1,5 +1,0 @@
-# This machine's Windows SDK is on drive D, where gpui's build.rs does not find fxc.exe (used to
-# compile shaders in release builds). On another machine, change the path, or delete this section
-# and set the environment variable GPUI_FXC_PATH instead.
-[env]
-GPUI_FXC_PATH = 'D:\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'

@@ -686,19 +686,24 @@ fn strokes_turn_flip_and_stretch_keeping_their_width(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         window.click(("stroke", 0usize), cx);
         window.press("ctrl-a", cx);
-        window.render_frame(cx);
     });
-    let (_, edges, turn) = view.read_with(cx, |v, cx| v.handles(cx)).expect("a selection box");
+    // The handles move a little once the outlines are planned again (in the background, after the
+    // undo above), so they are found only then.
+    let handles = |cx: &mut VisualTestContext| {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(view.read_with(cx, |v, _| v.ready()));
+        view.read_with(cx, |v, cx| v.handles(cx)).expect("a selection box")
+    };
+    let (_, edges, _) = handles(cx);
     cx.update(|window, cx| window.drag(edges[1], edges[1] + point(px(40.0), px(0.0)), cx));
     let wider = glyph(&workspace, cx);
     let k = linear(&wider.strokes[0])[0] / linear(&before.strokes[0])[0];
     assert!(k > 1.05 && close(linear(&wider.strokes[0]), times([k, 0.0, 0.0, 1.0], linear(&before.strokes[0]))), "{k}");
     // ...and the handle above turns it, sizes kept.
     cx.update(|window, cx| window.press("ctrl-z", cx));
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        window.drag(turn, turn + point(px(60.0), px(20.0)), cx);
-    });
+    let (_, _, turn) = handles(cx);
+    cx.update(|window, cx| window.drag(turn, turn + point(px(60.0), px(20.0)), cx));
     let turned = glyph(&workspace, cx);
     let (l0, l1) = (linear(&before.strokes[0]), linear(&turned.strokes[0]));
     let det = |l: [f64; 4]| l[0] * l[3] - l[1] * l[2];

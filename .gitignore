@@ -1,1 +1,3 @@
 /target
+# Machine-specific Cargo settings (e.g. GPUI_FXC_PATH) stay local.
+/.cargo/config.toml

@@ -2,6 +2,9 @@
 //!
 //! `scriptoria [project folder] [PDF…]`
 
+// Release builds on Windows open no console window beside the app; debug builds keep it for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 extern crate gpui_kit as gpui;
 
 use std::path::PathBuf;

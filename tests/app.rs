@@ -42,8 +42,15 @@ fn open(start: Vec<PathBuf>, cx: &mut TestAppContext) -> (Entity<Workspace>, &mu
         window.focus(&focus, cx);
         Root::new(view, window, cx)
     });
+    // The same on every machine: without the reference font that may be installed here (tests
+    // that need one make their own).
+    let workspace = workspace.unwrap();
+    let document = workspace.read_with(cx, |w, _| w.document().clone());
+    if document.read_with(cx, |d, _| d.reference().is_some()) {
+        document.update(cx, |d, cx| d.set_reference(None, cx)).unwrap();
+    }
     cx.update(|window, cx| window.render_frame(cx));
-    (workspace.unwrap(), cx)
+    (workspace, cx)
 }
 
 #[gpui_kit::test]
@@ -683,17 +690,24 @@ fn strokes_turn_flip_and_stretch_keeping_their_width(cx: &mut TestAppContext) {
     assert_eq!(glyph(&workspace, cx), before);
 
     // With the mouse: everything selected, the right edge dragged out stretches across only...
+    // (Zoomed out first: placed without a reference font, the glyph is larger than the em the
+    // canvas fits, and its right edge would be under the list of strokes.)
     cx.update(|window, cx| {
         window.click(("stroke", 0usize), cx);
         window.press("ctrl-a", cx);
+        window.click("zoom-out", cx);
     });
     // The handles move a little once the outlines are planned again (in the background, after the
-    // undo above), so they are found only then.
+    // undo above), so they are found only then; they must be on the canvas to be grabbed.
     let handles = |cx: &mut VisualTestContext| {
         cx.run_until_parked();
         cx.update(|window, cx| window.render_frame(cx));
         assert!(view.read_with(cx, |v, _| v.ready()));
-        view.read_with(cx, |v, cx| v.handles(cx)).expect("a selection box")
+        let handles = view.read_with(cx, |v, cx| v.handles(cx)).expect("a selection box");
+        let canvas = cx.update(|window, _| window.find("glyph-canvas").bounds());
+        let (_, edges, turn) = handles;
+        assert!(edges.iter().chain([&turn]).all(|p| canvas.contains(p)), "handles {edges:?} {turn:?} off the canvas {canvas:?}");
+        handles
     };
     let (_, edges, _) = handles(cx);
     cx.update(|window, cx| window.drag(edges[1], edges[1] + point(px(40.0), px(0.0)), cx));

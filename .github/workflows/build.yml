@@ -22,7 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # Kept even when a test fails, so that the next run does not compile everything again.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - run: cargo test --workspace --locked
 
   build:
